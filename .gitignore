@@ -1,0 +1,19 @@
+node_modules/
+android/.gradle/
+android/build/
+android/app/build/
+build_output/
+*.log
+.idea/
+*.iml
+local.properties
+downloaded_artifact/
+downloaded_directchat_artifact/
+
+# Android signing material must never be committed.
+*.keystore
+*.jks
+*.p12
+*.pfx
+keystore.properties
+signing.properties
