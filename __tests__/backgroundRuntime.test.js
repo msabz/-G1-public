@@ -2,6 +2,7 @@ let mockSignalMessageObserver = null;
 let mockSignalDisconnectObserver = null;
 let mockIncomingStartObserver = null;
 let mockIncomingDoneObserver = null;
+let mockActiveCall = null;
 
 jest.mock('../src/webrtc/signaling', () => ({
   addSignalingMessageObserver: jest.fn(cb => {
@@ -34,6 +35,30 @@ jest.mock('../src/services/Background', () => ({
   showMessageNotification: jest.fn().mockResolvedValue(true),
 }));
 
+// BackgroundRuntime only needs the CallRuntime contract here. Mocking that
+// boundary keeps this unit test independent from React Native's native module
+// loader while still verifying that incoming call metadata is routed correctly.
+jest.mock('../src/services/CallRuntime', () => ({
+  clearCallRuntime: jest.fn(callId => {
+    if (!callId || mockActiveCall?.callId === callId) mockActiveCall = null;
+  }),
+  getActiveCall: jest.fn(() => mockActiveCall),
+  handleIncomingCallRequest: jest.fn((msg, peer = {}) => {
+    mockActiveCall = {
+      ...msg,
+      callId: msg.callId,
+      video: !!msg.video,
+      direction: 'incoming',
+      peerId: peer.deviceId,
+      peerName: peer.deviceName || peer.name,
+      finalState: null,
+    };
+    return mockActiveCall;
+  }),
+  handleRemoteCallSignal: jest.fn(() => {}),
+  setCallUiAttached: jest.fn(() => {}),
+}));
+
 import { saveMessage, savePeer } from '../src/services/Persistence';
 import { showMessageNotification } from '../src/services/Background';
 import {
@@ -53,6 +78,7 @@ async function flushAsync() {
 describe('BackgroundRuntime', () => {
   beforeEach(() => {
     shutdownBackgroundRuntimeForTests();
+    mockActiveCall = null;
     jest.clearAllMocks();
     initializeBackgroundRuntime();
     setUiAttached(true);
