@@ -25,6 +25,7 @@ let recoveryGeneration = 0;
 let recoveryInProgress = false;
 let recoveryExpectedInboundPeerAddress = null;
 let recoveryInboundAdmissionSnapshot = null;
+let gracefulDisconnectPending = false;
 let passiveInboundAdmissionHandler = null;
 const messageObservers = new Set();
 const disconnectObservers = new Set();
@@ -243,6 +244,22 @@ function setupSessionEvents(session) {
         return;
       }
 
+      // disconnect-request / disconnect-ack are deliberate terminal control
+      // frames. Physical logs showed that treating the peer close that follows
+      // as a transient failure could redial a fresh socket only for App cleanup
+      // to destroy it ~180 ms later. Suppress recovery while graceful teardown
+      // is pending; App/coordinator remains the owner of the final logical reset.
+      if (gracefulDisconnectPending) {
+        gracefulDisconnectPending = false;
+        clearPassiveInboundIdentityTimer(session);
+        stopHeartbeat();
+        activeSession = null;
+        cancelPendingRecovery();
+        logSocket('RECOVERY_SUPPRESSED', session.socket, 'reason=graceful-disconnect');
+        setAvailabilityStatus();
+        return;
+      }
+
       beginTransientRecovery(session, 'socket-disconnect');
     }
   };
@@ -277,6 +294,7 @@ async function announceLocalRoute(session) {
 
 function activateSession(session, socket, direction, reason = 'connect') {
   cancelPendingRecovery();
+  gracefulDisconnectPending = false;
   activeSession = session;
   lastInboundActivityAt = Date.now();
   logSocket('SESSION_ACTIVE', socket, `direction=${direction} reason=${reason}`);
@@ -438,6 +456,7 @@ export function getSignalingHealth() {
     lastInboundActivityAt,
     heartbeatRunning: !!heartbeatTimer,
     recoveryInProgress,
+    gracefulDisconnectPending,
   };
 }
 
@@ -479,10 +498,165 @@ function notifyClientConnected() {
   }
 }
 
-function attachIncomingSession(socket, promote, source) {
-  logSocket('INBOUND_ACCEPTED', socket, `source=${source}`);
+function inspectDuplicatePassiveInbound(socket, promote, source) {
+  const activeSocket = activeSession?.socket || null;
+  logSocket('DUPLICATE_INBOUND_PENDING', socket, `active=${socketId(activeSocket)}`);
 
-  if (activeSession && activeSession.isConnected && activeSession.socket) {
+  let settled = false;
+  let buffer = '';
+  const bufferedMessages = [];
+  let timer = null;
+
+  const cleanup = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    try { socket.removeListener?.('data', onData); } catch (e) {}
+    try { socket.removeListener?.('close', onTerminal); } catch (e) {}
+    try { socket.removeListener?.('error', onTerminal); } catch (e) {}
+  };
+
+  const reject = reason => {
+    if (settled) return false;
+    settled = true;
+    cleanup();
+    logSocket('DUPLICATE_INBOUND_REJECTED', socket, `active=${socketId(activeSocket)} reason=${reason}`);
+    try { socket.destroy(); } catch (e) {}
+    return false;
+  };
+
+  const promoteInboundWinner = decision => {
+    if (settled) return false;
+    settled = true;
+    cleanup();
+
+    const previous = activeSession;
+    if (previous && previous.isConnected && previous.isOutbound) {
+      clearPassiveInboundIdentityTimer(previous);
+      stopHeartbeat();
+      activeSession = null;
+      try { previous.destroy(); } catch (e) {}
+    }
+
+    logSocket(
+      'DUPLICATE_INBOUND_SELECTED',
+      socket,
+      `peer=${decision?.peerId || 'unknown'} previous=${socketId(activeSocket)}`
+    );
+    return attachIncomingSession(socket, promote, source, {
+      skipAcceptedLog: true,
+      skipDuplicateCheck: true,
+      preMessages: bufferedMessages,
+    });
+  };
+
+  const validateIdentity = msg => {
+    const peerAddress = normalizePeerAddress(socket?.remoteAddress);
+    let decision = null;
+    try {
+      decision = passiveInboundAdmissionHandler?.({
+        message: msg,
+        peerAddress,
+        session: null,
+        validateOnly: true,
+      }) || null;
+    } catch (error) {
+      console.warn('[G1/SIGNAL] duplicate inbound validation failed:', error?.message || error);
+      reject('validator-error');
+      return false;
+    }
+
+    if (decision?.then && typeof decision.then === 'function') {
+      reject('async-validator-not-supported');
+      return false;
+    }
+    if (decision?.accepted !== true) {
+      reject(decision?.reason || 'identity-rejected');
+      return false;
+    }
+    if (decision?.preferInbound !== true) {
+      reject('stable-id-retains-outbound');
+      return false;
+    }
+
+    return promoteInboundWinner(decision);
+  };
+
+  const onData = data => {
+    if (settled) return;
+    buffer += data.toString();
+    if (buffer.length > MAX_SIGNALING_BUFFER_BYTES) {
+      reject('candidate-buffer-too-large');
+      return;
+    }
+
+    const parts = buffer.split('\n');
+    buffer = parts.pop();
+    const parsedMessages = [];
+    for (const part of parts) {
+      if (!part.trim()) continue;
+      try {
+        parsedMessages.push(JSON.parse(part));
+      } catch (error) {
+        reject('candidate-parse-error');
+        return;
+      }
+    }
+
+    for (let index = 0; index < parsedMessages.length; index++) {
+      if (settled) return;
+      const msg = parsedMessages[index];
+      if (msg?.type === 'my-ip') {
+        bufferedMessages.push(msg);
+        continue;
+      }
+      if (msg?.type !== 'identity' || !msg.deviceId) {
+        reject('identity-required');
+        return;
+      }
+
+      // Preserve every complete frame already coalesced in this TCP read. The
+      // real SignalingSession is attached only after the stable-id decision, so
+      // bytes already consumed by this provisional parser cannot be re-read from
+      // the socket. Replay identity and any trailing application frames in order.
+      bufferedMessages.push(msg, ...parsedMessages.slice(index + 1));
+      validateIdentity(msg);
+      return;
+    }
+  };
+
+  const onTerminal = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+  };
+
+  socket.on('data', onData);
+  socket.on('close', onTerminal);
+  socket.on('error', onTerminal);
+  timer = setTimeout(() => reject('identity-timeout'), PASSIVE_INBOUND_IDENTITY_TIMEOUT_MS);
+  return true;
+}
+
+function attachIncomingSession(socket, promote, source, options = {}) {
+  if (!options.skipAcceptedLog) {
+    logSocket('INBOUND_ACCEPTED', socket, `source=${source}`);
+  }
+
+  if (!options.skipDuplicateCheck && activeSession && activeSession.isConnected && activeSession.socket) {
+    // A simultaneous known-LAN connect must not be resolved by packet/socket
+    // arrival order. If the existing session is outbound, hold the inbound raw
+    // socket only long enough to read/validate stable identity, then apply the
+    // coordinator's deterministic deviceId tie-break. Other duplicate cases
+    // retain the existing healthy session as before.
+    if (
+      source === 'persistent' &&
+      activeSession.isOutbound &&
+      !isExplicitServerMode &&
+      typeof passiveInboundAdmissionHandler === 'function'
+    ) {
+      return inspectDuplicatePassiveInbound(socket, promote, source);
+    }
+
     logSocket('DUPLICATE_INBOUND_REJECTED', socket, `active=${socketId(activeSession.socket)}`);
     try { socket.destroy(); } catch (e) {}
     return false;
@@ -529,6 +703,13 @@ function attachIncomingSession(socket, promote, source) {
 
   if (session.passiveAdmissionRequired && !session.passiveAdmissionAccepted) {
     startPassiveInboundIdentityTimer(session);
+  }
+
+  if (Array.isArray(options.preMessages) && options.preMessages.length) {
+    for (const message of options.preMessages) {
+      if (activeSession !== session || !session.isConnected) break;
+      session.onMessage?.(message, session);
+    }
   }
 
   // waitForClientConnection belongs to the explicit Wi-Fi Direct server flow.
@@ -587,6 +768,7 @@ export function connectToSignalingServer(host, port, maxRetries = 10, retryDelay
     }
 
     cancelPendingRecovery();
+    gracefulDisconnectPending = false;
 
     const abort = error => {
       if (settled) return;
@@ -652,6 +834,9 @@ export function sendSignalingMessage(msgObj) {
   if (!activeSession) return false;
   const socket = activeSession.socket;
   const type = msgObj?.type || 'unknown';
+  if (type === 'disconnect-request' || type === 'disconnect-ack') {
+    gracefulDisconnectPending = true;
+  }
   logSocket('SEND', socket, `type=${type}`);
   const sent = activeSession.sendMessage(msgObj);
   if (!sent) logSocket('SEND_FAILED', socket, `type=${type}`);
@@ -661,6 +846,7 @@ export function sendSignalingMessage(msgObj) {
 export function closeSignaling() {
   stopHeartbeat();
   cancelPendingRecovery();
+  gracefulDisconnectPending = false;
   const session = activeSession;
   activeSession = null;
 

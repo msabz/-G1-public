@@ -13,7 +13,7 @@ export function createLanPassiveAdmissionHandler(options = {}) {
   const registry = options.registry || peerRegistry;
   const coordinator = options.coordinator || connectionCoordinator;
 
-  return ({ message, peerAddress } = {}) => {
+  return ({ message, peerAddress, validateOnly = false } = {}) => {
     if (message?.type !== 'identity' || !message.deviceId) {
       return { accepted: false, reason: 'identity-required' };
     }
@@ -56,6 +56,23 @@ export function createLanPassiveAdmissionHandler(options = {}) {
       return { accepted: false, reason: 'endpoint-mismatch' };
     }
 
+    const decision = {
+      accepted: true,
+      peerId: peer.deviceId,
+      transport: TRANSPORTS.LAN,
+      // Deterministic simultaneous-connect rule already owned by coordinator:
+      // lower stable deviceId yields its outbound attempt to the inbound socket;
+      // higher stable deviceId retains outbound. Expose it during provisional
+      // duplicate validation without mutating coordinator/session state yet.
+      preferInbound: typeof coordinator.shouldYieldToInbound === 'function'
+        ? coordinator.shouldYieldToInbound(message.deviceId)
+        : false,
+    };
+
+    if (validateOnly) {
+      return decision;
+    }
+
     try {
       coordinator.adoptSignalingOwnerSession(
         peer,
@@ -70,11 +87,7 @@ export function createLanPassiveAdmissionHandler(options = {}) {
       };
     }
 
-    return {
-      accepted: true,
-      peerId: peer.deviceId,
-      transport: TRANSPORTS.LAN,
-    };
+    return decision;
   };
 }
 

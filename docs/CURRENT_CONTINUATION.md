@@ -2,101 +2,94 @@
 
 This is the rolling resume pointer. Update it at every material phase transition. Dated checkpoint files remain the historical archive.
 
-Last prepared: 2026-08-18
+Last prepared: 2026-08-18 after physical ordinary-LAN testing.
 
 ## Read first
-
-Latest dated checkpoint:
-`docs/DEVELOPMENT_CHECKPOINT_2026-08-18_INCOMING_LAN_ADOPTION_PHASE5C.md`
 
 Master execution strategy:
 GitHub issue #5 — `Master execution strategy: release-ready G1 → independent I2P overlay`.
 
-## Current verified implementation state
+Latest merged Phase 5c checkpoint:
+`docs/DEVELOPMENT_CHECKPOINT_2026-08-18_INCOMING_LAN_ADOPTION_PHASE5C.md`.
 
-- Verified merged base before Phase 5c: `main@cce1c8f674c4e7c8862d41c92735e49df4d55b52`.
-- Phase 5c branch: `agent/incoming-lan-adoption-phase5c`.
-- Active Draft PR: #9 — `refactor: adopt passive incoming LAN signaling sessions`.
-- Verified live-code head: `7f6b883eb83b96491bfc3df1af007be3ef367e48`.
-- CI #113 (`32106767926`) is fully green on that exact code head: JS tests, RN production bundle, Android unit tests, Debug APK, Release APK, and both artifact uploads.
-- No review threads or submitted reviews are blocking PR #9.
-- `main` was re-checked after #113 and remained `cce1c8f6...`; the Phase 5c branch was strictly ahead with no base divergence.
-- No new physical two-device evidence exists for Phase 5c yet.
+Working stabilization branch:
+`fix/lan-recovery-identity-replay`.
 
-### Networking ownership now
+## Current verified baseline
 
-- Known-contact outbound LAN: coordinator-owned.
-- Passive incoming LAN: signaling accepts the socket, shared admission validates it, then coordinator adopts the existing signaling-owner session; live App promotes it to LAN CONNECTED when mounted.
-- Signaling owns socket/session heartbeat and bounded same-route recovery for coordinator-owned LAN sessions.
-- File transfer remains independent on its native data channel.
-- Wi-Fi Direct signaling/reconnect remains App-owned intentionally.
-- Manual-IP LAN remains provisional/legacy diagnostic behavior.
+- Canonical repository: `msabz/-G1-public`.
+- Canonical branch: `main`.
+- Current merged `main`: `07f889ec8378624f1322018f71e8193b7ce0e7a7` (`docs: checkpoint incoming LAN adoption Phase 5c`).
+- PR #9 is merged at that exact SHA.
+- GitHub Actions run #115 (`32107399461`) completed successfully on that exact SHA.
+- CodeRabbit status is success.
+- Phase 5c is therefore CI VERIFIED, but the physical LAN certification exposed defects that block calling it DEVICE VERIFIED.
 
-### New Phase 5c invariants
+## Physical ordinary-LAN evidence captured on 2026-08-18
 
-- Passive LAN admission never derives peer identity from IP.
-- A passive identity must already match a current/reachable LAN route for that `deviceId` and the live socket endpoint.
-- Unadmitted passive application frames cannot reach App/BackgroundRuntime; identity has a bounded 5s deadline.
-- Explicit P2P server mode bypasses the passive-LAN gate.
-- A different endpoint cannot steal an inbound transient-recovery window.
-- Same-peer outbound/inbound known-LAN races converge to the existing healthy inbound winner without a second socket or heartbeat.
-- Immediate live messages are merged with persisted history instead of being overwritten during identity/history loading.
+### CONFIRMED working behavior
 
-## Phase 5c verification chronology
+- Ordinary Wi-Fi LAN discovery works bidirectionally with stable peer records and current `wlan0` endpoints.
+- A normal single-initiator LAN connection can remain stable with signaling connected, heartbeat running, recovery false, and two-way chat.
+- Bidirectional simultaneous application traffic after a normally established session works: text in both directions, simultaneous text sends, and simultaneous voice-note sends were observed working.
+- Voice calls can establish and remain active for multiple minutes with WebRTC/ICE connected; at least one later call and normal teardown completed without a transport failure.
+- The native file/data plane remains separate from signaling.
 
-- #89 expected red → missing coordinator adoption seam.
-- #91 green → coordinator adoption verified.
-- #93 expected red → inbound recovery endpoint race reproduced.
-- #95 diagnostic red → previous socket address was lost before disconnect callback.
-- #97 green → endpoint-bound inbound recovery verified.
-- #99 expected red → shared passive admission seams missing.
-- #101 functional gate behavior passed; only test dependency isolation failed.
-- #103 rerun full green on unchanged code; first attempt's ApkFlinger Java heap OOM was transient, so Gradle config was not changed.
-- #105 expected red → App promotion/context seams missing.
-- #107 green → App policy/context/signaling ownership health verified.
-- #109 expected red → history/live merge helper missing.
-- #111 green → history/live convergence verified.
-- #113 green → live App incoming LAN integration verified across JS/bundle/Android/APKs/artifacts.
+### CONFIRMED defects / device symptoms
 
-## Exact next engineering step
+1. **Simultaneous-connect race is not reliably convergent.** Repeated physical tests produced a healthy-looking signaling state (`connected=true`, heartbeat running, recovery false) while only one chat direction delivered. The failed direction changed across attempts, so this is not a fixed-device defect.
+2. **Repeated disconnect/reconnect can leave one side unable to initiate outbound while it can still accept inbound.** The symptom was observed with more than one peer and could reverse sides, so it is a session lifecycle/ownership problem rather than a Moto-only problem.
+3. **Physical socket flapping/recovery occurred.** A captured A16 log shows outbound recovery sockets becoming active and then being replaced roughly every 5 seconds for multiple cycles before a later socket stabilized.
+4. A captured failure showed `SEND type=chat` on an outbound recovery socket followed by `SESSION_DISCONNECTED` about 94 ms later. That proves a write attempt close to teardown, not remote receipt or packet loss cause.
+5. Another captured sequence shows duplicate inbound/outbound races, `coordinator-rejected`, a later `disconnect-ack`, `SESSION_DISCONNECTED`, `Attempted to write to closed socket`, and `SESSION_DESTROYED reason=closeSignaling` before a later inbound session was admitted.
 
-First finish the Phase 5c merge procedure; then **stop networking refactoring and run the physical two-device ordinary-LAN certification matrix** before changing P2P ownership.
+## Current causal analysis
 
-### Phase 5c merge procedure
+### CONFIRMED code defect
 
-1. This documentation-only checkpoint must receive its own full-green CI run.
-2. Re-check `main` is still the Phase 5b base and the PR head is strictly ahead/behind=0.
-3. Fast-forward `main` non-force to the exact tested documentation head; do not squash or create a different merge commit.
-4. Verify PR #9 becomes `closed + merged=true` with the exact same SHA.
-5. Raise G1-before-I2P progress only after that verified merge.
+`src/webrtc/signaling.js` creates a replacement outbound `SignalingSession` inside `beginTransientRecovery()` and activates it, which only announces `my-ip`. The live App sends `identity` after the original outbound connect, but the signaling-owned recovery path does not replay the G1 identity on the replacement socket.
 
-### Physical two-device LAN matrix after merge
+The passive persistent-LAN receiver requires an `identity` frame within `PASSIVE_INBOUND_IDENTITY_TIMEOUT_MS = 5000`; `my-ip` is explicitly consumed only as metadata before identity. Therefore an outbound recovered socket is not self-sufficient as a valid new passive session on the peer.
 
-Use two Android devices on the same ordinary Wi-Fi LAN:
+Physical logs showing repeated ~5 s replacement cycles are strongly consistent with this defect. The exact remote rejection reason was not captured on the peer, so the physical symptom linkage remains `LIKELY`, while the missing recovery identity replay itself is `CONFIRMED` from code.
 
-1. Confirm both discover the expected stable peer over LAN.
-2. A → B from a saved contact: one logical session; B passively promotes; correct stable identity; text both directions.
-3. Clean disconnect and repeat B → A.
-4. Simultaneous connect on both phones to the same saved peer: converge to one healthy session; no stuck `WIFI_CONNECTING`; no immediate disconnect.
-5. Exercise a short signaling interruption/recovery when practical; successful recovery must not false-disconnect the UI.
-6. File-transfer smoke test both directions while signaling remains connected.
-7. On any failure capture current LAN IPs, initiator, `[G1/SIGNAL]`, coordinator transitions, and `[G1/LAN]` logs before further network code changes.
+### CONFIRMED architecture weakness
 
-Do not proceed to P2P ownership migration until this matrix passes or failures are diagnosed.
+`attachIncomingSession()` currently rejects any new inbound socket whenever a healthy `activeSession` already exists, before the passive identity is known. Deterministic same-peer duplicate arbitration exists at coordinator level only after identity/admission, so the signaling runtime can resolve simultaneous inbound/outbound races by arrival timing rather than stable peer identity. This is incompatible with the master invariant that simultaneous same-peer races converge deterministically.
 
-## Known limitations to keep visible
+### NOT CONFIRMED
 
-- Current LAN identity admission is not cryptographic authentication. NSD/TXT + `deviceId` + route/socket matching remain spoofable by a capable LAN attacker.
-- Cryptographic peer authentication/pairing is still mandatory before Internet-reachable I2P control signaling.
-- General duplicate arbitration and make-before-break across transport families remain unfinished.
-- Background UI re-attachment/process-death network ownership remains later work.
-- P2P is still App-owned.
-- Calls/call history, APK/APKS end-to-end validation, file performance, messaging completeness, UI, security/CI/release hardening remain later release gates.
+- `react-native-tcp-socket` TCP KeepAlive being the root cause of the ~5 s cycle is not established. `SignalingSession.attachSocket()` already calls `setKeepAlive(true, 5000)` best-effort and the application heartbeat runs every 6 s. Do not change heartbeat cadence merely from the external-agent KeepAlive hypothesis.
+- A `Broken pipe` or `Attempted to write to closed socket` establishes a write against a dead/closed socket, not why the peer closed it.
 
-## Progress metric
+## Immediate stabilization strategy
 
-G1-before-I2P: **42%** until the Phase 5c documentation head is fully green and merged into `main`. After verified merge, raise cautiously to approximately **45%**; physical LAN certification is still the next release gate.
+Before P2P ownership migration, calls refactor, I2P, UI expansion, or performance work:
 
-## Goal constraint
+1. Make outbound signaling identity part of signaling-session ownership, so every original or recovered outbound session announces stable G1 identity before application frames.
+2. Add deterministic tests for recovery identity replay and for application frames not being sent on an un-identified replacement.
+3. Move simultaneous same-peer LAN duplicate arbitration to a point where stable identity is available; never let arrival order alone choose the surviving logical session.
+4. Ensure disconnect/close clears both signaling runtime and coordinator logical ownership exactly once; repeated connect/disconnect must return both sides to a reusable IDLE state.
+5. Add characterization/regression tests for repeated disconnect/reconnect and side-reversal.
+6. Run full CI on the stabilization branch.
+7. Only then repeat the physical ordinary-LAN matrix. No P2P migration until LAN race/recovery/reconnect passes.
 
-Finish and device-verify G1 P0/P1 reliability before implementing I2P. I2P remains a future independent overlay/transport. I2P Destination is route addressing, not peer identity. Cryptographic peer authentication is a hard prerequisite before Internet-reachable control signaling.
+## Release order remains unchanged
+
+Stage A: finish and device-verify G1 core reliability (networking ownership, background lifecycle, calls/call history, APK/APKS correctness, file-transfer isolation/performance, messaging completeness, UI/UX, security/CI/release hardening).
+
+Stage B: only after Stage A is release-ready, add I2P as an independent overlay route. I2P destination is route addressing, not peer identity. Cryptographic peer authentication/pairing is a hard prerequisite before Internet-reachable control signaling.
+
+## Evidence rules
+
+Use: `CONFIRMED`, `LIKELY`, `HYPOTHESIS`, `GOAL`, `NOT VERIFIED`.
+
+Priority of truth:
+1. current code/tests;
+2. CI on the same SHA;
+3. reproducible raw device evidence;
+4. this rolling continuation;
+5. dated checkpoints/handoffs;
+6. external-agent interpretations.
+
+Do not store secrets or private identity material in the public repository.

@@ -68,6 +68,30 @@ describe('LAN passive session admission policy', () => {
     );
   });
 
+  test('validation-only admission exposes stable-id race choice without adopting coordinator state', () => {
+    const registry = makeRegistry(peer, true);
+    const coordinator = {
+      shouldYieldToInbound: jest.fn(() => true),
+      adoptSignalingOwnerSession: jest.fn(),
+    };
+    const handler = createLanPassiveAdmissionHandler({ registry, coordinator });
+
+    const result = handler({
+      message: { type: 'identity', deviceId: 'peer-1', deviceName: 'Peer One' },
+      peerAddress: '192.168.0.36',
+      validateOnly: true,
+    });
+
+    expect(result).toEqual(expect.objectContaining({
+      accepted: true,
+      peerId: 'peer-1',
+      transport: 'LAN',
+      preferInbound: true,
+    }));
+    expect(coordinator.shouldYieldToInbound).toHaveBeenCalledWith('peer-1');
+    expect(coordinator.adoptSignalingOwnerSession).not.toHaveBeenCalled();
+  });
+
   test('rejects an unknown deviceId without adopting the socket', () => {
     const registry = makeRegistry(peer, true);
     const coordinator = { adoptSignalingOwnerSession: jest.fn() };

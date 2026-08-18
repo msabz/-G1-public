@@ -3,6 +3,14 @@ import TcpSocket from 'react-native-tcp-socket';
 export const WRITE_CHUNK_SIZE = 16 * 1024;
 export const MAX_SIGNALING_BUFFER_BYTES = 64 * 1024;
 
+// Stable local G1 identity is safe to replay on every outbound signaling socket.
+// The live App historically sent identity only after the first connect. A
+// signaling-owned transient redial creates a fresh TCP session without returning
+// through that App path, so remember the latest outbound identity and replay it
+// when a replacement outbound session attaches. This keeps recovery self-
+// sufficient without coupling SignalingSession to persistence/App runtime.
+let cachedOutboundIdentity = null;
+
 function utf8ByteLength(value) {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
@@ -18,6 +26,19 @@ function utf8ByteLength(value) {
   return bytes;
 }
 
+function isIdentityMessage(message) {
+  return !!(message && message.type === 'identity' && message.deviceId);
+}
+
+function sameIdentity(left, right) {
+  return !!(
+    left &&
+    right &&
+    left.deviceId === right.deviceId &&
+    (left.deviceName || '') === (right.deviceName || '')
+  );
+}
+
 export class SignalingSession {
   constructor(options = {}) {
     this.socket = null;
@@ -29,6 +50,7 @@ export class SignalingSession {
     this.peerInfo = options.peerInfo || null;
     this.isOutbound = !!options.isOutbound;
     this.isConnected = false;
+    this.outboundIdentitySent = null;
   }
 
   attachSocket(socket, generation = 0) {
@@ -37,6 +59,7 @@ export class SignalingSession {
     this.generation = generation;
     this.stateHolder = { buf: '' };
     this.isConnected = true;
+    this.outboundIdentitySent = null;
 
     // Signaling is a long-lived control channel. Keep the TCP socket alive even
     // while chat is idle or a large file is flowing over the independent 8090
@@ -50,6 +73,14 @@ export class SignalingSession {
     } catch (e) {}
 
     this._bindSocketEvents(socket, generation);
+
+    // A recovered outbound session is a new passive inbound session on the
+    // remote peer. Replay stable identity before heartbeat/route/application
+    // traffic can use the replacement socket. The first ever outbound session
+    // has no cached identity yet and keeps the historical App-driven handshake.
+    if (this.isOutbound && cachedOutboundIdentity) {
+      this.sendMessage(cachedOutboundIdentity);
+    }
   }
 
   _bindSocketEvents(socket, generation) {
@@ -105,6 +136,23 @@ export class SignalingSession {
   sendMessage(msgObj) {
     const socket = this.socket;
     if (!socket || !this.isConnected) return false;
+
+    const identity = this.isOutbound && isIdentityMessage(msgObj)
+      ? { ...msgObj }
+      : null;
+
+    // The App can still send identity explicitly for compatibility. If attach()
+    // already replayed the same identity on this socket, treat that send as an
+    // idempotent success instead of producing a duplicate application identity.
+    if (identity && sameIdentity(this.outboundIdentitySent, identity)) {
+      cachedOutboundIdentity = identity;
+      return true;
+    }
+
+    if (identity) {
+      cachedOutboundIdentity = identity;
+    }
+
     const payload = JSON.stringify(msgObj) + '\n';
     try {
       if (payload.length <= WRITE_CHUNK_SIZE) {
@@ -114,6 +162,7 @@ export class SignalingSession {
           socket.write(payload.slice(i, i + WRITE_CHUNK_SIZE));
         }
       }
+      if (identity) this.outboundIdentitySent = identity;
       return true;
     } catch (e) {
       console.warn('SignalingSession send failed:', e?.message || e);
@@ -127,6 +176,7 @@ export class SignalingSession {
     const sock = this.socket;
     this.socket = null;
     this.stateHolder = { buf: '' };
+    this.outboundIdentitySent = null;
     return sock;
   }
 
@@ -135,6 +185,7 @@ export class SignalingSession {
     const sock = this.socket;
     this.socket = null;
     this.stateHolder = { buf: '' };
+    this.outboundIdentitySent = null;
     if (sock) {
       try {
         sock.destroy();
