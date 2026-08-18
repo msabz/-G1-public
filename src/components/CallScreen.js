@@ -30,8 +30,8 @@ export default function CallScreen({
   // ICE/PC connection while both screens still displayed "جاري الاتصال" and
   // their timers differed substantially because they started at UI mount time.
   useEffect(() => {
-    if (audioEngine !== 'webrtc') return undefined;
     setSeconds(0);
+    if (audioEngine !== 'webrtc') return undefined;
     const t = setInterval(() => setSeconds(s => s + 1), 1000);
     return () => clearInterval(t);
   }, [audioEngine]);

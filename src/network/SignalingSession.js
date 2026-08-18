@@ -11,7 +11,7 @@ export const MAX_SIGNALING_BUFFER_BYTES = 64 * 1024;
 // sufficient without coupling SignalingSession to persistence/App runtime.
 let cachedOutboundIdentity = null;
 
-function utf8ByteLength(value) {
+export function utf8ByteLength(value) {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
