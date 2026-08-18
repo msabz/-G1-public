@@ -6,6 +6,7 @@ export { MAX_SIGNALING_BUFFER_BYTES, DEFAULT_SIGNALING_PORT };
 export const SIGNALING_HEARTBEAT_INTERVAL_MS = 6000;
 export const SIGNALING_HEARTBEAT_TIMEOUT_MS = 18000;
 export const SIGNALING_RECOVERY_GRACE_MS = 4000;
+export const PASSIVE_INBOUND_IDENTITY_TIMEOUT_MS = 5000;
 
 let activeSession = null;
 let onMessageCallback = null;
@@ -23,6 +24,8 @@ let recoveryTimer = null;
 let recoveryGeneration = 0;
 let recoveryInProgress = false;
 let recoveryExpectedInboundPeerAddress = null;
+let recoveryInboundAdmissionSnapshot = null;
+let passiveInboundAdmissionHandler = null;
 const messageObservers = new Set();
 const disconnectObservers = new Set();
 
@@ -93,10 +96,112 @@ function stopHeartbeat() {
   lastInboundActivityAt = 0;
 }
 
+function clearPassiveInboundIdentityTimer(session) {
+  if (!session?.passiveAdmissionTimer) return;
+  clearTimeout(session.passiveAdmissionTimer);
+  session.passiveAdmissionTimer = null;
+}
+
+function terminateUnadmittedPassiveSession(session, reason = 'admission-rejected') {
+  if (!session) return false;
+  clearPassiveInboundIdentityTimer(session);
+  session.passiveAdmissionRejected = true;
+
+  const socket = session.socket;
+  if (activeSession === session) {
+    stopHeartbeat();
+    activeSession = null;
+  }
+
+  logSocket('PASSIVE_INBOUND_REJECTED', socket, `reason=${reason}`);
+  try { session.destroy(); } catch (e) {}
+  setAvailabilityStatus();
+  return true;
+}
+
+function startPassiveInboundIdentityTimer(session) {
+  clearPassiveInboundIdentityTimer(session);
+  if (!session?.passiveAdmissionRequired || session.passiveAdmissionAccepted) return;
+
+  session.passiveAdmissionTimer = setTimeout(() => {
+    session.passiveAdmissionTimer = null;
+    if (
+      activeSession !== session ||
+      !session.isConnected ||
+      !session.passiveAdmissionRequired ||
+      session.passiveAdmissionAccepted
+    ) {
+      return;
+    }
+    terminateUnadmittedPassiveSession(session, 'identity-timeout');
+  }, PASSIVE_INBOUND_IDENTITY_TIMEOUT_MS);
+}
+
+function dispatchApplicationMessage(msg) {
+  notifyMessageObservers(msg);
+  if (onMessageCallback) onMessageCallback(msg);
+}
+
+function handlePassiveInboundPreAdmissionMessage(session, msg) {
+  if (!session?.passiveAdmissionRequired || session.passiveAdmissionAccepted) return false;
+
+  // Every G1 session announces its local route immediately after activation.
+  // This metadata is useful only after identity is known, so consume it here
+  // rather than treating it as proof of identity or leaking it to app runtimes.
+  if (msg?.type === 'my-ip') {
+    logSocket('PASSIVE_ROUTE_METADATA_IGNORED', session.socket, `ip=${normalizePeerAddress(msg.ip) || 'unknown'}`);
+    return true;
+  }
+
+  if (msg?.type !== 'identity' || !msg.deviceId) {
+    terminateUnadmittedPassiveSession(session, 'identity-required');
+    return true;
+  }
+
+  const peerAddress = normalizePeerAddress(session.socket?.remoteAddress || session.peerInfo?.host || null);
+  let decision = null;
+  try {
+    decision = passiveInboundAdmissionHandler?.({
+      message: msg,
+      peerAddress,
+      session,
+    }) || null;
+  } catch (error) {
+    console.warn('[G1/SIGNAL] passive inbound admission handler failed:', error?.message || error);
+    decision = { accepted: false, reason: 'validator-error' };
+  }
+
+  if (decision?.then && typeof decision.then === 'function') {
+    terminateUnadmittedPassiveSession(session, 'async-validator-not-supported');
+    return true;
+  }
+
+  if (decision?.accepted !== true) {
+    terminateUnadmittedPassiveSession(session, decision?.reason || 'identity-rejected');
+    return true;
+  }
+
+  session.passiveAdmissionAccepted = true;
+  session.passiveAdmissionDetails = decision;
+  clearPassiveInboundIdentityTimer(session);
+  logSocket(
+    'PASSIVE_INBOUND_ADMITTED',
+    session.socket,
+    `peer=${decision.peerId || msg.deviceId} transport=${decision.transport || 'LAN'}`
+  );
+  setActiveServiceStatus('متصل عبر الشبكة المحلية');
+
+  // Mark the session admitted before dispatching identity. If several frames
+  // arrived in one TCP read, following app frames are now safe to dispatch.
+  dispatchApplicationMessage(msg);
+  return true;
+}
+
 function cancelPendingRecovery() {
   recoveryGeneration += 1;
   recoveryInProgress = false;
   recoveryExpectedInboundPeerAddress = null;
+  recoveryInboundAdmissionSnapshot = null;
   if (recoveryTimer) {
     clearTimeout(recoveryTimer);
     recoveryTimer = null;
@@ -105,6 +210,7 @@ function cancelPendingRecovery() {
 
 function setupSessionEvents(session) {
   session.onMessage = (msg) => {
+    if (activeSession !== session || !session.isConnected || session.passiveAdmissionRejected) return;
     lastInboundActivityAt = Date.now();
 
     // Heartbeat frames belong to the signaling control plane. They must never
@@ -123,14 +229,20 @@ function setupSessionEvents(session) {
       return;
     }
 
-    notifyMessageObservers(msg);
-    if (onMessageCallback) onMessageCallback(msg);
+    if (handlePassiveInboundPreAdmissionMessage(session, msg)) return;
+    dispatchApplicationMessage(msg);
   };
 
   session.onDisconnect = () => {
     if (activeSession === session) {
       const direction = session.isOutbound ? 'outbound' : 'inbound';
       logSocket('SESSION_DISCONNECTED', session.socket, `direction=${direction}`);
+
+      if (session.passiveAdmissionRequired && !session.passiveAdmissionAccepted) {
+        terminateUnadmittedPassiveSession(session, 'socket-disconnect-before-identity');
+        return;
+      }
+
       beginTransientRecovery(session, 'socket-disconnect');
     }
   };
@@ -168,7 +280,13 @@ function activateSession(session, socket, direction, reason = 'connect') {
   activeSession = session;
   lastInboundActivityAt = Date.now();
   logSocket('SESSION_ACTIVE', socket, `direction=${direction} reason=${reason}`);
-  setActiveServiceStatus(reason === 'transient-recovery' ? 'تمت استعادة الاتصال' : 'متصل — G1 يعمل في الخلفية');
+  setActiveServiceStatus(
+    session.passiveAdmissionRequired && !session.passiveAdmissionAccepted
+      ? 'جاري التحقق من جهاز قريب'
+      : reason === 'transient-recovery'
+        ? 'تمت استعادة الاتصال'
+        : 'متصل — G1 يعمل في الخلفية'
+  );
   startHeartbeat(session);
   announceLocalRoute(session).catch(() => {});
 }
@@ -180,6 +298,7 @@ function beginTransientRecovery(session, reason) {
   const peerInfo = session.peerInfo ? { ...session.peerInfo } : null;
   const wasOutbound = !!session.isOutbound;
 
+  clearPassiveInboundIdentityTimer(session);
   stopHeartbeat();
   activeSession = null;
   const token = ++recoveryGeneration;
@@ -187,6 +306,13 @@ function beginTransientRecovery(session, reason) {
   recoveryExpectedInboundPeerAddress = wasOutbound
     ? null
     : normalizePeerAddress(previousSocket?.remoteAddress || peerInfo?.host || peerInfo?.ip || null);
+  recoveryInboundAdmissionSnapshot = wasOutbound
+    ? null
+    : {
+        required: session.passiveAdmissionRequired === true,
+        accepted: session.passiveAdmissionAccepted === true,
+        details: session.passiveAdmissionDetails || null,
+      };
   callService('updateConnectionStatus', 'انقطع المسار مؤقتاً — جاري الاستعادة');
 
   logSocket(
@@ -226,6 +352,7 @@ function beginTransientRecovery(session, reason) {
     recoveryTimer = null;
     recoveryInProgress = false;
     recoveryExpectedInboundPeerAddress = null;
+    recoveryInboundAdmissionSnapshot = null;
     if (activeSession && activeSession.isConnected) return;
     console.warn(`[G1/SIGNAL][none] RECOVERY_EXHAUSTED reason=${reason}`);
     setAvailabilityStatus();
@@ -269,6 +396,10 @@ export function setOnMessage(cb) {
 export function setOnDisconnect(cb) {
   onDisconnectCallback = cb;
   if (activeSession) setupSessionEvents(activeSession);
+}
+
+export function setPassiveInboundAdmissionHandler(handler) {
+  passiveInboundAdmissionHandler = typeof handler === 'function' ? handler : null;
 }
 
 export function addSignalingMessageObserver(observer) {
@@ -365,15 +496,39 @@ function attachIncomingSession(socket, promote, source) {
     }
   }
 
+  const wasRecovering = recoveryInProgress;
+  const inheritedAdmission = wasRecovering ? recoveryInboundAdmissionSnapshot : null;
+  const passiveAdmissionRequired =
+    source === 'persistent' &&
+    !isExplicitServerMode &&
+    typeof passiveInboundAdmissionHandler === 'function';
+
   if (promote) promote();
   const session = new SignalingSession({
     isOutbound: false,
     peerInfo: { host: normalizePeerAddress(socket?.remoteAddress) },
   });
+  session.passiveAdmissionRequired = passiveAdmissionRequired;
+  session.passiveAdmissionAccepted = passiveAdmissionRequired
+    ? inheritedAdmission?.required === true && inheritedAdmission?.accepted === true
+    : true;
+  session.passiveAdmissionDetails = session.passiveAdmissionAccepted
+    ? inheritedAdmission?.details || null
+    : null;
+  session.passiveAdmissionRejected = false;
+  session.passiveAdmissionTimer = null;
+
   setupSessionEvents(session);
   session.attachSocket(socket);
-  activateSession(session, socket, 'inbound', recoveryInProgress ? 'peer-redial' : 'connect');
-  notifyClientConnected();
+  activateSession(session, socket, 'inbound', wasRecovering ? 'peer-redial' : 'connect');
+
+  if (session.passiveAdmissionRequired && !session.passiveAdmissionAccepted) {
+    startPassiveInboundIdentityTimer(session);
+  }
+
+  // waitForClientConnection belongs to the explicit Wi-Fi Direct server flow.
+  // Passive LAN sockets must never leave a stale clientConnectedPending token.
+  if (isExplicitServerMode) notifyClientConnected();
   return true;
 }
 
@@ -505,6 +660,7 @@ export function closeSignaling() {
   activeSession = null;
 
   if (session) {
+    clearPassiveInboundIdentityTimer(session);
     logSocket('SESSION_DESTROYED', session.socket, 'reason=closeSignaling');
     session.destroy();
   }

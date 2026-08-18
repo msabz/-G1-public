@@ -6,9 +6,12 @@ import { AppRegistry } from 'react-native';
 import App from './src/App';
 import { setUiAttached } from './src/services/BackgroundRuntime';
 import { connectionCoordinator } from './src/network/ConnectionCoordinator';
+import { lanPassiveAdmissionHandler } from './src/network/LanPassiveAdmission';
+import { setPassiveInboundAdmissionHandler } from './src/webrtc/signaling';
 import { signalingOwner } from './src/webrtc/signalingOwner';
 
 connectionCoordinator.setSignalingOwner(signalingOwner);
+setPassiveInboundAdmissionHandler(lanPassiveAdmissionHandler);
 
 function G1Root() {
   useEffect(() => {
