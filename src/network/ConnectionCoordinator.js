@@ -120,6 +120,9 @@ export class ConnectionCoordinator {
     if (!lanInfo.host) {
       throw new Error('LAN host is missing for peer');
     }
+    if (this.signalingOwner && typeof this.signalingOwner.connectOutbound !== 'function') {
+      throw new Error('Configured signaling owner is missing connectOutbound()');
+    }
 
     const currentGen = ++this.generation;
     this.cancelConnecting();
@@ -138,10 +141,6 @@ export class ConnectionCoordinator {
 
   async _connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs) {
     const owner = this.signalingOwner;
-    if (typeof owner?.connectOutbound !== 'function') {
-      throw new Error('Configured signaling owner is missing connectOutbound()');
-    }
-
     let settled = false;
     let cancelled = false;
     const abort = () => {

@@ -148,6 +148,21 @@ describe('ConnectionCoordinator signaling-owner boundary', () => {
     expect(coordinator.activeSession).toBeNull();
   });
 
+  test('invalid signaling-owner contract fails before coordinator state is mutated', async () => {
+    const coordinator = new ConnectionCoordinator({ signalingOwner: {} });
+    const peer = {
+      deviceId: 'peer-device',
+      transports: { LAN: { host: '192.168.0.36', port: 8089 } },
+    };
+
+    await expect(coordinator.connectLanPeer(peer, 5000)).rejects.toThrow(
+      'Configured signaling owner is missing connectOutbound()'
+    );
+    expect(coordinator.state).toBe(COORDINATOR_STATE.IDLE);
+    expect(coordinator.currentPeer).toBeNull();
+    expect(coordinator.currentTransport).toBeNull();
+  });
+
   test('refuses signaling-owner replacement while connecting or connected', async () => {
     let resolveConnect;
     const owner = makeOwner({
