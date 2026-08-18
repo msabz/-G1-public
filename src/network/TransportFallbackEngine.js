@@ -54,6 +54,10 @@ export class TransportFallbackEngine {
     this.lanTimeoutMs = options.lanTimeoutMs || 5000;
     this.p2pTimeoutMs = options.p2pTimeoutMs || 8000;
     this.bluetoothTimeoutMs = options.bluetoothTimeoutMs || 8000;
+    // Make connection ownership explicit without changing the default live
+    // behavior. The singleton remains the production default; injection gives
+    // tests and the future coordinator-owned orchestrator an exact owner seam.
+    this.coordinator = options.coordinator || connectionCoordinator;
   }
 
   setMode(mode) {
@@ -84,10 +88,10 @@ export class TransportFallbackEngine {
       try {
         if (onFallbackStep) onFallbackStep('LAN');
         const session = await runWithTransportTimeout(
-          () => connectionCoordinator.connectLanPeer(peer, this.lanTimeoutMs),
+          () => this.coordinator.connectLanPeer(peer, this.lanTimeoutMs),
           this.lanTimeoutMs,
           'LAN',
-          () => connectionCoordinator.cancelConnecting()
+          () => this.coordinator.cancelConnecting()
         );
         return { transport: 'LAN', session };
       } catch (err) {

@@ -68,10 +68,15 @@ describe('Discovery & Fallback Race Conditions', () => {
   });
 
   test('fallback engine gracefully recovers when LAN dialing fails before P2P succeeds', async () => {
-    const engine = new TransportFallbackEngine({ mode: TRANSPORT_MODE.AUTO });
     const coord = new ConnectionCoordinator({ myDeviceId: 'device-alpha' });
+    const engine = new TransportFallbackEngine({
+      mode: TRANSPORT_MODE.AUTO,
+      coordinator: coord,
+    });
 
-    jest.spyOn(coord, 'connectLanPeer').mockRejectedValue(new Error('ECONNREFUSED'));
+    const connectLan = jest
+      .spyOn(coord, 'connectLanPeer')
+      .mockRejectedValue(new Error('ECONNREFUSED'));
 
     const peer = {
       deviceId: 'device-gamma',
@@ -85,7 +90,10 @@ describe('Discovery & Fallback Race Conditions', () => {
     const result = await engine.connect(peer, { connectP2p });
 
     expect(result.transport).toBe('P2P');
+    expect(connectLan).toHaveBeenCalledTimes(1);
+    expect(connectLan).toHaveBeenCalledWith(peer, engine.lanTimeoutMs);
     expect(connectP2p).toHaveBeenCalledTimes(1);
+    expect(connectP2p).toHaveBeenCalledWith(peer);
 
     coord.disconnect();
   });
