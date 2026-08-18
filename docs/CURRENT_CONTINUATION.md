@@ -2,7 +2,7 @@
 
 This is the rolling resume pointer. Update it at every material phase transition. Dated checkpoint files remain the historical archive.
 
-Last prepared: 2026-08-18 after LAN Phase 5d physical revalidation and Stage A5 Phase 6a P2P ownership-boundary merge.
+Last prepared: 2026-08-19 after LAN Phase 5d physical verification, Stage A5 Phase 6a merge, and Phase 6b App-handoff seam merge.
 
 ## Read first
 
@@ -26,6 +26,8 @@ Phase 5d checkpoint:
 - Phase 5d ordinary-LAN networking is therefore **CODED / UNIT VERIFIED / CI VERIFIED / DEVICE VERIFIED** for the tested matrix.
 - PR #13 merged Stage A5 Phase 6a at `55b7d37c043651215757705fe0f8c4a883debe9d` (`refactor: establish coordinator-owned Wi-Fi Direct boundary`).
 - PR #13 final head `5e7193569b46db6a79d68dac495a8c5f31582211` passed GitHub Actions run #179 (`32177708754`): JavaScript tests, production bundle, Android unit tests, Debug APK, Release APK and both artifact uploads.
+- Physical P2P regression smoke on the existing live App path passed after the Phase 6a boundary landed: with LAN intentionally unavailable, Wi-Fi Direct established, text delivered both directions, and disconnect returned both devices to a usable state. This is a **legacy-live-path regression PASS**, not verification of the new coordinator live path.
+- PR #14 merged the Phase 6b App-handoff seam at `fdaea620d64644ea1c535479579893f1528e7227` (`refactor: prepare live App P2P handoff to coordinator`). Its final head `f6e8e43aa6334bdfde9c439b5bfd3c59b6f3fe11` passed GitHub Actions run #185 (`32178516885`) and CodeRabbit, with no review threads at merge time.
 
 ## Phase 5d LAN conclusions
 
@@ -47,35 +49,40 @@ Do not revive the historical TCP-KeepAlive root-cause claim. `SignalingSession` 
 
 ### Phase 6a — MERGED / UNIT VERIFIED / CI VERIFIED
 
-PR #13 establishes the P2P ownership seam without yet replacing the live App P2P path.
-
-Implemented:
+PR #13 established the transport/coordinator ownership boundary:
 
 - `WifiDirectTransportAdapter` owns Android Wi-Fi Direct route lifecycle: stable-identity-backed P2P observations, group negotiation, process bind/unbind and group cleanup.
 - Raw Wi-Fi Direct MAC / `deviceAddress` is route metadata only and never becomes G1 peer identity by itself.
 - `ConnectionCoordinator.connectP2pPeer()` owns logical P2P connection state.
-- `signalingOwner` now supports both outbound signaling and group-owner inbound accept/wait through the existing `signaling.js` runtime.
+- `signalingOwner` supports both outbound signaling and group-owner inbound accept/wait through the existing `signaling.js` runtime.
 - `signaling.js` remains the single signaling socket/session/heartbeat/recovery owner; the coordinator does not start a second heartbeat for externally managed sessions.
 - Coordinator P2P cancellation/failure/terminal teardown delegates Android group cleanup to the P2P adapter.
 - `TransportFallbackEngine` defaults P2P to the coordinator path when no compatibility handler is supplied, while legacy handler precedence remains during migration.
-- Production bootstrap wires the P2P adapter into the coordinator and begins passive route observation.
-- Tests cover P2P client/group-owner roles, cancellation, signaling failure cleanup, terminal signaling loss, explicit disconnect, stable identity vs route separation, bind/cleanup and fallback ownership.
 
-### Phase 6a scope boundary
+### Phase 6b-a — MERGED / UNIT VERIFIED / CI VERIFIED / LEGACY P2P REGRESSION VERIFIED
 
-`src/App.js` still owns the currently live Wi-Fi Direct UI/orchestration path (`connectToPeer`, group-owner/client signaling bootstrap, and legacy P2P reconnect). Therefore **Stage A5 is not complete and P2P is not device-verified on the new coordinator path yet**.
+PR #14 added `p2pAppBridge` as a narrow presentation-to-coordinator seam without changing `src/App.js` yet:
 
-## Immediate next engineering action — Phase 6b
+- a saved stable contact plus a fresh Wi-Fi Direct route is projected into `PeerRegistry` as a P2P endpoint;
+- DNS-SD-confirmed `peerId` may supply stable G1 identity, but raw `deviceAddress` alone never may;
+- logical connect delegates to `ConnectionCoordinator.connectP2pPeer()`;
+- the bridge verifies the exact stable peer and P2P transport own the resulting coordinator session;
+- the returned UI projection carries display name, route, transport and coordinator control ownership rather than socket ownership.
 
-Move the live App P2P intent onto the coordinator/adapter path in one bounded slice:
+The physical PASS obtained after this seam confirms no regression in the still-live legacy P2P path. It does **not** prove the coordinator live path because `src/App.js` has not been switched over yet.
 
-1. App remains presentation/user-intent only; it requests P2P connect but does not create/own signaling sockets.
-2. Both outgoing and trusted incoming Wi-Fi Direct negotiation go through `ConnectionCoordinator.connectP2pPeer()` + `WifiDirectTransportAdapter`.
-3. Native `PEER_CONNECTED` becomes adapter route evidence, not an App trigger to call `createSignalingServer()` / `connectToSignalingServer()`.
-4. P2P `activeControlOwner` becomes coordinator-owned.
-5. Remove/disable App-owned P2P signaling reconnect only after the coordinator-owned live path has deterministic tests.
-6. Preserve file/data plane independence, message history and existing UI semantics.
-7. After CI passes, perform one focused physical P2P bootstrap test in both group-owner/client roles before expanding the matrix.
+## Immediate next engineering action — Phase 6b-b
+
+Move the live App P2P intent onto the merged bridge in one bounded slice:
+
+1. outgoing and trusted incoming Wi-Fi Direct negotiation call the App→coordinator bridge rather than direct App-owned signaling bootstrap;
+2. native `PEER_CONNECTED` is treated as adapter route evidence while coordinator P2P is connecting/connected, not as an App trigger to open a second signaling socket;
+3. P2P `activeControlOwner` becomes coordinator-owned;
+4. App no longer performs legacy P2P signaling reconnect for coordinator-owned sessions;
+5. explicit and terminal teardown delegate signaling + group cleanup through coordinator/adapter exactly once;
+6. preserve message history, file/data-plane independence, call signaling and current UI semantics;
+7. add deterministic tests for outgoing/incoming live intent, duplicate native event suppression, coordinator-owned teardown and no legacy reconnect;
+8. after CI is green, perform one focused physical P2P bootstrap test on the new live path before expanding the matrix.
 
 Do not begin I2P. Stage B remains gated on the full Stage A release-ready bar.
 
