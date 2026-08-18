@@ -16,6 +16,46 @@ function isHealthyAdmittedInbound(signalingHealth) {
     !!signalingHealth?.peerAddress;
 }
 
+function messageFingerprint(message) {
+  if (!message || typeof message !== 'object') return 'invalid';
+  if (message.id != null) return `id:${message.id}`;
+  if (message.messageId != null) return `messageId:${message.messageId}`;
+  if (message.transferId != null) return `transferId:${message.transferId}`;
+  return [
+    message.sender || '',
+    message.type || '',
+    Number(message.time) || 0,
+    message.text || '',
+    message.fileName || '',
+    message.path || '',
+    message.callKind || '',
+    message.callResult || '',
+  ].join('|');
+}
+
+export function mergePeerMessageHistory(history = [], liveMessages = []) {
+  const merged = [];
+  const indexByKey = new Map();
+
+  const upsert = (message, preferIncoming) => {
+    if (!message || typeof message !== 'object') return;
+    const key = messageFingerprint(message);
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex == null) {
+      indexByKey.set(key, merged.length);
+      merged.push(message);
+      return;
+    }
+    if (preferIncoming) {
+      merged[existingIndex] = { ...merged[existingIndex], ...message };
+    }
+  };
+
+  (Array.isArray(history) ? history : []).forEach(message => upsert(message, false));
+  (Array.isArray(liveMessages) ? liveMessages : []).forEach(message => upsert(message, true));
+  return merged;
+}
+
 export function shouldAllowPassiveLanAdmission({
   uiMounted = true,
   appState,
