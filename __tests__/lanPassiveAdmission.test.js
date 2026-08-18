@@ -13,6 +13,12 @@ jest.mock('../src/webrtc/signaling', () => ({
   },
 }));
 
+jest.mock('../src/network/ConnectionCoordinator', () => ({
+  connectionCoordinator: {
+    adoptSignalingOwnerSession: jest.fn(),
+  },
+}));
+
 const { createLanPassiveAdmissionHandler } = require('../src/network/LanPassiveAdmission');
 
 function makeRegistry(peer, current = true) {
