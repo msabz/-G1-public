@@ -50,6 +50,7 @@ export class ConnectionCoordinator {
   }
 
   setSignalingOwner(owner) {
+    if (owner === this.signalingOwner) return;
     if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.CONNECTED) {
       throw new Error('Cannot replace signaling owner while a connection is active');
     }
