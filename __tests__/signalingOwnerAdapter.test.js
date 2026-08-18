@@ -3,8 +3,10 @@ jest.mock('../src/webrtc/signaling', () => ({
   cancelSignalingConnectAttempt: jest.fn(),
   closeSignaling: jest.fn(),
   connectToSignalingServer: jest.fn(),
+  createSignalingServer: jest.fn(),
   getActiveSession: jest.fn(),
   sendSignalingMessage: jest.fn(),
+  waitForClientConnection: jest.fn(),
 }));
 
 import * as signalingRuntime from '../src/webrtc/signaling';
@@ -15,7 +17,7 @@ describe('signalingOwner adapter', () => {
     jest.clearAllMocks();
   });
 
-  test('delegates the coordinator ownership contract to the live signaling runtime without adding behavior', async () => {
+  test('delegates outbound and inbound coordinator ownership without adding a second session owner', async () => {
     const session = { isConnected: true };
     const subscription = { remove: jest.fn() };
     const disconnectObserver = jest.fn();
@@ -23,6 +25,8 @@ describe('signalingOwner adapter', () => {
     const message = { type: 'chat', text: 'hello' };
 
     signalingRuntime.connectToSignalingServer.mockResolvedValue(undefined);
+    signalingRuntime.createSignalingServer.mockResolvedValue(undefined);
+    signalingRuntime.waitForClientConnection.mockResolvedValue(undefined);
     signalingRuntime.cancelSignalingConnectAttempt.mockReturnValue(true);
     signalingRuntime.getActiveSession.mockReturnValue(session);
     signalingRuntime.sendSignalingMessage.mockReturnValue(true);
@@ -42,6 +46,13 @@ describe('signalingOwner adapter', () => {
       3,
       600
     );
+
+    await expect(signalingOwner.acceptInbound({
+      port: 8089,
+      timeoutMs: 15000,
+    })).resolves.toBe(session);
+    expect(signalingRuntime.createSignalingServer).toHaveBeenCalledWith(8089);
+    expect(signalingRuntime.waitForClientConnection).toHaveBeenCalledWith(15000);
 
     expect(signalingOwner.cancelConnect(cancelReason)).toBe(true);
     expect(signalingRuntime.cancelSignalingConnectAttempt).toHaveBeenCalledWith(cancelReason);
