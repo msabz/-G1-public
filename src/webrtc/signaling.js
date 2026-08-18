@@ -56,6 +56,15 @@ function normalizePeerAddress(value) {
   return address || null;
 }
 
+function normalizeIdentityMessage(msg) {
+  if (msg?.type !== 'identity' || !msg.deviceId) return null;
+  return {
+    type: 'identity',
+    deviceId: msg.deviceId,
+    deviceName: msg.deviceName || '',
+  };
+}
+
 export function isSameSignalingEndpoint(left, right) {
   const a = normalizePeerAddress(left);
   const b = normalizePeerAddress(right);
@@ -190,6 +199,7 @@ function handlePassiveInboundPreAdmissionMessage(session, msg) {
 
   session.passiveAdmissionAccepted = true;
   session.passiveAdmissionDetails = decision;
+  session.passiveAdmissionIdentity = normalizeIdentityMessage(msg);
   clearPassiveInboundIdentityTimer(session);
   logSocket(
     'PASSIVE_INBOUND_ADMITTED',
@@ -237,6 +247,20 @@ function setupSessionEvents(session) {
     }
 
     if (handlePassiveInboundPreAdmissionMessage(session, msg)) return;
+
+    // Inherited admitted inbound recovery sessions may receive identity after
+    // admission is already restored. Keep the latest stable identity snapshot
+    // so a later foreground/App callback rebind can reconstruct UI ownership
+    // without opening a second signaling socket.
+    if (
+      session.passiveAdmissionRequired &&
+      session.passiveAdmissionAccepted &&
+      msg?.type === 'identity' &&
+      msg.deviceId
+    ) {
+      session.passiveAdmissionIdentity = normalizeIdentityMessage(msg);
+    }
+
     dispatchApplicationMessage(msg);
   };
 
@@ -336,6 +360,7 @@ function beginTransientRecovery(session, reason) {
         required: session.passiveAdmissionRequired === true,
         accepted: session.passiveAdmissionAccepted === true,
         details: session.passiveAdmissionDetails || null,
+        identity: session.passiveAdmissionIdentity || null,
       };
   callService('updateConnectionStatus', 'انقطع المسار مؤقتاً — جاري الاستعادة');
 
@@ -413,8 +438,42 @@ function startHeartbeat(session) {
 }
 
 export function setOnMessage(cb) {
+  const previousCallback = onMessageCallback;
   onMessageCallback = cb;
   if (activeSession) setupSessionEvents(activeSession);
+
+  // A task/Activity teardown intentionally leaves a healthy passive LAN session
+  // alive. When React mounts again, refs/UI start from IDLE while coordinator +
+  // signaling still own that admitted inbound session. Replay only the already-
+  // validated stable identity to a newly bound App callback so the existing
+  // promotion path can rehydrate the conversation instead of trying to connect
+  // a second socket. This is local state replay, not a network retransmission.
+  if (
+    typeof cb === 'function' &&
+    cb !== previousCallback &&
+    activeSession?.isConnected &&
+    activeSession.isOutbound === false &&
+    activeSession.passiveAdmissionRequired === true &&
+    activeSession.passiveAdmissionAccepted === true &&
+    activeSession.passiveAdmissionIdentity?.deviceId
+  ) {
+    const identity = { ...activeSession.passiveAdmissionIdentity };
+    logSocket(
+      'ACTIVE_IDENTITY_REPLAYED_TO_APP',
+      activeSession.socket,
+      `peer=${identity.deviceId}`
+    );
+    try {
+      const result = cb(identity);
+      if (result?.catch) {
+        result.catch(error => {
+          console.warn('[G1/SIGNAL] active identity replay callback failed:', error?.message || error);
+        });
+      }
+    } catch (error) {
+      console.warn('[G1/SIGNAL] active identity replay callback failed:', error?.message || error);
+    }
+  }
 }
 
 export function setOnDisconnect(cb) {
@@ -732,6 +791,9 @@ function attachIncomingSession(socket, promote, source, options = {}) {
     : true;
   session.passiveAdmissionDetails = session.passiveAdmissionAccepted
     ? inheritedAdmission?.details || null
+    : null;
+  session.passiveAdmissionIdentity = session.passiveAdmissionAccepted
+    ? inheritedAdmission?.identity || null
     : null;
   session.passiveAdmissionRejected = false;
   session.passiveAdmissionTimer = null;
