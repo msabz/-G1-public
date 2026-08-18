@@ -5,6 +5,10 @@ import React, { useEffect } from 'react';
 import { AppRegistry } from 'react-native';
 import App from './src/App';
 import { setUiAttached } from './src/services/BackgroundRuntime';
+import { connectionCoordinator } from './src/network/ConnectionCoordinator';
+import { signalingOwner } from './src/webrtc/signalingOwner';
+
+connectionCoordinator.setSignalingOwner(signalingOwner);
 
 function G1Root() {
   useEffect(() => {
