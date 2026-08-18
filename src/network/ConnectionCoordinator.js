@@ -1,6 +1,6 @@
 import { SignalingSession, connectOutboundSocket } from './SignalingSession';
 import { getDefaultSignalingListener } from './SignalingListener';
-import { peerRegistry, PEER_STATUS } from './PeerRegistry';
+import { peerRegistry, PEER_STATUS, TRANSPORTS } from './PeerRegistry';
 
 export const COORDINATOR_STATE = {
   IDLE: 'IDLE',
@@ -41,12 +41,20 @@ export class ConnectionCoordinator {
     this.signalingOwner = options.signalingOwner || null;
     this.activeSessionManagedExternally = false;
     this.signalingDisconnectSubscription = null;
+
+    // Wi-Fi Direct transport adapter owns only Android P2P route lifecycle:
+    // discovery observations, group negotiation, bind/unbind and cleanup. It
+    // never owns signaling, heartbeat, peer identity semantics or UI state.
+    this.p2pAdapter = options.p2pAdapter || null;
   }
 
   setIdentity({ deviceId, deviceName }) {
     this.myDeviceId = deviceId;
     this.myDeviceName = deviceName;
     peerRegistry.setMyDeviceId(deviceId);
+    try {
+      this.p2pAdapter?.setIdentity?.({ deviceId, deviceName });
+    } catch (e) {}
   }
 
   setSignalingOwner(owner) {
@@ -56,6 +64,22 @@ export class ConnectionCoordinator {
     }
     this._clearSignalingOwnerDisconnectSubscription();
     this.signalingOwner = owner || null;
+  }
+
+  setP2pAdapter(adapter) {
+    if (adapter === this.p2pAdapter) return;
+    if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.CONNECTED) {
+      throw new Error('Cannot replace P2P adapter while a connection is active');
+    }
+    this.p2pAdapter = adapter || null;
+    if (this.p2pAdapter && this.myDeviceId) {
+      try {
+        this.p2pAdapter.setIdentity?.({
+          deviceId: this.myDeviceId,
+          deviceName: this.myDeviceName,
+        });
+      } catch (e) {}
+    }
   }
 
   _setState(newState, payload = {}) {
@@ -75,6 +99,20 @@ export class ConnectionCoordinator {
     } catch (e) {}
   }
 
+  _releaseTransportAfterTermination(transport) {
+    if (transport !== TRANSPORTS.P2P || !this.p2pAdapter?.disconnect) return;
+    try {
+      const result = this.p2pAdapter.disconnect();
+      if (result?.catch) {
+        result.catch(error => {
+          console.warn('Coordinator P2P cleanup after termination failed:', error?.message || error);
+        });
+      }
+    } catch (error) {
+      console.warn('Coordinator P2P cleanup after termination failed:', error?.message || error);
+    }
+  }
+
   _subscribeToSignalingOwnerDisconnect(owner, generation) {
     this._clearSignalingOwnerDisconnectSubscription();
     if (typeof owner?.subscribeDisconnect !== 'function') return;
@@ -87,7 +125,7 @@ export class ConnectionCoordinator {
       ) {
         return;
       }
-      this._handleSessionTermination();
+      this._handleSessionTermination({ releaseTransport: true });
     };
 
     let subscription = null;
@@ -157,7 +195,7 @@ export class ConnectionCoordinator {
     this.activeSession = session;
     this.activeSessionManagedExternally = false;
     this.currentPeer = peerInfo;
-    this.currentTransport = peerInfo.transport || 'LAN';
+    this.currentTransport = peerInfo.transport || TRANSPORTS.LAN;
 
     this._startHeartbeat();
     this._setState(COORDINATOR_STATE.CONNECTED, { peer: peerInfo, transport: this.currentTransport });
@@ -174,7 +212,7 @@ export class ConnectionCoordinator {
    * This is intentionally transport-neutral: the coordinator only takes logical
    * peer/transport ownership and never opens a second socket or heartbeat.
    */
-  adoptSignalingOwnerSession(peer, transport = 'LAN', options = {}) {
+  adoptSignalingOwnerSession(peer, transport = TRANSPORTS.LAN, options = {}) {
     if (!peer?.deviceId) {
       throw new Error('Peer deviceId is required to adopt a signaling owner session');
     }
@@ -243,7 +281,7 @@ export class ConnectionCoordinator {
   }
 
   async connectLanPeer(peer, timeoutMs = 8000, connectOptions = {}) {
-    const lanInfo = peer.transports?.LAN || peer;
+    const lanInfo = peer.transports?.[TRANSPORTS.LAN] || peer;
     if (!lanInfo.host) {
       throw new Error('LAN host is missing for peer');
     }
@@ -258,10 +296,10 @@ export class ConnectionCoordinator {
     const currentGen = ++this.generation;
     this.cancelConnecting();
 
-    this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: 'LAN' });
+    this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: TRANSPORTS.LAN });
     peerRegistry.setPeerConnecting(peer.deviceId);
     this.currentPeer = peer;
-    this.currentTransport = 'LAN';
+    this.currentTransport = TRANSPORTS.LAN;
 
     if (this.signalingOwner) {
       return this._connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs, connectionPolicy);
@@ -311,9 +349,9 @@ export class ConnectionCoordinator {
       // runtime. Starting the coordinator heartbeat here would create two
       // control-plane liveness owners for the same socket.
       this._stopHeartbeat();
-      this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: 'LAN' });
-      peerRegistry.setPeerConnected(peer.deviceId, 'LAN');
-      if (this.onConnected) this.onConnected(peer, 'LAN');
+      this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: TRANSPORTS.LAN });
+      peerRegistry.setPeerConnected(peer.deviceId, TRANSPORTS.LAN);
+      if (this.onConnected) this.onConnected(peer, TRANSPORTS.LAN);
       this._subscribeToSignalingOwnerDisconnect(owner, currentGen);
 
       return session;
@@ -324,6 +362,137 @@ export class ConnectionCoordinator {
       if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
       if (this.generation === currentGen) {
         this._setState(COORDINATOR_STATE.ERROR, { error: err.message });
+        peerRegistry.setPeerDisconnected(peer.deviceId);
+      }
+      throw err;
+    }
+  }
+
+  async connectP2pPeer(peer, timeoutMs = 30000, connectOptions = {}) {
+    const p2pInfo = peer?.transports?.[TRANSPORTS.P2P] || peer || {};
+    const deviceAddress = p2pInfo.deviceAddress || peer?.deviceAddress;
+    if (!peer?.deviceId) {
+      throw new Error('Stable peer deviceId is required for Wi-Fi Direct');
+    }
+    if (!deviceAddress) {
+      throw new Error('Wi-Fi Direct deviceAddress is missing for peer');
+    }
+    if (!this.p2pAdapter || typeof this.p2pAdapter.connectPeer !== 'function') {
+      throw new Error('Configured Wi-Fi Direct transport adapter is unavailable');
+    }
+    const owner = this.signalingOwner;
+    if (!owner || typeof owner.getActiveSession !== 'function') {
+      throw new Error('Configured signaling owner is required for Wi-Fi Direct');
+    }
+    if (!this.myDeviceId) {
+      throw new Error('Local stable G1 identity is required before Wi-Fi Direct connect');
+    }
+
+    const currentGen = ++this.generation;
+    this.cancelConnecting();
+    this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: TRANSPORTS.P2P });
+    peerRegistry.setPeerConnecting(peer.deviceId);
+    this.currentPeer = peer;
+    this.currentTransport = TRANSPORTS.P2P;
+
+    let settled = false;
+    let cancelled = false;
+    let route = null;
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      cancelled = true;
+      try { owner.cancelConnect?.(); } catch (e) {}
+      try {
+        const disconnected = owner.disconnect?.();
+        disconnected?.catch?.(() => {});
+      } catch (e) {}
+      try {
+        const cancelledRoute = this.p2pAdapter.cancelConnect?.('Coordinator cancelled Wi-Fi Direct connect');
+        cancelledRoute?.catch?.(() => {});
+      } catch (e) {}
+    };
+    this.pendingConnectAbort = abort;
+
+    try {
+      route = await this.p2pAdapter.connectPeer(peer, {
+        timeoutMs,
+        incoming: connectOptions.incoming === true,
+      });
+
+      if (cancelled || this.generation !== currentGen) {
+        return;
+      }
+
+      const signalingTimeoutMs = connectOptions.signalingTimeoutMs || timeoutMs;
+      const port = connectOptions.port || 8089;
+      if (route?.isGroupOwner) {
+        if (typeof owner.acceptInbound !== 'function') {
+          throw new Error('Configured signaling owner is missing acceptInbound()');
+        }
+        await owner.acceptInbound({ port, timeoutMs: signalingTimeoutMs });
+      } else {
+        if (!route?.groupOwnerAddress) {
+          throw new Error('Wi-Fi Direct client route is missing group-owner address');
+        }
+        if (typeof owner.connectOutbound !== 'function') {
+          throw new Error('Configured signaling owner is missing connectOutbound()');
+        }
+        await owner.connectOutbound({
+          host: route.groupOwnerAddress,
+          port,
+          maxRetries: connectOptions.maxRetries ?? 8,
+          retryDelayMs: connectOptions.retryDelayMs ?? 1200,
+          timeoutMs: signalingTimeoutMs,
+        });
+      }
+
+      if (cancelled || this.generation !== currentGen) {
+        try { owner.disconnect?.(); } catch (e) {}
+        try { await this.p2pAdapter.disconnect?.(); } catch (e) {}
+        return;
+      }
+
+      const session = owner.getActiveSession();
+      if (!session || session.isConnected === false) {
+        throw new Error('Signaling owner completed Wi-Fi Direct connect without an active session');
+      }
+
+      const identitySent = typeof owner.sendMessage === 'function'
+        ? owner.sendMessage({
+            type: 'identity',
+            deviceId: this.myDeviceId,
+            deviceName: this.myDeviceName || 'G1 Device',
+          })
+        : false;
+      if (!identitySent) {
+        throw new Error('Failed to announce stable G1 identity over Wi-Fi Direct');
+      }
+
+      settled = true;
+      if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+      this.activeSession = session;
+      this.activeSessionManagedExternally = true;
+      this._stopHeartbeat();
+      this._setState(COORDINATOR_STATE.CONNECTED, {
+        peer,
+        transport: TRANSPORTS.P2P,
+        route,
+      });
+      peerRegistry.setPeerConnected(peer.deviceId, TRANSPORTS.P2P);
+      if (this.onConnected) this.onConnected(peer, TRANSPORTS.P2P);
+      this._subscribeToSignalingOwnerDisconnect(owner, currentGen);
+      return session;
+    } catch (err) {
+      if (cancelled || this.generation !== currentGen) {
+        return;
+      }
+      settled = true;
+      if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+      try { owner.disconnect?.(); } catch (e) {}
+      try { await this.p2pAdapter.disconnect?.(); } catch (e) {}
+      if (this.generation === currentGen) {
+        this._setState(COORDINATOR_STATE.ERROR, { error: err.message, transport: TRANSPORTS.P2P });
         peerRegistry.setPeerDisconnected(peer.deviceId);
       }
       throw err;
@@ -366,9 +535,9 @@ export class ConnectionCoordinator {
       this.activeSessionManagedExternally = false;
 
       this._startHeartbeat();
-      this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: 'LAN' });
-      peerRegistry.setPeerConnected(peer.deviceId, 'LAN');
-      if (this.onConnected) this.onConnected(peer, 'LAN');
+      this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: TRANSPORTS.LAN });
+      peerRegistry.setPeerConnected(peer.deviceId, TRANSPORTS.LAN);
+      if (this.onConnected) this.onConnected(peer, TRANSPORTS.LAN);
 
       return session;
     } catch (err) {
@@ -402,7 +571,7 @@ export class ConnectionCoordinator {
 
     session.onDisconnect = () => {
       if (this.generation !== generation || this.activeSession !== session) return;
-      this._handleSessionTermination();
+      this._handleSessionTermination({ releaseTransport: true });
     };
 
     session.onError = (err) => {
@@ -437,7 +606,7 @@ export class ConnectionCoordinator {
     }
   }
 
-  _handleSessionTermination() {
+  _handleSessionTermination({ releaseTransport = false } = {}) {
     if (
       this.state === COORDINATOR_STATE.IDLE &&
       !this.activeSession &&
@@ -450,6 +619,7 @@ export class ConnectionCoordinator {
     this._stopHeartbeat();
     this._clearSignalingOwnerDisconnectSubscription();
     const peer = this.currentPeer;
+    const transport = this.currentTransport;
     this.activeSession = null;
     this.activeSessionManagedExternally = false;
     this.currentPeer = null;
@@ -458,6 +628,9 @@ export class ConnectionCoordinator {
 
     if (peer?.deviceId) {
       peerRegistry.setPeerDisconnected(peer.deviceId);
+    }
+    if (releaseTransport) {
+      this._releaseTransportAfterTermination(transport);
     }
     if (this.onDisconnected) {
       this.onDisconnected(peer);
@@ -482,6 +655,8 @@ export class ConnectionCoordinator {
     }
     if (this.state === COORDINATOR_STATE.CONNECTING) {
       const peer = this.currentPeer;
+      this.currentPeer = null;
+      this.currentTransport = null;
       this._setState(COORDINATOR_STATE.IDLE);
       if (peer?.deviceId) {
         peerRegistry.setPeerDisconnected(peer.deviceId);
@@ -495,6 +670,7 @@ export class ConnectionCoordinator {
     this.cancelConnecting();
     const session = this.activeSession;
     const managedExternally = this.activeSessionManagedExternally;
+    const transport = this.currentTransport;
     if (managedExternally) {
       this._clearSignalingOwnerDisconnectSubscription();
     }
@@ -506,6 +682,7 @@ export class ConnectionCoordinator {
       session.destroy();
     }
     this._handleSessionTermination();
+    this._releaseTransportAfterTermination(transport);
   }
 
   getActivePeer() {
@@ -518,6 +695,7 @@ export class ConnectionCoordinator {
       peer: this.currentPeer,
       transport: this.currentTransport,
       generation: this.generation,
+      p2p: this.p2pAdapter?.getStatus?.() || null,
     };
   }
 }
