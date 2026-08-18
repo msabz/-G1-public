@@ -479,10 +479,155 @@ function notifyClientConnected() {
   }
 }
 
-function attachIncomingSession(socket, promote, source) {
-  logSocket('INBOUND_ACCEPTED', socket, `source=${source}`);
+function inspectDuplicatePassiveInbound(socket, promote, source) {
+  const activeSocket = activeSession?.socket || null;
+  logSocket('DUPLICATE_INBOUND_PENDING', socket, `active=${socketId(activeSocket)}`);
 
-  if (activeSession && activeSession.isConnected && activeSession.socket) {
+  let settled = false;
+  let buffer = '';
+  const bufferedMessages = [];
+  let timer = null;
+
+  const cleanup = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    try { socket.removeListener?.('data', onData); } catch (e) {}
+    try { socket.removeListener?.('close', onTerminal); } catch (e) {}
+    try { socket.removeListener?.('error', onTerminal); } catch (e) {}
+  };
+
+  const reject = reason => {
+    if (settled) return false;
+    settled = true;
+    cleanup();
+    logSocket('DUPLICATE_INBOUND_REJECTED', socket, `active=${socketId(activeSocket)} reason=${reason}`);
+    try { socket.destroy(); } catch (e) {}
+    return false;
+  };
+
+  const promoteInboundWinner = decision => {
+    if (settled) return false;
+    settled = true;
+    cleanup();
+
+    const previous = activeSession;
+    if (previous && previous.isConnected && previous.isOutbound) {
+      clearPassiveInboundIdentityTimer(previous);
+      stopHeartbeat();
+      activeSession = null;
+      try { previous.destroy(); } catch (e) {}
+    }
+
+    logSocket(
+      'DUPLICATE_INBOUND_SELECTED',
+      socket,
+      `peer=${decision?.peerId || 'unknown'} previous=${socketId(activeSocket)}`
+    );
+    return attachIncomingSession(socket, promote, source, {
+      skipAcceptedLog: true,
+      skipDuplicateCheck: true,
+      preMessages: bufferedMessages,
+    });
+  };
+
+  const handleMessage = msg => {
+    bufferedMessages.push(msg);
+
+    if (msg?.type === 'my-ip') return null;
+    if (msg?.type !== 'identity' || !msg.deviceId) {
+      reject('identity-required');
+      return false;
+    }
+
+    const peerAddress = normalizePeerAddress(socket?.remoteAddress);
+    let decision = null;
+    try {
+      decision = passiveInboundAdmissionHandler?.({
+        message: msg,
+        peerAddress,
+        session: null,
+        validateOnly: true,
+      }) || null;
+    } catch (error) {
+      console.warn('[G1/SIGNAL] duplicate inbound validation failed:', error?.message || error);
+      reject('validator-error');
+      return false;
+    }
+
+    if (decision?.then && typeof decision.then === 'function') {
+      reject('async-validator-not-supported');
+      return false;
+    }
+    if (decision?.accepted !== true) {
+      reject(decision?.reason || 'identity-rejected');
+      return false;
+    }
+    if (decision?.preferInbound !== true) {
+      reject('stable-id-retains-outbound');
+      return false;
+    }
+
+    return promoteInboundWinner(decision);
+  };
+
+  const onData = data => {
+    if (settled) return;
+    buffer += data.toString();
+    if (buffer.length > MAX_SIGNALING_BUFFER_BYTES) {
+      reject('candidate-buffer-too-large');
+      return;
+    }
+
+    const parts = buffer.split('\n');
+    buffer = parts.pop();
+    for (const part of parts) {
+      if (settled) return;
+      if (!part.trim()) continue;
+      let msg = null;
+      try {
+        msg = JSON.parse(part);
+      } catch (error) {
+        reject('candidate-parse-error');
+        return;
+      }
+      const result = handleMessage(msg);
+      if (result !== null) return;
+    }
+  };
+
+  const onTerminal = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+  };
+
+  socket.on('data', onData);
+  socket.on('close', onTerminal);
+  socket.on('error', onTerminal);
+  timer = setTimeout(() => reject('identity-timeout'), PASSIVE_INBOUND_IDENTITY_TIMEOUT_MS);
+  return true;
+}
+
+function attachIncomingSession(socket, promote, source, options = {}) {
+  if (!options.skipAcceptedLog) {
+    logSocket('INBOUND_ACCEPTED', socket, `source=${source}`);
+  }
+
+  if (!options.skipDuplicateCheck && activeSession && activeSession.isConnected && activeSession.socket) {
+    // A simultaneous known-LAN connect must not be resolved by packet/socket
+    // arrival order. If the existing session is outbound, hold the inbound raw
+    // socket only long enough to read/validate stable identity, then apply the
+    // coordinator's deterministic deviceId tie-break. Other duplicate cases
+    // retain the existing healthy session as before.
+    if (
+      source === 'persistent' &&
+      activeSession.isOutbound &&
+      !isExplicitServerMode &&
+      typeof passiveInboundAdmissionHandler === 'function'
+    ) {
+      return inspectDuplicatePassiveInbound(socket, promote, source);
+    }
+
     logSocket('DUPLICATE_INBOUND_REJECTED', socket, `active=${socketId(activeSession.socket)}`);
     try { socket.destroy(); } catch (e) {}
     return false;
@@ -529,6 +674,13 @@ function attachIncomingSession(socket, promote, source) {
 
   if (session.passiveAdmissionRequired && !session.passiveAdmissionAccepted) {
     startPassiveInboundIdentityTimer(session);
+  }
+
+  if (Array.isArray(options.preMessages) && options.preMessages.length) {
+    for (const message of options.preMessages) {
+      if (activeSession !== session || !session.isConnected) break;
+      session.onMessage?.(message, session);
+    }
   }
 
   // waitForClientConnection belongs to the explicit Wi-Fi Direct server flow.
