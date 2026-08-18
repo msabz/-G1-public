@@ -12,11 +12,14 @@ import { States, Tiers } from './utils/stateMachine';
 import {
   createSignalingServer, connectToSignalingServer, closeSignaling,
   setOnMessage, setOnDisconnect, sendSignalingMessage, waitForClientConnection,
-  startPersistentListener,
+  startPersistentListener, getSignalingHealth,
 } from './webrtc/signaling';
 import { lanDiscovery } from './network/LanDiscovery';
-import { peerRegistry } from './network/PeerRegistry';
+import { peerRegistry, TRANSPORTS } from './network/PeerRegistry';
 import { connectionCoordinator } from './network/ConnectionCoordinator';
+import { resolveKnownLanTarget } from './network/knownLanTarget';
+import { CONTROL_PLANE_OWNERS, getSessionDisconnectPlan } from './network/sessionDisconnectPlan';
+import { TransferActivityGate } from './network/transferActivityGate';
 import { secureHandshake } from './network/SecureHandshake';
 import { startCameraCapture, stopCameraCapture, switchCamera, onCameraFrame } from './media/CameraStream';
 import {
@@ -130,36 +133,49 @@ export default function App() {
 
   const handleConnectLan = async (ip, port = 8089) => {
     try {
-      setStatusText(`جاري الاتصال بـ ${ip}:${port} عبر شبكة الواي فاي...`);
-      setState(States.WIFI_CONNECTING);
-      await connectToSignalingServer(ip, port, 5, 800);
-      const peer = {
-        peerId: `lan_${ip}`,
-        deviceAddress: ip,
-        deviceName: `LAN (${ip})`,
-        customName: `LAN (${ip})`,
-        transport: "lan",
-        connected: true,
-      };
-      setActivePeer(peer);
-      setPeerDisplayName(`LAN (${ip})`);
-      setState(States.CONNECTED);
-      setActiveTier(Tiers.WIFI);
-      setChatOpen(true);
-      setStatusText(`متصل عبر شبكة الواي فاي (${ip})`);
       const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
       if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
       identityRef.current = identity;
+
+      setStatusText(`جاري الاتصال بـ ${ip}:${port} عبر الشبكة المحلية...`);
+      stateRef.current = States.WIFI_CONNECTING;
+      setState(States.WIFI_CONNECTING);
+      await connectToSignalingServer(ip, port, 5, 800);
+
+      peerIpRef.current = ip;
+      activeTransportRef.current = TRANSPORTS.LAN;
+      activeControlOwnerRef.current = CONTROL_PLANE_OWNERS.LEGACY_APP;
+      const peer = {
+        deviceAddress: ip,
+        deviceName: `LAN (${ip})`,
+        customName: `LAN (${ip})`,
+        transport: 'lan',
+        connected: true,
+      };
+      setActivePeerInfo(peer);
+      setPeerDisplayName(`LAN (${ip})`);
+      startTransferServer().catch(() => {});
+      ensureMicGuard();
+      stateRef.current = States.CONNECTED;
+      setState(States.CONNECTED);
+      setActiveTier(Tiers.LAN);
+      setChatOpen(true);
+      setStatusText(`متصل عبر الشبكة المحلية (${ip})`);
       sendSignalingMessage({
-        type: "identity",
+        type: 'identity',
         deviceId: identity.deviceId,
-        deviceName: identity.deviceName || "DirectChat Device",
+        deviceName: identity.deviceName || 'DirectChat Device',
       });
     } catch (e) {
-      console.warn("LAN connection error:", e);
-      Alert.alert("فشل الاتصال عبر الشبكة المحلية", `تعذر الاتصال بـ ${ip}:${port}.\nتأكد أن التطبيق مفتوح على الجهاز الآخر وأنهما على نفس شبكة الواي فاي.`);
+      console.warn('LAN connection error:', e);
+      activeTransportRef.current = null;
+      activeControlOwnerRef.current = null;
+      peerIpRef.current = null;
+      stateRef.current = States.IDLE;
       setState(States.IDLE);
-      setStatusText("فشل الاتصال بالـ IP");
+      setActiveTier(Tiers.NONE);
+      setStatusText('فشل الاتصال بالـ IP');
+      Alert.alert('فشل الاتصال عبر الشبكة المحلية', `تعذر الاتصال بـ ${ip}:${port}.\nتأكد أن التطبيق مفتوح على الجهاز الآخر وأنهما على نفس شبكة الواي فاي.`);
       throw e;
     }
   };
@@ -197,7 +213,9 @@ export default function App() {
   const inCallRef = useRef(false);
   const callVideoRef = useRef(true);
   const peerIpRef = useRef(null);
-  const activeTransfersRef = useRef(0);
+  const transferActivityGateRef = useRef(new TransferActivityGate());
+  const activeTransportRef = useRef(null);
+  const activeControlOwnerRef = useRef(null);
   const peerIdRef = useRef(null);
   const identityRef = useRef(null);
   const appActiveRef = useRef(true);
@@ -236,13 +254,43 @@ export default function App() {
     setActivePeer(next);
   };
 
+  const runReleasedTerminalTask = task => {
+    if (typeof task !== 'function') return;
+    Promise.resolve()
+      .then(task)
+      .catch(error => console.warn('[App] deferred terminal cleanup failed:', error?.message || error));
+  };
+
+  const releaseTransferActivity = key => {
+    runReleasedTerminalTask(transferActivityGateRef.current.end(key));
+  };
+
+  const ensureMicGuard = () => {
+    if (micGuardRef.current) clearInterval(micGuardRef.current);
+    micGuardRef.current = setInterval(() => {
+      reportLiveAudio(RTCAudio.hasLiveAudio());
+    }, 3000);
+  };
+
+  const signalingIsHealthy = () => {
+    try {
+      return getSignalingHealth()?.connected === true;
+    } catch (e) {
+      return false;
+    }
+  };
+
   const resetActiveSessionUi = ({ clearMessages = true } = {}) => {
     chatVisibleRef.current = false;
     activePeerRef.current = null;
     targetPeerRef.current = null;
     connectionAddressTrackerRef.current.clear();
     peerIdRef.current = null;
+    peerIpRef.current = null;
     lastConnectionRef.current = null;
+    activeTransportRef.current = null;
+    activeControlOwnerRef.current = null;
+    transferActivityGateRef.current.reset();
     setChatVisible(false);
     setActivePeer(null);
     setUnreadCount(0);
@@ -443,17 +491,21 @@ export default function App() {
         }
         if (resolveAck) resolveAck(true);
       } else if (msg.type === 'disconnect-request' || msg.type === 'hangup') {
-        // v32 يؤكد استلام طلب الفصل قبل إغلاق المقبس. نبقي hangup للتوافق
-        // مع طرف أقدم، لكن الطرفين في v32 ينظفان مجموعة Wi-Fi Direct.
+        // نؤكد الاستلام أولاً، ثم ننهي الجلسة حسب النقل الفعلي بدلاً من
+        // افتراض أن كل جلسة signaling هي Wi-Fi Direct.
         stateRef.current = States.DISCONNECTING;
         if (mountedRef.current) {
           setState(States.DISCONNECTING);
-          setStatusText('طلب الجهاز الآخر إنهاء الاتصال — جاري تنظيف المجموعة…');
+          setStatusText('طلب الجهاز الآخر إنهاء الاتصال — جاري إنهاء الجلسة…');
         }
         if (msg.type === 'disconnect-request') {
           sendSignalingMessage({ type: 'disconnect-ack' });
         }
-        setTimeout(() => finishWifiDisconnect({ remote: true }), 180);
+        setTimeout(() => {
+          finishCurrentTransportDisconnect({ remote: true }).catch(error => {
+            console.warn('[App] remote disconnect cleanup failed:', error?.message || error);
+          });
+        }, 180);
       }
     });
 
@@ -476,23 +528,7 @@ export default function App() {
       if (!mountedRef.current) return;
       if (disconnectingRef.current || stateRef.current === States.DISCONNECTING) return;
       if (stateRef.current !== States.CONNECTED) return;
-
-      // انقطاع قناة التحكم أثناء نقل ملف كبير غالباً مؤقّت (ضغط على الشبكة).
-      // كنا منهدم الاتصال فوراً فبترجع الواجهة للشاشة الأولى رغم إن النقل
-      // ناجح — منعطي مهلة سماح، وإذا في نقل شغال منتجاهل الانقطاع أصلاً.
-      if (activeTransfersRef.current > 0) return;
-
-      if (disconnectGraceRef.current) clearTimeout(disconnectGraceRef.current);
-      disconnectGraceRef.current = setTimeout(async () => {
-        if (!mountedRef.current) return;
-        if (activeTransfersRef.current > 0) return;
-
-        // منحاول نرجع الاتصال بهدوء قبل ما نرجّع المستخدم للشاشة الأولى
-        const recovered = await attemptReconnect();
-        if (recovered || !mountedRef.current) return;
-
-        await finishWifiDisconnect({ unexpected: true });
-      }, 4000);
+      handleTerminalSignalingDisconnect();
     });
 
     onCameraFrame(base64 => {
@@ -515,6 +551,7 @@ export default function App() {
         setMessages(prev => prev.map(m => m.transferId === id ? { ...m, progress } : m));
       }),
       onIncomingStart(({ id, fileName, mimeType, kind, size }) => {
+        transferActivityGateRef.current.begin(`in:${id}`);
         if (!mountedRef.current) return;
         markUnreadIfChatHidden();
         if (kind === 'voice') {
@@ -527,22 +564,26 @@ export default function App() {
         }
       }),
       onIncomingDone(({ id, path, size, fileName, kind }) => {
-        if (!mountedRef.current) return;
-        setMessages(prev => prev.map(m => {
-          if (m.transferId !== id) return m;
-          const done = {
-            ...m, progress: 1, size, path,
-            localUri: path ? (path.startsWith('content://') ? path : 'file://' + path) : null,
-          };
-          // نحفظ الرسالة بعد اكتمال الاستلام (صار عندنا المسار النهائي)
-          if (peerIdRef.current) saveMessage(peerIdRef.current, done);
-          return done;
-        }));
-        if (!appActiveRef.current) {
-          showMessageNotification(
-            peerNameLabel,
-            kind === 'voice' ? 'رسالة صوتية' : kind === 'image' ? 'صورة' : `ملف: ${fileName || ''}`
-          );
+        try {
+          if (!mountedRef.current) return;
+          setMessages(prev => prev.map(m => {
+            if (m.transferId !== id) return m;
+            const done = {
+              ...m, progress: 1, size, path,
+              localUri: path ? (path.startsWith('content://') ? path : 'file://' + path) : null,
+            };
+            // نحفظ الرسالة بعد اكتمال الاستلام (صار عندنا المسار النهائي)
+            if (peerIdRef.current) saveMessage(peerIdRef.current, done);
+            return done;
+          }));
+          if (!appActiveRef.current) {
+            showMessageNotification(
+              peerNameLabel,
+              kind === 'voice' ? 'رسالة صوتية' : kind === 'image' ? 'صورة' : `ملف: ${fileName || ''}`
+            );
+          }
+        } finally {
+          releaseTransferActivity(`in:${id}`);
         }
       }),
       onSentDone(({ id, size }) => {
@@ -554,10 +595,14 @@ export default function App() {
           return done;
         }));
       }),
-      onTransferError(({ id, message }) => {
-        if (!mountedRef.current) return;
-        setMessages(prev => prev.map(m => m.transferId === id ? { ...m, progress: 1, failed: true } : m));
-        Alert.alert('تعذّر نقل الملف', message || '');
+      onTransferError(({ id, message, direction }) => {
+        try {
+          if (!mountedRef.current) return;
+          setMessages(prev => prev.map(m => m.transferId === id ? { ...m, progress: 1, failed: true } : m));
+          Alert.alert('تعذّر نقل الملف', message || '');
+        } finally {
+          if (direction === 'in') releaseTransferActivity(`in:${id}`);
+        }
       }),
       emitter.addListener('WIFI_P2P_STATE_CHANGED', d => mountedRef.current && setWifiEnabled(d.enabled)),
       emitter.addListener('PEERS_UPDATED', handlePeers),
@@ -603,11 +648,15 @@ export default function App() {
       onBtDiscoveryFinished(() => mountedRef.current && setBtScanning(false)),
       onBtConnected(d => {
         if (!mountedRef.current) return;
+        activeTransportRef.current = TRANSPORTS.BLUETOOTH;
+        activeControlOwnerRef.current = null;
         setBtPeerName(d.deviceName);
         setActiveTier(Tiers.BLUETOOTH);
         setState(States.BT_CONNECTED);
       }),
       onBtDisconnected(() => {
+        activeTransportRef.current = null;
+        activeControlOwnerRef.current = null;
         if (!mountedRef.current) return;
         Alert.alert('انقطع اتصال البلوتوث');
         setState(States.IDLE);
@@ -623,7 +672,7 @@ export default function App() {
       // Root/Activity teardown is not an explicit disconnect. Keep signaling,
       // file server and the foreground availability service alive so removing
       // G1 from Recents does not make the peer go offline. Explicit disconnect
-      // flows still call cleanupAll()/finishWifiDisconnect().
+      // flows still call the transport-aware finish helpers.
     };
   // الاشتراكات الأصلية تُثبت مرة واحدة وتعتمد على refs للحالة الحية؛
   // إعادة إنشائها مع كل render تضاعف مستمعي المقابس وWi-Fi Direct.
@@ -733,7 +782,7 @@ export default function App() {
     // على بعض أجهزة Samsung لا تظهر نافذة قبول ثانية بعد فك المجموعة.
     // حالة INVITED هي الإشارة الوحيدة داخل التطبيق إلى أن الطرف الآخر طلبنا.
     maybeAnswerIncomingInvitation(Object.values(next));
-  };
+  }
 
   const handlePeerConnected = async initialInfo => {
     if (!initialInfo?.groupFormed || disconnectingRef.current) return;
@@ -797,10 +846,7 @@ export default function App() {
       startTransferServer().catch(() => {});
 
       // فحص أمان دوري: لو الميكروفون ضل شغّال خارج المكالمة منقفله فوراً.
-      if (micGuardRef.current) clearInterval(micGuardRef.current);
-      micGuardRef.current = setInterval(() => {
-        reportLiveAudio(RTCAudio.hasLiveAudio());
-      }, 3000);
+      ensureMicGuard();
 
       if (!isOwner) {
         peerIpRef.current = ownerIP;
@@ -822,6 +868,8 @@ export default function App() {
 
       startConnectionService('متصل عبر واي فاي مباشر');
       lastConnectionRef.current = { isOwner, ownerIP };
+      activeTransportRef.current = TRANSPORTS.P2P;
+      activeControlOwnerRef.current = CONTROL_PLANE_OWNERS.LEGACY_APP;
       reconnectAttemptRef.current = 0;
 
       const selected = targetPeerRef.current;
@@ -886,6 +934,8 @@ export default function App() {
       }
 
       reconnectAttemptRef.current = 0;
+      activeTransportRef.current = TRANSPORTS.P2P;
+      activeControlOwnerRef.current = CONTROL_PLANE_OWNERS.LEGACY_APP;
       stateRef.current = States.CONNECTED;
       setState(States.CONNECTED);
       setStatusText('');
@@ -898,11 +948,55 @@ export default function App() {
     }
   };
 
+  const handleTerminalSignalingDisconnect = () => {
+    const plan = getSessionDisconnectPlan({
+      transport: activeTransportRef.current,
+      controlOwner: activeControlOwnerRef.current,
+      unexpected: true,
+    });
+
+    const finalize = async () => {
+      if (!mountedRef.current) return;
+      if (disconnectingRef.current || stateRef.current !== States.CONNECTED) return;
+      if (signalingIsHealthy()) return;
+
+      if (plan.attemptLegacyWifiDirectReconnect) {
+        const recovered = await attemptReconnect();
+        if (recovered || !mountedRef.current || signalingIsHealthy()) return;
+      }
+
+      await finishCurrentTransportDisconnect({ unexpected: true });
+    };
+
+    if (plan.attemptLegacyWifiDirectReconnect) {
+      if (disconnectGraceRef.current) clearTimeout(disconnectGraceRef.current);
+      disconnectGraceRef.current = setTimeout(() => {
+        disconnectGraceRef.current = null;
+        if (!mountedRef.current || disconnectingRef.current || stateRef.current !== States.CONNECTED) return;
+        if (signalingIsHealthy()) return;
+        if (transferActivityGateRef.current.deferTerminal(finalize)) return;
+        finalize().catch(error => {
+          console.warn('[App] terminal P2P recovery failed:', error?.message || error);
+        });
+      }, 4000);
+      return;
+    }
+
+    if (transferActivityGateRef.current.deferTerminal(finalize)) return;
+    finalize().catch(error => {
+      console.warn('[App] terminal signaling cleanup failed:', error?.message || error);
+    });
+  };
+
   function handlePeerDisconnected() {
     // أثناء الفصل المتعمّد، cleanupConnection هو مصدر الحقيقة وينتظر
     // requestGroupInfo؛ لا نسمح لبث متأخر بتغيير الحالة قبله.
     if (disconnectingRef.current || stateRef.current === States.DISCONNECTING) return;
     if (stateRef.current === States.CONNECTED) {
+      if (activeTransportRef.current !== TRANSPORTS.P2P) {
+        console.log('[Wi-Fi Direct] تجاهل بث انفصال P2P لأن النقل النشط ليس P2P');
+        return;
+      }
       finishWifiDisconnect({ unexpected: true });
     } else if (
       stateRef.current === States.WIFI_CONNECTING &&
@@ -952,6 +1046,8 @@ export default function App() {
   };
 
   const endBtChat = () => {
+    activeTransportRef.current = null;
+    activeControlOwnerRef.current = null;
     BT.disconnect().catch(() => {});
     setBtMessages([]);
     setActiveTier(Tiers.NONE);
@@ -991,21 +1087,24 @@ export default function App() {
     }
   };
 
-  function cleanupAll() {
+  function cleanupSessionResources({ disconnectViaCoordinator = false } = {}) {
     connectionAttemptRef.current += 1;
     incomingInvitationRef.current = null;
     connectionAddressTrackerRef.current.clear();
     endCallLocal();
-    closeSignaling();
+    if (disconnectViaCoordinator) {
+      connectionCoordinator.disconnect();
+    } else {
+      closeSignaling();
+    }
     stopTransferServer().catch(() => {});
-    DirectConnection.unbindNetwork().catch(() => {});
     stopConnectionService();
     peerIpRef.current = null;
-    activeTransfersRef.current = 0;
+    transferActivityGateRef.current.reset();
     if (micGuardRef.current) { clearInterval(micGuardRef.current); micGuardRef.current = null; }
     if (disconnectGraceRef.current) { clearTimeout(disconnectGraceRef.current); disconnectGraceRef.current = null; }
     if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
-  };
+  }
 
   /** قبول المكالمة الواردة — هون فقط بينفتح الميكروفون */
   const acceptIncomingCall = async () => {
@@ -1084,7 +1183,7 @@ export default function App() {
       setStatusText('جاري إنهاء اتصال Wi-Fi Direct وتنظيف المجموعة…');
     }
 
-    cleanupAll();
+    cleanupSessionResources({ disconnectViaCoordinator: false });
     let result = null;
     try {
       result = await cleanupWifiDirect(10000);
@@ -1136,6 +1235,59 @@ export default function App() {
 
     disconnectingRef.current = false;
     return clean;
+  };
+
+  const finishLogicalDisconnect = async ({
+    remote = false,
+    unexpected = false,
+    disconnectViaCoordinator = false,
+  } = {}) => {
+    if (disconnectingRef.current) return false;
+    disconnectingRef.current = true;
+    connectionSetupRef.current = false;
+    stateRef.current = States.DISCONNECTING;
+    if (mountedRef.current) {
+      setState(States.DISCONNECTING);
+      setStatusText('جاري إنهاء الاتصال…');
+    }
+
+    cleanupSessionResources({ disconnectViaCoordinator });
+
+    if (mountedRef.current) {
+      resetActiveSessionUi({ clearMessages: !unexpected });
+      setActiveTier(Tiers.NONE);
+      if (unexpected) {
+        stateRef.current = States.DISCONNECTED;
+        setState(States.DISCONNECTED);
+        setStatusText('انقطع الاتصال. يمكنك الاتصال مجدداً.');
+      } else {
+        stateRef.current = States.IDLE;
+        setState(States.IDLE);
+        setStatusText('');
+      }
+      if (remote) Alert.alert('أنهى الطرف الآخر الاتصال');
+    }
+
+    disconnectingRef.current = false;
+    return true;
+  };
+
+  const finishCurrentTransportDisconnect = async ({ remote = false, unexpected = false } = {}) => {
+    const plan = getSessionDisconnectPlan({
+      transport: activeTransportRef.current,
+      controlOwner: activeControlOwnerRef.current,
+      unexpected,
+    });
+
+    if (plan.cleanupWifiDirect) {
+      return finishWifiDisconnect({ remote, unexpected });
+    }
+
+    return finishLogicalDisconnect({
+      remote,
+      unexpected,
+      disconnectViaCoordinator: plan.disconnectViaCoordinator,
+    });
   };
 
   const recoverFailedConnection = async (phase, error) => {
@@ -1351,7 +1503,7 @@ export default function App() {
       return;
     }
     if (stateRef.current === States.DISCONNECTING || disconnectingRef.current) {
-      Alert.alert('جاري إنهاء الاتصال', 'انتظر حتى يكتمل تنظيف مجموعة Wi-Fi Direct.');
+      Alert.alert('جاري إنهاء الاتصال', 'انتظر حتى يكتمل إنهاء الاتصال الحالي.');
       return;
     }
     if (scanningRef.current) return scanPromiseRef.current;
@@ -1366,6 +1518,90 @@ export default function App() {
         );
       }
       return [];
+    }
+  };
+
+  const connectKnownLanPeer = async (contact, target) => {
+    const lanInfo = target?.transports?.[TRANSPORTS.LAN];
+    if (!target?.deviceId || !lanInfo?.host) {
+      throw new Error('هدف LAN المعروف غير مكتمل');
+    }
+
+    const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
+    if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
+    identityRef.current = identity;
+
+    connectionAttemptRef.current += 1;
+    targetPeerRef.current = contact;
+    connectionPhaseRef.current = 'اتصال LAN مباشر';
+    setMessages([]);
+    stateRef.current = States.WIFI_CONNECTING;
+    setState(States.WIFI_CONNECTING);
+    setStatusText(`جاري الاتصال بـ ${contact.customName || contact.name || target.deviceName || 'الجهاز'} عبر الشبكة المحلية…`);
+
+    try {
+      await connectionCoordinator.connectLanPeer(target, 8000, {
+        maxRetries: 5,
+        retryDelayMs: 800,
+      });
+
+      if (!mountedRef.current || disconnectingRef.current) {
+        connectionCoordinator.disconnect();
+        throw new Error('أُلغيت محاولة LAN قبل تفعيل الجلسة');
+      }
+
+      const displayName = contact.customName || contact.name || target.deviceName || 'الجهاز الآخر';
+      peerIdRef.current = target.deviceId;
+      peerIpRef.current = lanInfo.host;
+      activeTransportRef.current = TRANSPORTS.LAN;
+      activeControlOwnerRef.current = CONTROL_PLANE_OWNERS.COORDINATOR;
+      setActivePeerInfo({
+        ...contact,
+        deviceId: target.deviceId,
+        peerId: target.deviceId,
+        deviceAddress: lanInfo.host,
+        name: displayName,
+        transport: 'lan',
+      });
+      setPeerDisplayName(displayName);
+      startTransferServer().catch(() => {});
+      ensureMicGuard();
+
+      await savePeer(target.deviceId, target.deviceName || displayName, '');
+      const history = await loadMessages(target.deviceId, 300);
+      if (mountedRef.current) {
+        setMessages((history || []).map(h => ({ ...h, time: Number(h.time) })));
+      }
+
+      sendSignalingMessage({
+        type: 'identity',
+        deviceId: identity.deviceId,
+        deviceName: identity.deviceName || 'DirectChat Device',
+      });
+
+      reconnectAttemptRef.current = 0;
+      stateRef.current = States.CONNECTED;
+      setState(States.CONNECTED);
+      setActiveTier(Tiers.LAN);
+      setStatusText('متصل عبر الشبكة المحلية');
+      setChatOpen(true);
+      refreshContacts();
+      return true;
+    } catch (error) {
+      connectionCoordinator.disconnect();
+      if (activeControlOwnerRef.current === CONTROL_PLANE_OWNERS.COORDINATOR) {
+        activeControlOwnerRef.current = null;
+      }
+      if (activeTransportRef.current === TRANSPORTS.LAN) {
+        activeTransportRef.current = null;
+      }
+      peerIpRef.current = null;
+      stateRef.current = States.IDLE;
+      if (mountedRef.current) {
+        setState(States.IDLE);
+        setActiveTier(Tiers.NONE);
+      }
+      throw error;
     }
   };
 
@@ -1404,19 +1640,20 @@ export default function App() {
     }
 
     if (stateRef.current === States.DISCONNECTING || disconnectingRef.current) {
-      Alert.alert('جاري إنهاء الاتصال', 'انتظر حتى يكتمل تنظيف مجموعة Wi-Fi Direct.');
+      Alert.alert('جاري إنهاء الاتصال', 'انتظر حتى يكتمل إنهاء الاتصال الحالي.');
       return;
     }
 
     try {
-      // Priority 1: Check if peer is reachable over LAN
-      const lanInfo = contact.transports?.LAN || (contact.host ? { host: contact.host, port: contact.port || 8089 } : peerRegistry.getPeer(contact.deviceId || contact.peerId)?.transports?.LAN);
-      if (lanInfo && lanInfo.host && lanInfo.isReachable !== false) {
+      const stableId = contact.deviceId || contact.peerId || null;
+      const registryPeer = stableId ? peerRegistry.getPeer(stableId) : null;
+      const knownLanTarget = resolveKnownLanTarget(contact, registryPeer);
+      if (knownLanTarget) {
         try {
-          await handleConnectLan(lanInfo.host, lanInfo.port || 8089);
+          await connectKnownLanPeer(contact, knownLanTarget);
           return;
         } catch (lanErr) {
-          console.log('[App] LAN attempt failed in connectToContact, falling back to P2P:', lanErr?.message || lanErr);
+          console.log('[App] known LAN attempt failed, falling back to P2P:', lanErr?.message || lanErr);
         }
       }
 
@@ -1566,7 +1803,7 @@ export default function App() {
       disconnectAckRef.current = null;
     }
 
-    await finishWifiDisconnect();
+    await finishCurrentTransportDisconnect();
   };
 
   const sendMsg = (text) => {
@@ -1676,11 +1913,11 @@ export default function App() {
       time: Date.now(),
     }]);
 
-    activeTransfersRef.current++;
+    transferActivityGateRef.current.begin(`out:${transferId}`);
     try {
       await sendFileNative(peerIp, uri, transferId, kind);
     } finally {
-      activeTransfersRef.current = Math.max(0, activeTransfersRef.current - 1);
+      releaseTransferActivity(`out:${transferId}`);
     }
   };
 
