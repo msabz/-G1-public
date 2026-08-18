@@ -546,6 +546,7 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
       skipAcceptedLog: true,
       skipDuplicateCheck: true,
       preMessages: bufferedMessages,
+      preBuffer: buffer,
     });
   };
 
@@ -699,6 +700,9 @@ function attachIncomingSession(socket, promote, source, options = {}) {
 
   setupSessionEvents(session);
   session.attachSocket(socket);
+  if (typeof options.preBuffer === 'string' && options.preBuffer) {
+    session.stateHolder.buf = options.preBuffer;
+  }
   activateSession(session, socket, 'inbound', wasRecovering ? 'peer-redial' : 'connect');
 
   if (session.passiveAdmissionRequired && !session.passiveAdmissionAccepted) {
