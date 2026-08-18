@@ -25,6 +25,7 @@ let recoveryGeneration = 0;
 let recoveryInProgress = false;
 let recoveryExpectedInboundPeerAddress = null;
 let recoveryInboundAdmissionSnapshot = null;
+let gracefulDisconnectPending = false;
 let passiveInboundAdmissionHandler = null;
 const messageObservers = new Set();
 const disconnectObservers = new Set();
@@ -243,6 +244,22 @@ function setupSessionEvents(session) {
         return;
       }
 
+      // disconnect-request / disconnect-ack are deliberate terminal control
+      // frames. Physical logs showed that treating the peer close that follows
+      // as a transient failure could redial a fresh socket only for App cleanup
+      // to destroy it ~180 ms later. Suppress recovery while graceful teardown
+      // is pending; App/coordinator remains the owner of the final logical reset.
+      if (gracefulDisconnectPending) {
+        gracefulDisconnectPending = false;
+        clearPassiveInboundIdentityTimer(session);
+        stopHeartbeat();
+        activeSession = null;
+        cancelPendingRecovery();
+        logSocket('RECOVERY_SUPPRESSED', session.socket, 'reason=graceful-disconnect');
+        setAvailabilityStatus();
+        return;
+      }
+
       beginTransientRecovery(session, 'socket-disconnect');
     }
   };
@@ -277,6 +294,7 @@ async function announceLocalRoute(session) {
 
 function activateSession(session, socket, direction, reason = 'connect') {
   cancelPendingRecovery();
+  gracefulDisconnectPending = false;
   activeSession = session;
   lastInboundActivityAt = Date.now();
   logSocket('SESSION_ACTIVE', socket, `direction=${direction} reason=${reason}`);
@@ -438,6 +456,7 @@ export function getSignalingHealth() {
     lastInboundActivityAt,
     heartbeatRunning: !!heartbeatTimer,
     recoveryInProgress,
+    gracefulDisconnectPending,
   };
 }
 
@@ -739,6 +758,7 @@ export function connectToSignalingServer(host, port, maxRetries = 10, retryDelay
     }
 
     cancelPendingRecovery();
+    gracefulDisconnectPending = false;
 
     const abort = error => {
       if (settled) return;
@@ -804,6 +824,9 @@ export function sendSignalingMessage(msgObj) {
   if (!activeSession) return false;
   const socket = activeSession.socket;
   const type = msgObj?.type || 'unknown';
+  if (type === 'disconnect-request' || type === 'disconnect-ack') {
+    gracefulDisconnectPending = true;
+  }
   logSocket('SEND', socket, `type=${type}`);
   const sent = activeSession.sendMessage(msgObj);
   if (!sent) logSocket('SEND_FAILED', socket, `type=${type}`);
@@ -813,6 +836,7 @@ export function sendSignalingMessage(msgObj) {
 export function closeSignaling() {
   stopHeartbeat();
   cancelPendingRecovery();
+  gracefulDisconnectPending = false;
   const session = activeSession;
   activeSession = null;
 
