@@ -366,7 +366,10 @@ function attachIncomingSession(socket, promote, source) {
   }
 
   if (promote) promote();
-  const session = new SignalingSession({ isOutbound: false });
+  const session = new SignalingSession({
+    isOutbound: false,
+    peerInfo: { host: normalizePeerAddress(socket?.remoteAddress) },
+  });
   setupSessionEvents(session);
   session.attachSocket(socket);
   activateSession(session, socket, 'inbound', recoveryInProgress ? 'peer-redial' : 'connect');
