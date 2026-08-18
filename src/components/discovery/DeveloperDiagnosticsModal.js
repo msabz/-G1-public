@@ -57,6 +57,14 @@ export const DeveloperDiagnosticsModal = ({
     }
   }, [visible]);
 
+  useEffect(() => {
+    if (!visible) return undefined;
+    const refresh = () => setSignalingHealth(getSignalingHealth());
+    refresh();
+    const timer = setInterval(refresh, 750);
+    return () => clearInterval(timer);
+  }, [visible]);
+
   const handleModeChange = (mode) => {
     setTransportMode(mode);
     fallbackEngine.setMode(mode);
