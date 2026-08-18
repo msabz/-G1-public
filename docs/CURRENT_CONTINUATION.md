@@ -7,69 +7,96 @@ Last prepared: 2026-08-18
 ## Read first
 
 Latest dated checkpoint:
-`docs/DEVELOPMENT_CHECKPOINT_2026-08-18_LIVE_LAN_PHASE5B.md`
+`docs/DEVELOPMENT_CHECKPOINT_2026-08-18_INCOMING_LAN_ADOPTION_PHASE5C.md`
 
 Master execution strategy:
 GitHub issue #5 — `Master execution strategy: release-ready G1 → independent I2P overlay`.
 
 ## Current verified implementation state
 
-- Verified base `main` before Phase 5b merge: `585468c6d68043e482f75e986a1bf470598a1ba3`.
-- Active Phase 5b branch: `agent/live-lan-app-wiring-phase5b`.
-- Active PR: #8 — `refactor: wire live known-LAN through coordinator`.
-- Corrected live code head: `f4d3cddd1aa3984f57a3eb0cca6924c8bcd4b7df`.
-- Corrected-head CI #83 (`32101066718`) is fully green: JS tests, RN bundle, Android units, Debug APK, Release APK and both artifacts.
-- Phase 5b moves known-contact outbound LAN to `ConnectionCoordinator` and makes App disconnect cleanup transport/control-owner aware.
-- `src/App.js` no longer invents `lan_<ip>` identity and no longer stores LAN IP in P2P `deviceAddress`.
-- Manual-IP LAN remains a legacy/provisional diagnostic path.
-- Current live Wi-Fi Direct ownership remains in App on purpose.
-- Persistent-listener incoming LAN promotion/reciprocal identity is still incomplete and is the exact next networking checkpoint.
-- No new physical-device evidence exists for Phase 5b yet.
+- Verified merged base before Phase 5c: `main@cce1c8f674c4e7c8862d41c92735e49df4d55b52`.
+- Phase 5c branch: `agent/incoming-lan-adoption-phase5c`.
+- Active Draft PR: #9 — `refactor: adopt passive incoming LAN signaling sessions`.
+- Verified live-code head: `7f6b883eb83b96491bfc3df1af007be3ef367e48`.
+- CI #113 (`32106767926`) is fully green on that exact code head: JS tests, RN production bundle, Android unit tests, Debug APK, Release APK, and both artifact uploads.
+- No review threads or submitted reviews are blocking PR #9.
+- `main` was re-checked after #113 and remained `cce1c8f6...`; the Phase 5c branch was strictly ahead with no base divergence.
+- No new physical two-device evidence exists for Phase 5c yet.
 
-## Phase 5b merge procedure
+### Networking ownership now
 
-1. Inspect PR #8 head and final Actions state; do not assume merge from this file alone.
-2. The corrected code head `f4d3cddd...` is green on #83.
-3. This documentation checkpoint must itself receive a final full-green CI run.
-4. Re-check that `main` is still `585468c6...` and that the PR head is strictly ahead/behind=0.
-5. Fast-forward `main` non-force to the exact tested documentation head.
-6. Verify PR #8 becomes `closed + merged=true` with the same SHA; do not create a different merge commit.
+- Known-contact outbound LAN: coordinator-owned.
+- Passive incoming LAN: signaling accepts the socket, shared admission validates it, then coordinator adopts the existing signaling-owner session; live App promotes it to LAN CONNECTED when mounted.
+- Signaling owns socket/session heartbeat and bounded same-route recovery for coordinator-owned LAN sessions.
+- File transfer remains independent on its native data channel.
+- Wi-Fi Direct signaling/reconnect remains App-owned intentionally.
+- Manual-IP LAN remains provisional/legacy diagnostic behavior.
 
-## Exact next engineering step after Phase 5b merge
+### New Phase 5c invariants
 
-Create branch:
-`agent/incoming-lan-adoption-phase5c`
+- Passive LAN admission never derives peer identity from IP.
+- A passive identity must already match a current/reachable LAN route for that `deviceId` and the live socket endpoint.
+- Unadmitted passive application frames cannot reach App/BackgroundRuntime; identity has a bounded 5s deadline.
+- Explicit P2P server mode bypasses the passive-LAN gate.
+- A different endpoint cannot steal an inbound transient-recovery window.
+- Same-peer outbound/inbound known-LAN races converge to the existing healthy inbound winner without a second socket or heartbeat.
+- Immediate live messages are merged with persisted history instead of being overwritten during identity/history loading.
 
-Then:
+## Phase 5c verification chronology
 
-1. Add characterization tests for coordinator adoption of an already-active signaling-owner session.
-2. Implement a transport-neutral `adoptSignalingOwnerSession(peer, transport, { requireInbound })`-style boundary (final name may vary) that:
-   - uses `signalingOwner.getActiveSession()`;
-   - does not call `connectOutbound`;
-   - rejects a disconnected/missing session;
-   - can require `session.isOutbound === false`;
-   - does not start coordinator heartbeat for an externally managed session;
-   - reuses generation/disconnect-subscription protections;
-   - converges the same-peer CONNECTING/inbound race safely.
-3. Wire passive LAN identity handling in App only when App is IDLE/DISCONNECTED with a live inbound session. P2P `WIFI_CONNECTING` and outbound LAN must not take this branch.
-4. Upsert the LAN route as `deviceId + host + port`; never derive identity from IP.
-5. Send local identity once as the reciprocal passive-LAN response, then promote App UI/history to LAN CONNECTED.
-6. Full CI.
-7. When both directions are code/CI green, stop networking refactoring and run the physical two-device LAN certification matrix before moving P2P ownership.
+- #89 expected red → missing coordinator adoption seam.
+- #91 green → coordinator adoption verified.
+- #93 expected red → inbound recovery endpoint race reproduced.
+- #95 diagnostic red → previous socket address was lost before disconnect callback.
+- #97 green → endpoint-bound inbound recovery verified.
+- #99 expected red → shared passive admission seams missing.
+- #101 functional gate behavior passed; only test dependency isolation failed.
+- #103 rerun full green on unchanged code; first attempt's ApkFlinger Java heap OOM was transient, so Gradle config was not changed.
+- #105 expected red → App promotion/context seams missing.
+- #107 green → App policy/context/signaling ownership health verified.
+- #109 expected red → history/live merge helper missing.
+- #111 green → history/live convergence verified.
+- #113 green → live App incoming LAN integration verified across JS/bundle/Android/APKs/artifacts.
+
+## Exact next engineering step
+
+First finish the Phase 5c merge procedure; then **stop networking refactoring and run the physical two-device ordinary-LAN certification matrix** before changing P2P ownership.
+
+### Phase 5c merge procedure
+
+1. This documentation-only checkpoint must receive its own full-green CI run.
+2. Re-check `main` is still the Phase 5b base and the PR head is strictly ahead/behind=0.
+3. Fast-forward `main` non-force to the exact tested documentation head; do not squash or create a different merge commit.
+4. Verify PR #9 becomes `closed + merged=true` with the exact same SHA.
+5. Raise G1-before-I2P progress only after that verified merge.
+
+### Physical two-device LAN matrix after merge
+
+Use two Android devices on the same ordinary Wi-Fi LAN:
+
+1. Confirm both discover the expected stable peer over LAN.
+2. A → B from a saved contact: one logical session; B passively promotes; correct stable identity; text both directions.
+3. Clean disconnect and repeat B → A.
+4. Simultaneous connect on both phones to the same saved peer: converge to one healthy session; no stuck `WIFI_CONNECTING`; no immediate disconnect.
+5. Exercise a short signaling interruption/recovery when practical; successful recovery must not false-disconnect the UI.
+6. File-transfer smoke test both directions while signaling remains connected.
+7. On any failure capture current LAN IPs, initiator, `[G1/SIGNAL]`, coordinator transitions, and `[G1/LAN]` logs before further network code changes.
+
+Do not proceed to P2P ownership migration until this matrix passes or failures are diagnosed.
 
 ## Known limitations to keep visible
 
-- incoming LAN passive session is not yet promoted into coordinator/UI;
-- current deviceId claim is not cryptographically authenticated;
-- general duplicate arbitration / make-before-break remains unfinished;
-- P2P signaling/reconnect is still App-owned;
-- background/process-death networking still needs later Android-runtime work;
-- calls/APK/file-performance/messaging/UI release gates remain after networking stabilization.
+- Current LAN identity admission is not cryptographic authentication. NSD/TXT + `deviceId` + route/socket matching remain spoofable by a capable LAN attacker.
+- Cryptographic peer authentication/pairing is still mandatory before Internet-reachable I2P control signaling.
+- General duplicate arbitration and make-before-break across transport families remain unfinished.
+- Background UI re-attachment/process-death network ownership remains later work.
+- P2P is still App-owned.
+- Calls/call history, APK/APKS end-to-end validation, file performance, messaging completeness, UI, security/CI/release hardening remain later release gates.
 
 ## Progress metric
 
-G1-before-I2P: **40%** before the Phase 5b fast-forward. Raise only on a verified merged milestone, not on commit count.
+G1-before-I2P: **42%** until the Phase 5c documentation head is fully green and merged into `main`. After verified merge, raise cautiously to approximately **45%**; physical LAN certification is still the next release gate.
 
 ## Goal constraint
 
-Finish and device-verify G1 P0/P1 reliability before implementing I2P. I2P is a future independent transport/overlay. I2P Destination is route addressing, not peer identity, and cryptographic peer authentication is required before Internet-reachable control signaling.
+Finish and device-verify G1 P0/P1 reliability before implementing I2P. I2P remains a future independent overlay/transport. I2P Destination is route addressing, not peer identity. Cryptographic peer authentication is a hard prerequisite before Internet-reachable control signaling.
