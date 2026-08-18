@@ -18,6 +18,12 @@ import { lanDiscovery } from './network/LanDiscovery';
 import { peerRegistry, TRANSPORTS } from './network/PeerRegistry';
 import { connectionCoordinator } from './network/ConnectionCoordinator';
 import { resolveKnownLanTarget } from './network/knownLanTarget';
+import { setLanPassiveAdmissionContextProvider } from './network/LanPassiveAdmission';
+import {
+  getPassiveLanPromotionPlan,
+  isKnownLanRaceWinner,
+  mergePeerMessageHistory,
+} from './network/passiveLanAppPolicy';
 import { CONTROL_PLANE_OWNERS, getSessionDisconnectPlan } from './network/sessionDisconnectPlan';
 import { TransferActivityGate } from './network/transferActivityGate';
 import { secureHandshake } from './network/SecureHandshake';
@@ -93,6 +99,12 @@ export default function App() {
   const [localIp, setLocalIp] = useState("127.0.0.1");
 
   useEffect(() => {
+    setLanPassiveAdmissionContextProvider(() => ({
+      uiMounted: mountedRef.current,
+      appState: stateRef.current,
+      pendingKnownLanPeerId: pendingKnownLanPeerIdRef.current,
+    }));
+
     // Start persistent LAN listener on 0.0.0.0:8089 (Always-On Listener)
     startPersistentListener(PORT).catch(err => {
       console.log('[App] Persistent listener startup:', err?.message || err);
@@ -219,6 +231,7 @@ export default function App() {
   const discoveredRef = useRef({});
   const contactsRef = useRef([]);
   const targetPeerRef = useRef(null);
+  const pendingKnownLanPeerIdRef = useRef(null);
   const connectionAddressTrackerRef = useRef(createConnectionAddressTracker());
   const rtcNegotiatingRef = useRef(false);
   const inCallRef = useRef(false);
@@ -468,24 +481,111 @@ export default function App() {
       } else if (msg.type === 'identity') {
         // تبادل الهوية: منعرف مين الطرف الآخر ومنحمّل محادثته المحفوظة
         if (msg.deviceId) {
+          const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+          const signalingHealth = getSignalingHealth();
+          const promotionPlan = getPassiveLanPromotionPlan({
+            message: msg,
+            appState: stateRef.current,
+            uiMounted: mountedRef.current,
+            pendingKnownLanPeerId: pendingKnownLanPeerIdRef.current,
+            coordinatorStatus,
+            signalingHealth,
+          });
+          const currentTarget = targetPeerRef.current;
+          const matchingTarget = currentTarget && (
+            currentTarget.peerId === msg.deviceId ||
+            currentTarget.deviceId === msg.deviceId
+          ) ? currentTarget : null;
+          const savedContact = contactsRef.current.find(contact => (
+            contact.peerId === msg.deviceId || contact.deviceId === msg.deviceId
+          )) || null;
+          const selected = matchingTarget || savedContact || coordinatorStatus.peer || {};
+          const displayName =
+            selected.customName || selected.name || msg.deviceName ||
+            selected.deviceName || coordinatorStatus.peer?.deviceName || 'الجهاز الآخر';
+
           peerIdRef.current = msg.deviceId;
-          if (mountedRef.current) setPeerDisplayName(msg.deviceName || 'الجهاز الآخر');
-          const selected = targetPeerRef.current || {};
           connectionAddressTrackerRef.current.setIdentity({
             peerId: msg.deviceId,
             deviceName: msg.deviceName || selected.name || selected.deviceName || '',
             targetPeer: selected,
           });
-          setActivePeerInfo({
-            ...selected,
-            peerId: msg.deviceId,
-            name: msg.deviceName || selected.name || selected.deviceName || 'الجهاز الآخر',
-          });
-          await savePeer(msg.deviceId, msg.deviceName || '', '');
+
+          if (promotionPlan && mountedRef.current) {
+            peerIpRef.current = promotionPlan.host;
+            activeTransportRef.current = TRANSPORTS.LAN;
+            activeControlOwnerRef.current = CONTROL_PLANE_OWNERS.COORDINATOR;
+            targetPeerRef.current = selected;
+            reconnectAttemptRef.current = 0;
+            stateRef.current = States.CONNECTED;
+            setState(States.CONNECTED);
+            setActiveTier(Tiers.LAN);
+            setStatusText('متصل عبر الشبكة المحلية');
+            setPeerDisplayName(displayName);
+            setChatOpen(true);
+            startTransferServer().catch(() => {});
+            ensureMicGuard();
+            setActivePeerInfo({
+              ...selected,
+              deviceId: msg.deviceId,
+              peerId: msg.deviceId,
+              host: promotionPlan.host,
+              port: selected?.transports?.[TRANSPORTS.LAN]?.port || selected?.port || PORT,
+              name: displayName,
+              transport: 'lan',
+            });
+          } else if (mountedRef.current) {
+            setPeerDisplayName(displayName);
+            setActivePeerInfo({
+              ...selected,
+              peerId: msg.deviceId,
+              name: displayName,
+            });
+          }
+
+          const sendReciprocalIdentity = localIdentity => {
+            if (!localIdentity?.deviceId) return false;
+            const currentCoordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+            const currentHealth = getSignalingHealth();
+            if (!isKnownLanRaceWinner({
+              targetDeviceId: msg.deviceId,
+              coordinatorStatus: currentCoordinatorStatus,
+              signalingHealth: currentHealth,
+            })) {
+              return false;
+            }
+            identityRef.current = localIdentity;
+            return sendSignalingMessage({
+              type: 'identity',
+              deviceId: localIdentity.deviceId,
+              deviceName: localIdentity.deviceName || 'DirectChat Device',
+            });
+          };
+
+          if (isKnownLanRaceWinner({
+            targetDeviceId: msg.deviceId,
+            coordinatorStatus,
+            signalingHealth,
+          })) {
+            if (identityRef.current) {
+              sendReciprocalIdentity(identityRef.current);
+            } else {
+              getDeviceIdentity()
+                .then(sendReciprocalIdentity)
+                .catch(() => false);
+            }
+          }
+
+          await savePeer(msg.deviceId, msg.deviceName || displayName, '');
           await saveResolvedPeerAddress(connectionAddressTrackerRef.current, savePeerAddress);
           const history = await loadMessages(msg.deviceId, 300);
           if (mountedRef.current) {
-            setMessages((history || []).map(h => ({ ...h, time: Number(h.time) })));
+            const normalizedHistory = (history || []).map(h => ({ ...h, time: Number(h.time) }));
+            setMessages(prev => (
+              promotionPlan
+                ? mergePeerMessageHistory(normalizedHistory, prev)
+                : normalizedHistory
+            ));
           }
           refreshContacts();
         }
@@ -1538,19 +1638,28 @@ export default function App() {
       throw new Error('هدف LAN المعروف غير مكتمل');
     }
 
-    const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
-    if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
-    identityRef.current = identity;
-
-    connectionAttemptRef.current += 1;
-    targetPeerRef.current = contact;
-    connectionPhaseRef.current = 'اتصال LAN مباشر';
-    setMessages([]);
-    stateRef.current = States.WIFI_CONNECTING;
-    setState(States.WIFI_CONNECTING);
-    setStatusText(`جاري الاتصال بـ ${contact.customName || contact.name || target.deviceName || 'الجهاز'} عبر الشبكة المحلية…`);
-
+    pendingKnownLanPeerIdRef.current = target.deviceId;
     try {
+      const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
+      if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
+      identityRef.current = identity;
+
+      if (isKnownLanRaceWinner({
+        targetDeviceId: target.deviceId,
+        coordinatorStatus: connectionCoordinator.getCoordinatorStatus(),
+        signalingHealth: getSignalingHealth(),
+      })) {
+        return true;
+      }
+
+      connectionAttemptRef.current += 1;
+      targetPeerRef.current = contact;
+      connectionPhaseRef.current = 'اتصال LAN مباشر';
+      setMessages([]);
+      stateRef.current = States.WIFI_CONNECTING;
+      setState(States.WIFI_CONNECTING);
+      setStatusText(`جاري الاتصال بـ ${contact.customName || contact.name || target.deviceName || 'الجهاز'} عبر الشبكة المحلية…`);
+
       await connectionCoordinator.connectLanPeer(target, 8000, {
         maxRetries: 5,
         retryDelayMs: 800,
@@ -1613,6 +1722,14 @@ export default function App() {
       return true;
     } catch (error) {
       const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+      const signalingHealth = getSignalingHealth();
+      if (isKnownLanRaceWinner({
+        targetDeviceId: target.deviceId,
+        coordinatorStatus,
+        signalingHealth,
+      })) {
+        return true;
+      }
       if (
         coordinatorStatus.peer?.deviceId === target.deviceId &&
         coordinatorStatus.transport === TRANSPORTS.LAN
@@ -1632,6 +1749,10 @@ export default function App() {
         setActiveTier(Tiers.NONE);
       }
       throw error;
+    } finally {
+      if (pendingKnownLanPeerIdRef.current === target.deviceId) {
+        pendingKnownLanPeerIdRef.current = null;
+      }
     }
   };
 
