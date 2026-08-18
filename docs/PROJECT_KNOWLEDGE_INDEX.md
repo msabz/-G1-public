@@ -30,6 +30,8 @@ The user should interact with peers and conversations, not network plumbing. Dis
 
 ## 4. Canonical documents
 Read these before substantial changes:
+- `docs/CURRENT_CONTINUATION.md` — rolling first-stop pointer to the latest verified work and exact resume step.
+- `docs/DEVELOPMENT_CHECKPOINT_2026-08-18_LIVE_LAN_PHASE5_SEAMS_COMPLETE.md` — latest dated networking checkpoint at the time of this index update.
 - `docs/DEVELOPMENT_HANDOFF_2026-08-17.md` — broad implementation handoff and known state.
 - `docs/DEVELOPMENT_HANDOFF_NETWORKING_2026-08-17.md` — networking-specific handoff.
 - `docs/G1_NETWORKING_DEVELOPMENT_MEMORY.md` — detailed networking history, evidence and decisions.
@@ -113,6 +115,8 @@ A Samsung-only log cannot establish the internal reason a Motorola peer closed a
 
 ## 8. Current CI baseline
 The public clean-history repository uses GitHub-hosted Actions as the canonical build/test environment. Local Android building on the user's phone is not part of the development workflow. JavaScript tests and Android validation must remain green before device testing is treated as a candidate release.
+
+For the exact newest continuation state and CI references, read `docs/CURRENT_CONTINUATION.md` and the dated checkpoint it names before relying on the historical baseline below.
 
 ### Current verified public baseline — 2026-08-18
 - Repository: `msabz/-G1-public`, branch `main`.
