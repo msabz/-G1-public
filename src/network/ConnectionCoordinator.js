@@ -32,12 +32,27 @@ export class ConnectionCoordinator {
     this.heartbeatInterval = null;
     this.lastReceivedHeartbeat = 0;
     this.pendingConnectAbort = null;
+
+    // Optional high-level signaling owner. When present, the coordinator owns
+    // logical connection state while the injected owner owns the socket/session,
+    // heartbeat and same-route signaling recovery. Keeping this dependency
+    // injectable lets the live runtime adopt src/webrtc/signaling.js gradually
+    // without importing React Native runtime code into this pure coordinator.
+    this.signalingOwner = options.signalingOwner || null;
+    this.activeSessionManagedExternally = false;
   }
 
   setIdentity({ deviceId, deviceName }) {
     this.myDeviceId = deviceId;
     this.myDeviceName = deviceName;
     peerRegistry.setMyDeviceId(deviceId);
+  }
+
+  setSignalingOwner(owner) {
+    if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.CONNECTED) {
+      throw new Error('Cannot replace signaling owner while a connection is active');
+    }
+    this.signalingOwner = owner || null;
   }
 
   _setState(newState, payload = {}) {
@@ -86,6 +101,7 @@ export class ConnectionCoordinator {
     this._bindSessionEvents(session, ++this.generation);
     session.attachSocket(socket, this.generation);
     this.activeSession = session;
+    this.activeSessionManagedExternally = false;
     this.currentPeer = peerInfo;
     this.currentTransport = peerInfo.transport || 'LAN';
 
@@ -113,8 +129,78 @@ export class ConnectionCoordinator {
     this.currentPeer = peer;
     this.currentTransport = 'LAN';
 
+    if (this.signalingOwner) {
+      return this._connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs);
+    }
+
+    return this._connectLanLegacy(peer, lanInfo, currentGen);
+  }
+
+  async _connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs) {
+    const owner = this.signalingOwner;
+    if (typeof owner?.connectOutbound !== 'function') {
+      throw new Error('Configured signaling owner is missing connectOutbound()');
+    }
+
     let settled = false;
-    let connectPromise = null;
+    let cancelled = false;
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      cancelled = true;
+      try { owner.cancelConnect?.(); } catch (e) {}
+    };
+    this.pendingConnectAbort = abort;
+
+    try {
+      await owner.connectOutbound({
+        host: lanInfo.host,
+        port: lanInfo.port || 8089,
+        maxRetries: 3,
+        retryDelayMs: 600,
+        timeoutMs,
+      });
+
+      if (cancelled || this.generation !== currentGen) {
+        return;
+      }
+
+      settled = true;
+      if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+
+      const session = typeof owner.getActiveSession === 'function'
+        ? owner.getActiveSession()
+        : null;
+      if (!session || session.isConnected === false) {
+        throw new Error('Signaling owner completed LAN connect without an active session');
+      }
+
+      this.activeSession = session;
+      this.activeSessionManagedExternally = true;
+      // Heartbeat/recovery remain exclusively owned by the injected signaling
+      // runtime. Starting the coordinator heartbeat here would create two
+      // control-plane liveness owners for the same socket.
+      this._stopHeartbeat();
+      this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: 'LAN' });
+      peerRegistry.setPeerConnected(peer.deviceId, 'LAN');
+      if (this.onConnected) this.onConnected(peer, 'LAN');
+
+      return session;
+    } catch (err) {
+      if (cancelled || this.generation !== currentGen) {
+        return;
+      }
+      if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+      if (this.generation === currentGen) {
+        this._setState(COORDINATOR_STATE.ERROR, { error: err.message });
+        peerRegistry.setPeerDisconnected(peer.deviceId);
+      }
+      throw err;
+    }
+  }
+
+  async _connectLanLegacy(peer, lanInfo, currentGen) {
+    let settled = false;
 
     const abort = () => {
       if (settled) return;
@@ -146,6 +232,7 @@ export class ConnectionCoordinator {
       this._bindSessionEvents(session, currentGen);
       session.attachSocket(socket, currentGen);
       this.activeSession = session;
+      this.activeSessionManagedExternally = false;
 
       this._startHeartbeat();
       this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: 'LAN' });
@@ -223,6 +310,7 @@ export class ConnectionCoordinator {
     this._stopHeartbeat();
     const peer = this.currentPeer;
     this.activeSession = null;
+    this.activeSessionManagedExternally = false;
     this.currentPeer = null;
     this.currentTransport = null;
     this._setState(COORDINATOR_STATE.IDLE);
@@ -238,6 +326,9 @@ export class ConnectionCoordinator {
   sendMessage(msgObj) {
     if (!this.activeSession || this.state !== COORDINATOR_STATE.CONNECTED) {
       return false;
+    }
+    if (this.activeSessionManagedExternally && typeof this.signalingOwner?.sendMessage === 'function') {
+      return this.signalingOwner.sendMessage(msgObj);
     }
     return this.activeSession.sendMessage(msgObj);
   }
@@ -261,8 +352,12 @@ export class ConnectionCoordinator {
     this._stopHeartbeat();
     this.cancelConnecting();
     const session = this.activeSession;
+    const managedExternally = this.activeSessionManagedExternally;
     this.activeSession = null;
-    if (session) {
+    this.activeSessionManagedExternally = false;
+    if (managedExternally) {
+      try { this.signalingOwner?.disconnect?.(); } catch (e) {}
+    } else if (session) {
       session.destroy();
     }
     this._handleSessionTermination();
