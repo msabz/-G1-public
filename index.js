@@ -7,10 +7,13 @@ import App from './src/App';
 import { setUiAttached } from './src/services/BackgroundRuntime';
 import { connectionCoordinator } from './src/network/ConnectionCoordinator';
 import { lanPassiveAdmissionHandler } from './src/network/LanPassiveAdmission';
+import { wifiDirectTransportAdapter } from './src/network/WifiDirectTransportAdapter';
 import { setPassiveInboundAdmissionHandler } from './src/webrtc/signaling';
 import { signalingOwner } from './src/webrtc/signalingOwner';
 
 connectionCoordinator.setSignalingOwner(signalingOwner);
+connectionCoordinator.setP2pAdapter(wifiDirectTransportAdapter);
+wifiDirectTransportAdapter.startObserving();
 setPassiveInboundAdmissionHandler(lanPassiveAdmissionHandler);
 
 function G1Root() {

@@ -3,8 +3,10 @@ import {
   cancelSignalingConnectAttempt,
   closeSignaling,
   connectToSignalingServer,
+  createSignalingServer,
   getActiveSession,
   sendSignalingMessage,
+  waitForClientConnection,
 } from './signaling';
 
 /**
@@ -20,6 +22,12 @@ export const signalingOwner = {
     retryDelayMs = 800,
   }) {
     return connectToSignalingServer(host, port, maxRetries, retryDelayMs);
+  },
+
+  async acceptInbound({ port = 8089, timeoutMs = 30000 } = {}) {
+    await createSignalingServer(port);
+    await waitForClientConnection(timeoutMs);
+    return getActiveSession();
   },
 
   cancelConnect(reason) {

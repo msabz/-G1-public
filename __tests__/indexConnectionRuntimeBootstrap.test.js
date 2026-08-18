@@ -1,6 +1,9 @@
 const mockSetSignalingOwner = jest.fn();
+const mockSetP2pAdapter = jest.fn();
+const mockStartP2pObserving = jest.fn();
 const mockSetPassiveInboundAdmissionHandler = jest.fn();
 const mockSignalingOwner = { name: 'live-signaling-owner' };
+const mockP2pAdapter = { startObserving: mockStartP2pObserving };
 const mockLanPassiveAdmissionHandler = jest.fn();
 const mockRegisterComponent = jest.fn();
 
@@ -19,7 +22,12 @@ jest.mock('../src/services/BackgroundRuntime', () => ({
 jest.mock('../src/network/ConnectionCoordinator', () => ({
   connectionCoordinator: {
     setSignalingOwner: mockSetSignalingOwner,
+    setP2pAdapter: mockSetP2pAdapter,
   },
+}));
+
+jest.mock('../src/network/WifiDirectTransportAdapter', () => ({
+  wifiDirectTransportAdapter: mockP2pAdapter,
 }));
 
 jest.mock('../src/webrtc/signalingOwner', () => ({
@@ -39,18 +47,27 @@ describe('G1 live connection runtime bootstrap', () => {
     jest.clearAllMocks();
   });
 
-  test('binds signaling ownership and passive LAN admission before registering React Native roots', () => {
+  test('binds signaling/P2P ownership and passive LAN admission before registering React Native roots', () => {
     jest.isolateModules(() => {
       require('../index');
     });
 
     expect(mockSetSignalingOwner).toHaveBeenCalledTimes(1);
     expect(mockSetSignalingOwner).toHaveBeenCalledWith(mockSignalingOwner);
+    expect(mockSetP2pAdapter).toHaveBeenCalledTimes(1);
+    expect(mockSetP2pAdapter).toHaveBeenCalledWith(mockP2pAdapter);
+    expect(mockStartP2pObserving).toHaveBeenCalledTimes(1);
     expect(mockSetPassiveInboundAdmissionHandler).toHaveBeenCalledTimes(1);
     expect(mockSetPassiveInboundAdmissionHandler).toHaveBeenCalledWith(mockLanPassiveAdmissionHandler);
     expect(mockRegisterComponent).toHaveBeenCalledTimes(3);
 
     expect(mockSetSignalingOwner.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSetP2pAdapter.mock.invocationCallOrder[0]
+    );
+    expect(mockSetP2pAdapter.mock.invocationCallOrder[0]).toBeLessThan(
+      mockStartP2pObserving.mock.invocationCallOrder[0]
+    );
+    expect(mockStartP2pObserving.mock.invocationCallOrder[0]).toBeLessThan(
       mockSetPassiveInboundAdmissionHandler.mock.invocationCallOrder[0]
     );
     expect(mockSetPassiveInboundAdmissionHandler.mock.invocationCallOrder[0]).toBeLessThan(
