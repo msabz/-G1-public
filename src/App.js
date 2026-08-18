@@ -132,6 +132,7 @@ export default function App() {
   }, []);
 
   const handleConnectLan = async (ip, port = 8089) => {
+    let connectedHere = false;
     try {
       const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
       if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
@@ -141,12 +142,26 @@ export default function App() {
       stateRef.current = States.WIFI_CONNECTING;
       setState(States.WIFI_CONNECTING);
       await connectToSignalingServer(ip, port, 5, 800);
+      connectedHere = true;
+
+      if (!mountedRef.current || disconnectingRef.current || !signalingIsHealthy()) {
+        throw new Error('أُلغيت محاولة LAN قبل تفعيل الجلسة');
+      }
+      const identitySent = sendSignalingMessage({
+        type: 'identity',
+        deviceId: identity.deviceId,
+        deviceName: identity.deviceName || 'DirectChat Device',
+      });
+      if (!identitySent || !signalingIsHealthy()) {
+        throw new Error('فشل تبادل هوية G1 عبر LAN');
+      }
 
       peerIpRef.current = ip;
       activeTransportRef.current = TRANSPORTS.LAN;
       activeControlOwnerRef.current = CONTROL_PLANE_OWNERS.LEGACY_APP;
       const peer = {
-        deviceAddress: ip,
+        host: ip,
+        port,
         deviceName: `LAN (${ip})`,
         customName: `LAN (${ip})`,
         transport: 'lan',
@@ -161,13 +176,9 @@ export default function App() {
       setActiveTier(Tiers.LAN);
       setChatOpen(true);
       setStatusText(`متصل عبر الشبكة المحلية (${ip})`);
-      sendSignalingMessage({
-        type: 'identity',
-        deviceId: identity.deviceId,
-        deviceName: identity.deviceName || 'DirectChat Device',
-      });
     } catch (e) {
       console.warn('LAN connection error:', e);
+      if (connectedHere) closeSignaling();
       activeTransportRef.current = null;
       activeControlOwnerRef.current = null;
       peerIpRef.current = null;
@@ -1546,11 +1557,34 @@ export default function App() {
       });
 
       if (!mountedRef.current || disconnectingRef.current) {
-        connectionCoordinator.disconnect();
         throw new Error('أُلغيت محاولة LAN قبل تفعيل الجلسة');
       }
 
       const displayName = contact.customName || contact.name || target.deviceName || 'الجهاز الآخر';
+      await savePeer(target.deviceId, target.deviceName || displayName, '');
+      const history = await loadMessages(target.deviceId, 300);
+
+      const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+      if (
+        !mountedRef.current ||
+        disconnectingRef.current ||
+        !signalingIsHealthy() ||
+        coordinatorStatus.state !== 'CONNECTED' ||
+        coordinatorStatus.peer?.deviceId !== target.deviceId ||
+        coordinatorStatus.transport !== TRANSPORTS.LAN
+      ) {
+        throw new Error('انتهت جلسة LAN قبل اكتمال تهيئة المحادثة');
+      }
+
+      const identitySent = sendSignalingMessage({
+        type: 'identity',
+        deviceId: identity.deviceId,
+        deviceName: identity.deviceName || 'DirectChat Device',
+      });
+      if (!identitySent || !signalingIsHealthy()) {
+        throw new Error('فشل تبادل هوية G1 عبر LAN');
+      }
+
       peerIdRef.current = target.deviceId;
       peerIpRef.current = lanInfo.host;
       activeTransportRef.current = TRANSPORTS.LAN;
@@ -1559,25 +1593,15 @@ export default function App() {
         ...contact,
         deviceId: target.deviceId,
         peerId: target.deviceId,
-        deviceAddress: lanInfo.host,
+        host: lanInfo.host,
+        port: lanInfo.port || PORT,
         name: displayName,
         transport: 'lan',
       });
       setPeerDisplayName(displayName);
       startTransferServer().catch(() => {});
       ensureMicGuard();
-
-      await savePeer(target.deviceId, target.deviceName || displayName, '');
-      const history = await loadMessages(target.deviceId, 300);
-      if (mountedRef.current) {
-        setMessages((history || []).map(h => ({ ...h, time: Number(h.time) })));
-      }
-
-      sendSignalingMessage({
-        type: 'identity',
-        deviceId: identity.deviceId,
-        deviceName: identity.deviceName || 'DirectChat Device',
-      });
+      setMessages((history || []).map(h => ({ ...h, time: Number(h.time) })));
 
       reconnectAttemptRef.current = 0;
       stateRef.current = States.CONNECTED;
@@ -1588,7 +1612,13 @@ export default function App() {
       refreshContacts();
       return true;
     } catch (error) {
-      connectionCoordinator.disconnect();
+      const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+      if (
+        coordinatorStatus.peer?.deviceId === target.deviceId &&
+        coordinatorStatus.transport === TRANSPORTS.LAN
+      ) {
+        connectionCoordinator.disconnect();
+      }
       if (activeControlOwnerRef.current === CONTROL_PLANE_OWNERS.COORDINATOR) {
         activeControlOwnerRef.current = null;
       }
