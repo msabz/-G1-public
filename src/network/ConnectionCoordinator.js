@@ -169,6 +169,79 @@ export class ConnectionCoordinator {
     return true;
   }
 
+  /**
+   * Adopt a session that is already owned by the injected signaling runtime.
+   * This is intentionally transport-neutral: the coordinator only takes logical
+   * peer/transport ownership and never opens a second socket or heartbeat.
+   */
+  adoptSignalingOwnerSession(peer, transport = 'LAN', options = {}) {
+    if (!peer?.deviceId) {
+      throw new Error('Peer deviceId is required to adopt a signaling owner session');
+    }
+
+    const owner = this.signalingOwner;
+    if (!owner || typeof owner.getActiveSession !== 'function') {
+      throw new Error('Configured signaling owner is missing getActiveSession()');
+    }
+
+    const session = owner.getActiveSession();
+    if (!session || session.isConnected === false) {
+      throw new Error('Signaling owner has no connected session to adopt');
+    }
+    if (options?.requireInbound && session.isOutbound !== false) {
+      throw new Error('Active signaling owner session is not inbound');
+    }
+
+    const samePeer = this.currentPeer?.deviceId === peer.deviceId;
+    const sameTransport = this.currentTransport === transport;
+
+    if (this.state === COORDINATOR_STATE.CONNECTED) {
+      if (!samePeer || !sameTransport || !this.activeSessionManagedExternally) {
+        throw new Error('Cannot adopt signaling owner session while a different connection is active');
+      }
+
+      // Same logical route may receive a replacement SignalingSession after the
+      // owner's same-route recovery. Refresh the snapshot without creating a
+      // second onConnected callback, generation or disconnect subscription.
+      this.activeSession = session;
+      return session;
+    }
+
+    if (this.state === COORDINATOR_STATE.DISCONNECTING) {
+      throw new Error('Cannot adopt signaling owner session while disconnecting');
+    }
+
+    if (this.state === COORDINATOR_STATE.CONNECTING) {
+      if (!samePeer) {
+        throw new Error('Cannot adopt signaling owner session for a different peer while connecting');
+      }
+      // cancelConnecting() delegates to owner.cancelConnect(), which is the
+      // connect-only cancellation primitive. It must not destroy a healthy
+      // inbound session that has already won the race.
+      this.cancelConnecting();
+    }
+
+    const currentGen = ++this.generation;
+    this._clearSignalingOwnerDisconnectSubscription();
+    this.pendingConnectAbort = null;
+    this.activeSession = session;
+    this.activeSessionManagedExternally = true;
+    this.currentPeer = peer;
+    this.currentTransport = transport;
+
+    this._stopHeartbeat();
+    this._setState(COORDINATOR_STATE.CONNECTED, {
+      peer,
+      transport,
+      adopted: true,
+    });
+    peerRegistry.setPeerConnected(peer.deviceId, transport);
+    if (this.onConnected) this.onConnected(peer, transport);
+    this._subscribeToSignalingOwnerDisconnect(owner, currentGen);
+
+    return session;
+  }
+
   async connectLanPeer(peer, timeoutMs = 8000, connectOptions = {}) {
     const lanInfo = peer.transports?.LAN || peer;
     if (!lanInfo.host) {
