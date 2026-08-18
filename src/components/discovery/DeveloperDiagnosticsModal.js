@@ -124,9 +124,13 @@ export const DeveloperDiagnosticsModal = ({
       `Transport Mode: ${transportMode}`,
       `Signaling Connected: ${health.connected}`,
       `Signaling Peer: ${health.peerAddress || 'none'}`,
+      `Signaling Direction: ${health.direction || 'none'}`,
+      `Passive Admission Required: ${health.passiveAdmissionRequired === true}`,
+      `Passive Admission Accepted: ${health.passiveAdmissionAccepted === true}`,
       `Heartbeat Running: ${health.heartbeatRunning}`,
       `Last Inbound Activity: ${health.lastInboundActivityAt || 0}`,
       `Recovery In Progress: ${health.recoveryInProgress === true}`,
+      `Graceful Disconnect Pending: ${health.gracefulDisconnectPending === true}`,
       `Discovered Peers: ${discoveredPeers.length}`,
       ...discoveredPeers.map(p => ` - ${p.deviceName} (${p.deviceId}) ${transportLine(p)}`),
     ].join('\n');
@@ -170,11 +174,17 @@ export const DeveloperDiagnosticsModal = ({
               </Text>
               <Text style={[styles.rowText, { color: theme.text }]}>
                 <Text style={styles.bold}>Signaling: </Text>
-                {signalingHealth.connected ? `✅ ${signalingHealth.peerAddress || ''}` : '⚪ غير متصل'}
+                {signalingHealth.connected
+                  ? `✅ ${signalingHealth.peerAddress || ''} · ${signalingHealth.direction || 'unknown'}`
+                  : '⚪ غير متصل'}
+              </Text>
+              <Text style={[styles.rowText, { color: theme.text }]}>
+                <Text style={styles.bold}>Admission: </Text>
+                Required {signalingHealth.passiveAdmissionRequired ? 'Yes' : 'No'} | Accepted {signalingHealth.passiveAdmissionAccepted ? 'Yes' : 'No'}
               </Text>
               <Text style={[styles.rowText, { color: theme.text }]}>
                 <Text style={styles.bold}>Heartbeat: </Text>
-                {signalingHealth.heartbeatRunning ? '✅ Active' : '⚪ Idle'} | Recovery: {signalingHealth.recoveryInProgress ? '🔄 Yes' : 'No'}
+                {signalingHealth.heartbeatRunning ? '✅ Active' : '⚪ Idle'} | Recovery: {signalingHealth.recoveryInProgress ? '🔄 Yes' : 'No'} | Graceful: {signalingHealth.gracefulDisconnectPending ? 'Yes' : 'No'}
               </Text>
               <Text style={[styles.rowText, { color: theme.text }]}>
                 <Text style={styles.bold}>Protocol Version: </Text>{APP_IDENTIFIER} v{PROTOCOL_VERSION}
