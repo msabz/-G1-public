@@ -56,7 +56,7 @@ export class TransportFallbackEngine {
     this.bluetoothTimeoutMs = options.bluetoothTimeoutMs || 8000;
     // Make connection ownership explicit without changing the default live
     // behavior. The singleton remains the production default; injection gives
-    // tests and the future coordinator-owned orchestrator an exact owner seam.
+    // tests and the coordinator-owned orchestrator an exact owner seam.
     this.coordinator = options.coordinator || connectionCoordinator;
   }
 
@@ -104,19 +104,28 @@ export class TransportFallbackEngine {
       throw new Error(`تعذّر الاتصال عبر الشبكة المحلية (LAN): ${errors[0]?.error?.message || 'لا يوجد عنوان'}`);
     }
 
-    // 2. Wi-Fi Direct (P2P) (Priority 2). P2P remains independently usable;
-    // this timeout only prevents AUTO orchestration from hanging forever.
-    const canTryP2p = (this.mode === TRANSPORT_MODE.AUTO || this.mode === TRANSPORT_MODE.P2P_ONLY) && typeof connectP2p === 'function';
+    // 2. Wi-Fi Direct (P2P) (Priority 2). When the caller does not provide a
+    // compatibility handler, the coordinator is now the default P2P owner.
+    const coordinatorP2p = typeof this.coordinator?.connectP2pPeer === 'function'
+      ? candidate => this.coordinator.connectP2pPeer(candidate, this.p2pTimeoutMs)
+      : null;
+    const p2pConnect = typeof connectP2p === 'function' ? connectP2p : coordinatorP2p;
+    const p2pCancel = typeof connectP2p === 'function'
+      ? cancelP2p
+      : () => this.coordinator?.cancelConnecting?.();
+    const canTryP2p = (
+      this.mode === TRANSPORT_MODE.AUTO || this.mode === TRANSPORT_MODE.P2P_ONLY
+    ) && typeof p2pConnect === 'function';
     const hasP2pEndpoint = peer.transports?.P2P?.deviceAddress || peer.deviceAddress;
 
     if (canTryP2p && hasP2pEndpoint) {
       try {
         if (onFallbackStep) onFallbackStep('P2P');
         const result = await runWithTransportTimeout(
-          () => connectP2p(peer),
+          () => p2pConnect(peer),
           this.p2pTimeoutMs,
           'Wi-Fi Direct',
-          cancelP2p
+          p2pCancel
         );
         return { transport: 'P2P', result };
       } catch (err) {
