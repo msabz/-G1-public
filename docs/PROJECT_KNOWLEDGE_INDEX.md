@@ -114,6 +114,16 @@ A Samsung-only log cannot establish the internal reason a Motorola peer closed a
 ## 8. Current CI baseline
 The public clean-history repository uses GitHub-hosted Actions as the canonical build/test environment. Local Android building on the user's phone is not part of the development workflow. JavaScript tests and Android validation must remain green before device testing is treated as a candidate release.
 
+### Current verified public baseline — 2026-08-18
+- Repository: `msabz/-G1-public`, branch `main`.
+- The public clean-history snapshot was force-published to `main` after confirming the obsolete release password string was absent from the cloned public history.
+- The first public CI run reached JavaScript validation but failed because `__tests__/backgroundRuntime.test.js` imported `react-native` through `CallRuntime`, causing Jest to parse React Native's Flow/ES-module syntax from `node_modules`. This was a test/configuration integration failure, not evidence that the signaling tests were failing; the other reported suites passed.
+- That Jest/background-runtime issue was subsequently corrected and the next observed GitHub Actions run completed green.
+- Therefore the post-fix public `main` state reached a verified green CI checkpoint. Do not use the older Actions-minutes exhaustion note in `RESUME_AFTER_ACTIONS_RESET.md` to claim that the public repository is currently blocked or that its current HEAD is unvalidated.
+- This checkpoint does not imply that every future commit is green. For any later HEAD, inspect its own Actions result before calling it validated.
+
+When a newer reproducible CI result exists, it supersedes this dated checkpoint.
+
 ## 9. Definition of done
 A change is not done merely because it compiles. It is done when:
 - relevant automated tests pass;
