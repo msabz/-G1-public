@@ -54,7 +54,11 @@ function makeSocket(remoteAddress = '192.168.0.36') {
 }
 
 function emitJson(socket, message) {
-  const payload = JSON.stringify(message) + '\n';
+  emitJsonBatch(socket, [message]);
+}
+
+function emitJsonBatch(socket, messages) {
+  const payload = messages.map(message => JSON.stringify(message)).join('\n') + '\n';
   socket.emit('data', {
     length: payload.length,
     toString: () => payload,
@@ -137,6 +141,34 @@ describe('stable-identity simultaneous LAN arbitration', () => {
       message: expect.objectContaining({ deviceId: 'peer-device' }),
       session: expect.objectContaining({ isOutbound: false }),
     }));
+  });
+
+  test('preserves application frames coalesced after identity on the winning inbound socket', async () => {
+    const validator = jest.fn(({ message }) => ({
+      accepted: true,
+      peerId: message.deviceId,
+      transport: 'LAN',
+      preferInbound: true,
+    }));
+    const received = [];
+    signaling.setPassiveInboundAdmissionHandler(validator);
+    signaling.setOnMessage(message => received.push(message));
+
+    const outbound = await establishOutbound();
+    const inbound = makeSocket('192.168.0.36');
+    onConnection(inbound);
+
+    emitJsonBatch(inbound, [
+      { type: 'identity', deviceId: 'peer-device', deviceName: 'Peer' },
+      { type: 'chat', text: 'same-read-frame' },
+    ]);
+
+    expect(outbound.destroy).toHaveBeenCalledTimes(1);
+    expect(signaling.getSignalingHealth().direction).toBe('inbound');
+    expect(received).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'identity', deviceId: 'peer-device' }),
+      expect.objectContaining({ type: 'chat', text: 'same-read-frame' }),
+    ]));
   });
 
   test('retains outbound and rejects validated inbound when stable-id policy prefers outbound', async () => {
