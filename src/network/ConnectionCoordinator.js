@@ -40,6 +40,7 @@ export class ConnectionCoordinator {
     // without importing React Native runtime code into this pure coordinator.
     this.signalingOwner = options.signalingOwner || null;
     this.activeSessionManagedExternally = false;
+    this.signalingDisconnectSubscription = null;
   }
 
   setIdentity({ deviceId, deviceName }) {
@@ -52,6 +53,7 @@ export class ConnectionCoordinator {
     if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.CONNECTED) {
       throw new Error('Cannot replace signaling owner while a connection is active');
     }
+    this._clearSignalingOwnerDisconnectSubscription();
     this.signalingOwner = owner || null;
   }
 
@@ -60,6 +62,57 @@ export class ConnectionCoordinator {
     if (this.onStateChange) {
       this.onStateChange(newState, payload);
     }
+  }
+
+  _clearSignalingOwnerDisconnectSubscription() {
+    const subscription = this.signalingDisconnectSubscription;
+    this.signalingDisconnectSubscription = null;
+    if (!subscription) return;
+    try {
+      if (typeof subscription === 'function') subscription();
+      else subscription.remove?.();
+    } catch (e) {}
+  }
+
+  _subscribeToSignalingOwnerDisconnect(owner, generation) {
+    this._clearSignalingOwnerDisconnectSubscription();
+    if (typeof owner?.subscribeDisconnect !== 'function') return;
+
+    const observer = () => {
+      if (
+        this.generation !== generation ||
+        !this.activeSessionManagedExternally ||
+        this.state !== COORDINATOR_STATE.CONNECTED
+      ) {
+        return;
+      }
+      this._handleSessionTermination();
+    };
+
+    let subscription = null;
+    try {
+      subscription = owner.subscribeDisconnect(observer) || null;
+    } catch (e) {
+      console.warn('Coordinator signaling-owner disconnect subscription failed:', e?.message || e);
+      return;
+    }
+
+    // A defensive owner may invoke the callback synchronously while subscribing.
+    // If that already terminated/replaced this generation, do not retain a stale
+    // subscription after the callback returns.
+    if (
+      this.generation !== generation ||
+      !this.activeSessionManagedExternally ||
+      this.state !== COORDINATOR_STATE.CONNECTED
+    ) {
+      try {
+        if (typeof subscription === 'function') subscription();
+        else subscription?.remove?.();
+      } catch (e) {}
+      return;
+    }
+
+    this.signalingDisconnectSubscription = subscription;
   }
 
   /**
@@ -183,6 +236,7 @@ export class ConnectionCoordinator {
       this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: 'LAN' });
       peerRegistry.setPeerConnected(peer.deviceId, 'LAN');
       if (this.onConnected) this.onConnected(peer, 'LAN');
+      this._subscribeToSignalingOwnerDisconnect(owner, currentGen);
 
       return session;
     } catch (err) {
@@ -306,7 +360,17 @@ export class ConnectionCoordinator {
   }
 
   _handleSessionTermination() {
+    if (
+      this.state === COORDINATOR_STATE.IDLE &&
+      !this.activeSession &&
+      !this.currentPeer &&
+      !this.currentTransport
+    ) {
+      return false;
+    }
+
     this._stopHeartbeat();
+    this._clearSignalingOwnerDisconnectSubscription();
     const peer = this.currentPeer;
     this.activeSession = null;
     this.activeSessionManagedExternally = false;
@@ -320,6 +384,7 @@ export class ConnectionCoordinator {
     if (this.onDisconnected) {
       this.onDisconnected(peer);
     }
+    return true;
   }
 
   sendMessage(msgObj) {
@@ -352,6 +417,9 @@ export class ConnectionCoordinator {
     this.cancelConnecting();
     const session = this.activeSession;
     const managedExternally = this.activeSessionManagedExternally;
+    if (managedExternally) {
+      this._clearSignalingOwnerDisconnectSubscription();
+    }
     this.activeSession = null;
     this.activeSessionManagedExternally = false;
     if (managedExternally) {
