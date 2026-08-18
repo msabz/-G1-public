@@ -18,11 +18,15 @@ jest.mock('react-native', () => ({
 
 import TcpSocket from 'react-native-tcp-socket';
 import {
+  cancelSignalingConnectAttempt,
   closeSignaling,
   connectToSignalingServer,
+  getActivePeerAddress,
   getActiveSession,
+  getDefaultListener,
   getSignalingHealth,
   setOnDisconnect,
+  startPersistentListener,
 } from '../src/webrtc/signaling';
 
 function makeSocket(remoteAddress = '192.168.0.36') {
@@ -47,9 +51,23 @@ async function flushMicrotasks() {
   await Promise.resolve();
 }
 
-describe('signaling close/cancellation characterization', () => {
+describe('signaling connect-attempt cancellation', () => {
+  let onServerConnection;
+
+  beforeEach(() => {
+    TcpSocket.createServer.mockImplementation(callback => {
+      onServerConnection = callback;
+      return {
+        listen: jest.fn((_, callback) => callback()),
+        on: jest.fn(),
+        close: jest.fn(),
+      };
+    });
+  });
+
   afterEach(() => {
     closeSignaling();
+    getDefaultListener().stop();
     setOnDisconnect(null);
     jest.clearAllMocks();
   });
@@ -75,7 +93,7 @@ describe('signaling close/cancellation characterization', () => {
     expect(getActiveSession()).toBeNull();
   });
 
-  test('closeSignaling also destroys a healthy active session, so it is not a connect-only cancellation primitive', async () => {
+  test('closeSignaling also destroys a healthy active session, so it remains a full-close operation', async () => {
     const socket = makeSocket();
     TcpSocket.createConnection.mockImplementation((_options, callback) => {
       Promise.resolve().then(callback);
@@ -91,5 +109,67 @@ describe('signaling close/cancellation characterization', () => {
     expect(socket.destroy).toHaveBeenCalledTimes(1);
     expect(getActiveSession()).toBeNull();
     expect(getSignalingHealth().connected).toBe(false);
+  });
+
+  test('connect-only cancellation settles a pending attempt and suppresses a late socket', async () => {
+    const socket = makeSocket();
+    let onConnect;
+    TcpSocket.createConnection.mockImplementation((_options, callback) => {
+      onConnect = callback;
+      return socket;
+    });
+
+    const attempt = connectToSignalingServer('192.168.0.36', 8089, 1, 1);
+    await flushMicrotasks();
+
+    expect(cancelSignalingConnectAttempt()).toBe(true);
+    await expect(attempt).rejects.toThrow('أُلغيت محاولة الاتصال بقناة الإشارات');
+    expect(cancelSignalingConnectAttempt()).toBe(false);
+
+    onConnect();
+    await flushMicrotasks();
+
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
+    expect(getActiveSession()).toBeNull();
+  });
+
+  test('cancelling an obsolete outbound attempt preserves an inbound session that wins the race', async () => {
+    const disconnected = jest.fn();
+    setOnDisconnect(disconnected);
+    await startPersistentListener(8089);
+
+    const outboundSocket = makeSocket('192.168.0.36');
+    let onOutboundConnect;
+    TcpSocket.createConnection.mockImplementation((_options, callback) => {
+      onOutboundConnect = callback;
+      return outboundSocket;
+    });
+
+    const attempt = connectToSignalingServer('192.168.0.36', 8089, 1, 1);
+    await flushMicrotasks();
+
+    const inboundSocket = makeSocket('192.168.0.55');
+    onServerConnection(inboundSocket);
+    await flushMicrotasks();
+
+    expect(getSignalingHealth().connected).toBe(true);
+    expect(getActivePeerAddress()).toBe('192.168.0.55');
+    expect(inboundSocket.destroy).not.toHaveBeenCalled();
+
+    expect(cancelSignalingConnectAttempt()).toBe(true);
+    await expect(attempt).rejects.toThrow('أُلغيت محاولة الاتصال بقناة الإشارات');
+
+    expect(getActiveSession()?.socket).toBe(inboundSocket);
+    expect(getSignalingHealth().connected).toBe(true);
+    expect(inboundSocket.destroy).not.toHaveBeenCalled();
+    expect(disconnected).not.toHaveBeenCalled();
+
+    onOutboundConnect();
+    await flushMicrotasks();
+
+    expect(outboundSocket.destroy).toHaveBeenCalledTimes(1);
+    expect(getActiveSession()?.socket).toBe(inboundSocket);
+    expect(getSignalingHealth().connected).toBe(true);
+    expect(disconnected).not.toHaveBeenCalled();
   });
 });
