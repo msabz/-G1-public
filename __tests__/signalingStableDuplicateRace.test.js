@@ -211,6 +211,93 @@ describe('stable-identity simultaneous LAN arbitration', () => {
     ]));
   });
 
+  test('does not let a different LAN peer replace the active outbound session', async () => {
+    const validator = jest.fn(({ message }) => ({
+      accepted: true,
+      peerId: message.deviceId,
+      transport: 'LAN',
+      preferInbound: true,
+    }));
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    const outbound = await establishOutbound();
+    const intruder = makeSocket('192.168.0.55');
+    onConnection(intruder);
+    emitJson(intruder, { type: 'identity', deviceId: 'other-peer', deviceName: 'Other' });
+
+    expect(intruder.destroy).toHaveBeenCalledTimes(1);
+    expect(outbound.destroy).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth().connected).toBe(true);
+    expect(signaling.getSignalingHealth().direction).toBe('outbound');
+    expect(signaling.getSignalingHealth().peerAddress).toBe('192.168.0.36');
+  });
+
+  test('allows only one provisional duplicate inbound inspection at a time', async () => {
+    const validator = jest.fn(({ message }) => ({
+      accepted: true,
+      peerId: message.deviceId,
+      transport: 'LAN',
+      preferInbound: true,
+    }));
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    const outbound = await establishOutbound();
+    const firstInbound = makeSocket('192.168.0.36');
+    const secondInbound = makeSocket('192.168.0.36');
+    onConnection(firstInbound);
+    onConnection(secondInbound);
+
+    expect(secondInbound.destroy).toHaveBeenCalledTimes(1);
+    expect(firstInbound.destroy).not.toHaveBeenCalled();
+
+    emitJson(firstInbound, { type: 'identity', deviceId: 'peer-device', deviceName: 'Peer' });
+
+    expect(outbound.destroy).toHaveBeenCalledTimes(1);
+    expect(signaling.getSignalingHealth().direction).toBe('inbound');
+  });
+
+  test('rolls back to the healthy outbound session when final inbound admission fails', async () => {
+    const validator = jest.fn(({ message, validateOnly }) => validateOnly
+      ? {
+          accepted: true,
+          peerId: message.deviceId,
+          transport: 'LAN',
+          preferInbound: true,
+        }
+      : {
+          accepted: false,
+          reason: 'coordinator-rejected',
+        });
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    const outbound = await establishOutbound();
+    const inbound = makeSocket('192.168.0.36');
+    onConnection(inbound);
+    emitJson(inbound, { type: 'identity', deviceId: 'peer-device', deviceName: 'Peer' });
+
+    expect(inbound.destroy).toHaveBeenCalled();
+    expect(outbound.destroy).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth().connected).toBe(true);
+    expect(signaling.getSignalingHealth().direction).toBe('outbound');
+    expect(signaling.getSignalingHealth().peerAddress).toBe('192.168.0.36');
+    expect(signaling.getSignalingHealth().heartbeatRunning).toBe(true);
+  });
+
+  test('rejects an oversized UTF-8 frame during provisional inspection', async () => {
+    const validator = jest.fn();
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    const outbound = await establishOutbound();
+    const inbound = makeSocket('192.168.0.36');
+    onConnection(inbound);
+    emitRaw(inbound, `${'ع'.repeat(40 * 1024)}\n`);
+
+    expect(inbound.destroy).toHaveBeenCalledTimes(1);
+    expect(outbound.destroy).not.toHaveBeenCalled();
+    expect(validator).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth().direction).toBe('outbound');
+  });
+
   test('retains outbound and rejects validated inbound when stable-id policy prefers outbound', async () => {
     const validator = jest.fn(({ message }) => ({
       accepted: true,
