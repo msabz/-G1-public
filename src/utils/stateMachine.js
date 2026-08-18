@@ -15,6 +15,7 @@ export const States = {
 
 export const Tiers = {
   NONE: 'NONE',
+  LAN: 'LAN',
   WIFI_DIRECT: 'WIFI_DIRECT',
   BLUETOOTH: 'BLUETOOTH',
 };
