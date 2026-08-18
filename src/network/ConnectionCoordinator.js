@@ -169,7 +169,7 @@ export class ConnectionCoordinator {
     return true;
   }
 
-  async connectLanPeer(peer, timeoutMs = 8000) {
+  async connectLanPeer(peer, timeoutMs = 8000, connectOptions = {}) {
     const lanInfo = peer.transports?.LAN || peer;
     if (!lanInfo.host) {
       throw new Error('LAN host is missing for peer');
@@ -178,6 +178,10 @@ export class ConnectionCoordinator {
       throw new Error('Configured signaling owner is missing connectOutbound()');
     }
 
+    const connectionPolicy = {
+      maxRetries: connectOptions?.maxRetries ?? 3,
+      retryDelayMs: connectOptions?.retryDelayMs ?? 600,
+    };
     const currentGen = ++this.generation;
     this.cancelConnecting();
 
@@ -187,13 +191,13 @@ export class ConnectionCoordinator {
     this.currentTransport = 'LAN';
 
     if (this.signalingOwner) {
-      return this._connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs);
+      return this._connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs, connectionPolicy);
     }
 
-    return this._connectLanLegacy(peer, lanInfo, currentGen);
+    return this._connectLanLegacy(peer, lanInfo, currentGen, connectionPolicy);
   }
 
-  async _connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs) {
+  async _connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs, connectionPolicy) {
     const owner = this.signalingOwner;
     let settled = false;
     let cancelled = false;
@@ -209,8 +213,8 @@ export class ConnectionCoordinator {
       await owner.connectOutbound({
         host: lanInfo.host,
         port: lanInfo.port || 8089,
-        maxRetries: 3,
-        retryDelayMs: 600,
+        maxRetries: connectionPolicy.maxRetries,
+        retryDelayMs: connectionPolicy.retryDelayMs,
         timeoutMs,
       });
 
@@ -253,7 +257,7 @@ export class ConnectionCoordinator {
     }
   }
 
-  async _connectLanLegacy(peer, lanInfo, currentGen) {
+  async _connectLanLegacy(peer, lanInfo, currentGen, connectionPolicy) {
     let settled = false;
 
     const abort = () => {
@@ -266,8 +270,8 @@ export class ConnectionCoordinator {
       const socket = await connectOutboundSocket({
         host: lanInfo.host,
         port: lanInfo.port || 8089,
-        maxRetries: 3,
-        retryDelayMs: 600,
+        maxRetries: connectionPolicy.maxRetries,
+        retryDelayMs: connectionPolicy.retryDelayMs,
       });
 
       if (settled || this.generation !== currentGen) {
