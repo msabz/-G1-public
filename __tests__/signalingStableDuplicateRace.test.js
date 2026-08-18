@@ -107,11 +107,11 @@ describe('stable-identity simultaneous LAN arbitration', () => {
   }
 
   test('yields outbound and promotes validated inbound when stable-id policy prefers inbound', async () => {
-    const validator = jest.fn(({ message, validateOnly }) => ({
+    const validator = jest.fn(({ message }) => ({
       accepted: true,
       peerId: message.deviceId,
       transport: 'LAN',
-      preferInbound: validateOnly ? true : true,
+      preferInbound: true,
     }));
     signaling.setPassiveInboundAdmissionHandler(validator);
 
@@ -130,8 +130,13 @@ describe('stable-identity simultaneous LAN arbitration', () => {
     expect(signaling.getSignalingHealth().connected).toBe(true);
     expect(signaling.getSignalingHealth().direction).toBe('inbound');
     expect(signaling.getSignalingHealth().passiveAdmissionAccepted).toBe(true);
-    expect(validator).toHaveBeenCalledWith(expect.objectContaining({ validateOnly: true }));
-    expect(validator).toHaveBeenCalledWith(expect.objectContaining({ validateOnly: undefined }));
+    expect(validator).toHaveBeenCalledTimes(2);
+    expect(validator.mock.calls[0][0]).toEqual(expect.objectContaining({ validateOnly: true }));
+    expect(validator.mock.calls[1][0]).not.toHaveProperty('validateOnly');
+    expect(validator.mock.calls[1][0]).toEqual(expect.objectContaining({
+      message: expect.objectContaining({ deviceId: 'peer-device' }),
+      session: expect.objectContaining({ isOutbound: false }),
+    }));
   });
 
   test('retains outbound and rejects validated inbound when stable-id policy prefers outbound', async () => {
