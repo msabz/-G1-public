@@ -22,6 +22,7 @@ let lastInboundActivityAt = 0;
 let recoveryTimer = null;
 let recoveryGeneration = 0;
 let recoveryInProgress = false;
+let recoveryExpectedInboundPeerAddress = null;
 const messageObservers = new Set();
 const disconnectObservers = new Set();
 
@@ -95,6 +96,7 @@ function stopHeartbeat() {
 function cancelPendingRecovery() {
   recoveryGeneration += 1;
   recoveryInProgress = false;
+  recoveryExpectedInboundPeerAddress = null;
   if (recoveryTimer) {
     clearTimeout(recoveryTimer);
     recoveryTimer = null;
@@ -182,6 +184,9 @@ function beginTransientRecovery(session, reason) {
   activeSession = null;
   const token = ++recoveryGeneration;
   recoveryInProgress = true;
+  recoveryExpectedInboundPeerAddress = wasOutbound
+    ? null
+    : normalizePeerAddress(previousSocket?.remoteAddress || peerInfo?.host || peerInfo?.ip || null);
   callService('updateConnectionStatus', 'انقطع المسار مؤقتاً — جاري الاستعادة');
 
   logSocket(
@@ -220,6 +225,7 @@ function beginTransientRecovery(session, reason) {
     if (token !== recoveryGeneration) return;
     recoveryTimer = null;
     recoveryInProgress = false;
+    recoveryExpectedInboundPeerAddress = null;
     if (activeSession && activeSession.isConnected) return;
     console.warn(`[G1/SIGNAL][none] RECOVERY_EXHAUSTED reason=${reason}`);
     setAvailabilityStatus();
@@ -344,6 +350,19 @@ function attachIncomingSession(socket, promote, source) {
     logSocket('DUPLICATE_INBOUND_REJECTED', socket, `active=${socketId(activeSession.socket)}`);
     try { socket.destroy(); } catch (e) {}
     return false;
+  }
+
+  if (recoveryInProgress && recoveryExpectedInboundPeerAddress) {
+    const incomingAddress = normalizePeerAddress(socket?.remoteAddress);
+    if (!isSameSignalingEndpoint(incomingAddress, recoveryExpectedInboundPeerAddress)) {
+      logSocket(
+        'RECOVERY_INBOUND_REJECTED',
+        socket,
+        `expected=${recoveryExpectedInboundPeerAddress || 'unknown'} actual=${incomingAddress || 'unknown'}`
+      );
+      try { socket.destroy(); } catch (e) {}
+      return false;
+    }
   }
 
   if (promote) promote();
