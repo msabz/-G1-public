@@ -163,7 +163,7 @@ describe('ConnectionCoordinator signaling-owner boundary', () => {
     expect(coordinator.currentTransport).toBeNull();
   });
 
-  test('refuses signaling-owner replacement while connecting or connected', async () => {
+  test('allows same signaling-owner rebinding but refuses replacement while connecting or connected', async () => {
     let resolveConnect;
     const owner = makeOwner({
       connectOutbound: jest.fn(() => new Promise(resolve => {
@@ -178,12 +178,14 @@ describe('ConnectionCoordinator signaling-owner boundary', () => {
 
     const attempt = coordinator.connectLanPeer(peer, 5000);
     await flushMicrotasks();
+    expect(() => coordinator.setSignalingOwner(owner)).not.toThrow();
     expect(() => coordinator.setSignalingOwner(makeOwner())).toThrow(
       'Cannot replace signaling owner while a connection is active'
     );
 
     resolveConnect();
     await attempt;
+    expect(() => coordinator.setSignalingOwner(owner)).not.toThrow();
     expect(() => coordinator.setSignalingOwner(makeOwner())).toThrow(
       'Cannot replace signaling owner while a connection is active'
     );
