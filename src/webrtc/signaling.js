@@ -1,5 +1,10 @@
 import { NativeModules } from 'react-native';
-import { SignalingSession, connectOutboundSocket, MAX_SIGNALING_BUFFER_BYTES } from '../network/SignalingSession';
+import {
+  SignalingSession,
+  connectOutboundSocket,
+  MAX_SIGNALING_BUFFER_BYTES,
+  utf8ByteLength,
+} from '../network/SignalingSession';
 import { getDefaultSignalingListener, DEFAULT_SIGNALING_PORT } from '../network/SignalingListener';
 
 export { MAX_SIGNALING_BUFFER_BYTES, DEFAULT_SIGNALING_PORT };
@@ -26,6 +31,7 @@ let recoveryInProgress = false;
 let recoveryExpectedInboundPeerAddress = null;
 let recoveryInboundAdmissionSnapshot = null;
 let gracefulDisconnectPending = false;
+let duplicateInboundInspectionSocket = null;
 let passiveInboundAdmissionHandler = null;
 const messageObservers = new Set();
 const disconnectObservers = new Set();
@@ -500,6 +506,18 @@ function notifyClientConnected() {
 
 function inspectDuplicatePassiveInbound(socket, promote, source) {
   const activeSocket = activeSession?.socket || null;
+
+  if (duplicateInboundInspectionSocket && duplicateInboundInspectionSocket !== socket) {
+    logSocket(
+      'DUPLICATE_INBOUND_REJECTED',
+      socket,
+      `active=${socketId(activeSocket)} reason=inspection-already-pending`
+    );
+    try { socket.destroy(); } catch (e) {}
+    return false;
+  }
+
+  duplicateInboundInspectionSocket = socket;
   logSocket('DUPLICATE_INBOUND_PENDING', socket, `active=${socketId(activeSocket)}`);
 
   let settled = false;
@@ -508,6 +526,9 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
   let timer = null;
 
   const cleanup = () => {
+    if (duplicateInboundInspectionSocket === socket) {
+      duplicateInboundInspectionSocket = null;
+    }
     if (timer) clearTimeout(timer);
     timer = null;
     try { socket.removeListener?.('data', onData); } catch (e) {}
@@ -526,16 +547,26 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
 
   const promoteInboundWinner = decision => {
     if (settled) return false;
-    settled = true;
-    cleanup();
 
     const previous = activeSession;
-    if (previous && previous.isConnected && previous.isOutbound) {
-      clearPassiveInboundIdentityTimer(previous);
-      stopHeartbeat();
-      activeSession = null;
-      try { previous.destroy(); } catch (e) {}
+    const previousAddress = normalizePeerAddress(
+      previous?.socket?.remoteAddress || previous?.peerInfo?.host || previous?.peerInfo?.ip || null
+    );
+    const incomingAddress = normalizePeerAddress(socket?.remoteAddress);
+
+    // The provisional identity decision is valid only against the exact healthy
+    // outbound session that existed when inspection started. Never let a known
+    // but different LAN peer replace another peer merely because its stable-id
+    // ordering says it would win a simultaneous race.
+    if (!previous || !previous.isConnected || previous.socket !== activeSocket) {
+      return reject('active-session-changed');
     }
+    if (!isSameSignalingEndpoint(previousAddress, incomingAddress)) {
+      return reject('different-active-peer');
+    }
+
+    settled = true;
+    cleanup();
 
     logSocket(
       'DUPLICATE_INBOUND_SELECTED',
@@ -547,6 +578,7 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
       skipDuplicateCheck: true,
       preMessages: bufferedMessages,
       preBuffer: buffer,
+      racePreviousSession: previous,
     });
   };
 
@@ -585,15 +617,20 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
   const onData = data => {
     if (settled) return;
     buffer += data.toString();
-    if (buffer.length > MAX_SIGNALING_BUFFER_BYTES) {
+
+    const parts = buffer.split('\n');
+    buffer = parts.pop();
+    if (utf8ByteLength(buffer) > MAX_SIGNALING_BUFFER_BYTES) {
       reject('candidate-buffer-too-large');
       return;
     }
 
-    const parts = buffer.split('\n');
-    buffer = parts.pop();
     const parsedMessages = [];
     for (const part of parts) {
+      if (utf8ByteLength(part) > MAX_SIGNALING_BUFFER_BYTES) {
+        reject('candidate-buffer-too-large');
+        return;
+      }
       if (!part.trim()) continue;
       try {
         parsedMessages.push(JSON.parse(part));
@@ -678,6 +715,7 @@ function attachIncomingSession(socket, promote, source, options = {}) {
 
   const wasRecovering = recoveryInProgress;
   const inheritedAdmission = wasRecovering ? recoveryInboundAdmissionSnapshot : null;
+  const racePreviousSession = options.racePreviousSession || null;
   const passiveAdmissionRequired =
     source === 'persistent' &&
     !isExplicitServerMode &&
@@ -703,7 +741,21 @@ function attachIncomingSession(socket, promote, source, options = {}) {
   if (typeof options.preBuffer === 'string' && options.preBuffer) {
     session.stateHolder.buf = options.preBuffer;
   }
-  activateSession(session, socket, 'inbound', wasRecovering ? 'peer-redial' : 'connect');
+
+  if (racePreviousSession) {
+    // Make-before-break for the duplicate race: temporarily expose the admitted
+    // candidate to the owner so coordinator adoption can bind to it, but keep
+    // the old outbound socket alive until the normal identity admission commits.
+    cancelPendingRecovery();
+    gracefulDisconnectPending = false;
+    activeSession = session;
+    lastInboundActivityAt = Date.now();
+    stopHeartbeat();
+    logSocket('SESSION_ACTIVE', socket, 'direction=inbound reason=duplicate-race-candidate');
+    setActiveServiceStatus('جاري التحقق من جهاز قريب');
+  } else {
+    activateSession(session, socket, 'inbound', wasRecovering ? 'peer-redial' : 'connect');
+  }
 
   if (session.passiveAdmissionRequired && !session.passiveAdmissionAccepted) {
     startPassiveInboundIdentityTimer(session);
@@ -713,6 +765,44 @@ function attachIncomingSession(socket, promote, source, options = {}) {
     for (const message of options.preMessages) {
       if (activeSession !== session || !session.isConnected) break;
       session.onMessage?.(message, session);
+    }
+  }
+
+  if (racePreviousSession) {
+    const committed =
+      activeSession === session &&
+      session.isConnected &&
+      (!session.passiveAdmissionRequired || session.passiveAdmissionAccepted);
+
+    if (committed) {
+      logSocket(
+        'DUPLICATE_INBOUND_COMMITTED',
+        socket,
+        `previous=${socketId(racePreviousSession.socket)}`
+      );
+      try { racePreviousSession.destroy(); } catch (e) {}
+      startHeartbeat(session);
+      announceLocalRoute(session).catch(() => {});
+      setActiveServiceStatus('متصل عبر الشبكة المحلية');
+    } else {
+      clearPassiveInboundIdentityTimer(session);
+      if (activeSession === session) activeSession = null;
+      try { session.destroy(); } catch (e) {}
+
+      if (racePreviousSession.isConnected && racePreviousSession.socket) {
+        activeSession = racePreviousSession;
+        lastInboundActivityAt = Date.now();
+        startHeartbeat(racePreviousSession);
+        setActiveServiceStatus('متصل — G1 يعمل في الخلفية');
+        logSocket('DUPLICATE_INBOUND_ROLLED_BACK', racePreviousSession.socket, 'reason=admission-failed');
+      } else {
+        activeSession = null;
+        stopHeartbeat();
+        setAvailabilityStatus();
+        notifyDisconnectObservers({ reason: 'duplicate-promotion-failed', recovered: false });
+        if (onDisconnectCallback) onDisconnectCallback();
+      }
+      return false;
     }
   }
 
@@ -851,6 +941,13 @@ export function closeSignaling() {
   stopHeartbeat();
   cancelPendingRecovery();
   gracefulDisconnectPending = false;
+
+  const pendingDuplicateSocket = duplicateInboundInspectionSocket;
+  duplicateInboundInspectionSocket = null;
+  if (pendingDuplicateSocket) {
+    try { pendingDuplicateSocket.destroy(); } catch (e) {}
+  }
+
   const session = activeSession;
   activeSession = null;
 
