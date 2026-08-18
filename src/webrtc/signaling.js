@@ -454,6 +454,18 @@ export function connectToSignalingServer(host, port, maxRetries = 10, retryDelay
   });
 }
 
+export function cancelSignalingConnectAttempt(reason) {
+  const abort = abortCurrentOperation;
+  if (!abort) return false;
+
+  abortCurrentOperation = null;
+  const error = reason instanceof Error
+    ? reason
+    : new Error(typeof reason === 'string' && reason ? reason : 'أُلغيت محاولة الاتصال بقناة الإشارات');
+  abort(error);
+  return true;
+}
+
 export function sendSignalingMessage(msgObj) {
   if (!activeSession) return false;
   const socket = activeSession.socket;
@@ -475,9 +487,7 @@ export function closeSignaling() {
     session.destroy();
   }
 
-  const abort = abortCurrentOperation;
-  abortCurrentOperation = null;
-  if (abort) abort(new Error('أُغلقت قناة الإشارات'));
+  cancelSignalingConnectAttempt(new Error('أُغلقت قناة الإشارات'));
 
   if (clientWaitTimer) clearTimeout(clientWaitTimer);
   clientWaitTimer = null;
