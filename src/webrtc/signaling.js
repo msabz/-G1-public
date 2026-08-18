@@ -448,7 +448,6 @@ export function connectToSignalingServer(host, port, maxRetries = 10, retryDelay
       })
       .catch(err => {
         if (settled) return;
-        settled = true;
         if (abortCurrentOperation === abort) abortCurrentOperation = null;
         abort(err);
       });
