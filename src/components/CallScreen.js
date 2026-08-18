@@ -25,10 +25,16 @@ export default function CallScreen({
   const [localStreamURL, setLocalStreamURL] = useState(null);
   const [remoteStreamURL, setRemoteStreamURL] = useState(null);
 
+  // Duration belongs to the established RTC media session, not to the moment
+  // each phone happened to mount CallScreen. Physical tests showed a healthy
+  // ICE/PC connection while both screens still displayed "جاري الاتصال" and
+  // their timers differed substantially because they started at UI mount time.
   useEffect(() => {
+    if (audioEngine !== 'webrtc') return undefined;
+    setSeconds(0);
     const t = setInterval(() => setSeconds(s => s + 1), 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [audioEngine]);
 
   useEffect(() => {
     if (!controlsVisible) return;
@@ -55,6 +61,11 @@ export default function CallScreen({
 
   const hasRemoteVideo = !!videoEnabled && !!remoteStreamURL;
   const hasLocalVideo = !!videoEnabled && !!localStreamURL && cameraOn;
+  const waitingStatus = audioEngine === 'webrtc'
+    ? (videoEnabled ? 'متصل — جاري انتظار الفيديو…' : 'متصل عبر WebRTC')
+    : audioEngine === 'failed'
+      ? 'تعذّر إنشاء مسار WebRTC'
+      : (videoEnabled ? 'جاري تشغيل فيديو WebRTC…' : 'جاري الاتصال…');
 
   return (
     <TouchableOpacity
@@ -77,9 +88,7 @@ export default function CallScreen({
             <Text style={styles.bigAvatarText}>{(peerName || 'M')[0].toUpperCase()}</Text>
           </View>
           <Text style={styles.waitingName}>{peerName || 'Musabchat'}</Text>
-          <Text style={styles.waitingStatus}>
-            {videoEnabled ? 'جاري تشغيل فيديو WebRTC…' : 'جاري الاتصال…'}
-          </Text>
+          <Text style={styles.waitingStatus}>{waitingStatus}</Text>
         </View>
       )}
 
