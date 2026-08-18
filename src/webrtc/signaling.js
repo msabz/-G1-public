@@ -549,15 +549,7 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
     });
   };
 
-  const handleMessage = msg => {
-    bufferedMessages.push(msg);
-
-    if (msg?.type === 'my-ip') return null;
-    if (msg?.type !== 'identity' || !msg.deviceId) {
-      reject('identity-required');
-      return false;
-    }
-
+  const validateIdentity = msg => {
     const peerAddress = normalizePeerAddress(socket?.remoteAddress);
     let decision = null;
     try {
@@ -599,18 +591,36 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
 
     const parts = buffer.split('\n');
     buffer = parts.pop();
+    const parsedMessages = [];
     for (const part of parts) {
-      if (settled) return;
       if (!part.trim()) continue;
-      let msg = null;
       try {
-        msg = JSON.parse(part);
+        parsedMessages.push(JSON.parse(part));
       } catch (error) {
         reject('candidate-parse-error');
         return;
       }
-      const result = handleMessage(msg);
-      if (result !== null) return;
+    }
+
+    for (let index = 0; index < parsedMessages.length; index++) {
+      if (settled) return;
+      const msg = parsedMessages[index];
+      if (msg?.type === 'my-ip') {
+        bufferedMessages.push(msg);
+        continue;
+      }
+      if (msg?.type !== 'identity' || !msg.deviceId) {
+        reject('identity-required');
+        return;
+      }
+
+      // Preserve every complete frame already coalesced in this TCP read. The
+      // real SignalingSession is attached only after the stable-id decision, so
+      // bytes already consumed by this provisional parser cannot be re-read from
+      // the socket. Replay identity and any trailing application frames in order.
+      bufferedMessages.push(msg, ...parsedMessages.slice(index + 1));
+      validateIdentity(msg);
+      return;
     }
   };
 
