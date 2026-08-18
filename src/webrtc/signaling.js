@@ -430,6 +430,11 @@ export function getSignalingHealth() {
   return {
     connected: !!(activeSession && activeSession.isConnected),
     peerAddress: getActivePeerAddress(),
+    direction: activeSession
+      ? (activeSession.isOutbound ? 'outbound' : 'inbound')
+      : null,
+    passiveAdmissionAccepted: activeSession?.passiveAdmissionAccepted === true,
+    passiveAdmissionRequired: activeSession?.passiveAdmissionRequired === true,
     lastInboundActivityAt,
     heartbeatRunning: !!heartbeatTimer,
     recoveryInProgress,

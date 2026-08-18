@@ -1,6 +1,13 @@
 import { isSameSignalingEndpoint } from '../webrtc/signaling';
 import { connectionCoordinator } from './ConnectionCoordinator';
 import { peerRegistry, TRANSPORTS } from './PeerRegistry';
+import { shouldAllowPassiveLanAdmission } from './passiveLanAppPolicy';
+
+let passiveLanAdmissionContextProvider = null;
+
+export function setLanPassiveAdmissionContextProvider(provider) {
+  passiveLanAdmissionContextProvider = typeof provider === 'function' ? provider : null;
+}
 
 export function createLanPassiveAdmissionHandler(options = {}) {
   const registry = options.registry || peerRegistry;
@@ -9,6 +16,26 @@ export function createLanPassiveAdmissionHandler(options = {}) {
   return ({ message, peerAddress } = {}) => {
     if (message?.type !== 'identity' || !message.deviceId) {
       return { accepted: false, reason: 'identity-required' };
+    }
+
+    if (passiveLanAdmissionContextProvider) {
+      let context = null;
+      try {
+        context = passiveLanAdmissionContextProvider() || {};
+      } catch (error) {
+        return {
+          accepted: false,
+          reason: 'context-error',
+          error: error?.message || String(error),
+        };
+      }
+
+      if (!shouldAllowPassiveLanAdmission({
+        ...context,
+        messageDeviceId: message.deviceId,
+      })) {
+        return { accepted: false, reason: 'app-busy' };
+      }
     }
 
     const peer = registry.getPeer?.(message.deviceId) || null;
