@@ -43,6 +43,17 @@ describe('p2pAppBridge', () => {
     )).toBeNull();
   });
 
+  test('rejects a confirmed discovery peerId when it still equals the route address', () => {
+    expect(resolveStableP2pDeviceId(
+      { peerId: 'saved-id' },
+      {
+        isMusab: true,
+        peerId: 'AA:BB:CC:DD:EE:FF',
+        deviceAddress: 'aa:bb:cc:dd:ee:ff',
+      }
+    )).toBeNull();
+  });
+
   test('prefers DNS-SD stable peerId for a confirmed G1 discovery', () => {
     expect(resolveStableP2pDeviceId(
       { peerId: 'saved-id' },
