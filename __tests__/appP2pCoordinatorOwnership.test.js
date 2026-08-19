@@ -32,6 +32,18 @@ describe('App outbound P2P coordinator ownership wiring', () => {
     expect(source).toContain('coordinatorStatus.transport === TRANSPORTS.P2P');
   });
 
+  test('concurrent App connection entry points yield while outbound coordinator P2P is active', () => {
+    expect(source).toMatch(
+      /const maybeAnswerIncomingInvitation = peers => \{[\s\S]*?if \(coordinatorP2pAttemptRef\.current\) \{\s*return;\s*\}/
+    );
+    expect(source).toMatch(
+      /const handleConnectLan = async \(ip, port = 8089\) => \{[\s\S]*?if \(coordinatorP2pAttemptRef\.current\)/
+    );
+    expect(source).toMatch(
+      /const btConnect = async \(address\) => \{[\s\S]*?if \(coordinatorP2pAttemptRef\.current\)/
+    );
+  });
+
   test('coordinator-owned P2P teardown avoids App native cleanup ownership', () => {
     expect(source).toContain(
       'if (plan.cleanupWifiDirect && !plan.disconnectViaCoordinator) {'
