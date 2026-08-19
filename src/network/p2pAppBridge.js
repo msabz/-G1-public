@@ -10,14 +10,10 @@ function normalizeText(value) {
 }
 
 export function resolveStableP2pDeviceId(contact = {}, discoveredPeer = {}) {
-  // DNS-SD/Musab discovery is allowed to provide a stable G1 peerId. A raw
-  // Wi-Fi Direct deviceAddress is route metadata only and must never be promoted
-  // into logical identity.
-  if (discoveredPeer.isMusab === true && discoveredPeer.peerId) {
-    return discoveredPeer.peerId;
-  }
-
+  // DNS-SD/Musab discovery may provide the strongest G1 identity candidate,
+  // but even that value must stay separate from Wi-Fi Direct route metadata.
   const candidate = firstText(
+    discoveredPeer.isMusab === true ? discoveredPeer.peerId : '',
     contact.deviceId,
     contact.peerId,
     discoveredPeer.deviceId
