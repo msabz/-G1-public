@@ -10,11 +10,18 @@ jest.mock('react-native', () => ({
 
 import {
   captureP2pDiscoverySnapshot,
+  getAndroidApiLevel,
   normalizeP2pPeers,
   startP2pDiscoveryDiagnostics,
 } from '../src/network/p2pDiscoveryDiagnostics';
 
 describe('p2pDiscoveryDiagnostics', () => {
+  test('tolerates partial/non-Android React Native runtime metadata', () => {
+    expect(getAndroidApiLevel(undefined)).toBeNull();
+    expect(getAndroidApiLevel({ OS: 'ios', Version: '18' })).toBeNull();
+    expect(getAndroidApiLevel({ OS: 'android', Version: 34 })).toBe(34);
+  });
+
   test('normalizes native peer snapshots without inventing stable identity', () => {
     expect(normalizeP2pPeers([
       { deviceName: 'moto g35 5G', deviceAddress: 'AA:BB:CC:DD:EE:FF', status: 3 },
