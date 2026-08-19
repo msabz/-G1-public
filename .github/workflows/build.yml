@@ -28,6 +28,34 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Prepare Stable CI Debug Signing
+        env:
+          G1_CI_KEYSTORE_B64: ${{ secrets.G1_CI_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$G1_CI_KEYSTORE_B64" ]; then
+            echo "::error::Missing repository secret G1_CI_KEYSTORE_B64. Refusing to publish another APK with an ephemeral debug signature."
+            exit 1
+          fi
+
+          KEYSTORE="$RUNNER_TEMP/g1-ci-debug-signing.jks"
+          printf '%s' "$G1_CI_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+          chmod 600 "$KEYSTORE"
+
+          EXPECTED_KEYSTORE_SHA256="cd9f2781f950233af1ba9b535ebfebffd579dad12a17bcc0313bd2c8a010b260"
+          ACTUAL_KEYSTORE_SHA256="$(sha256sum "$KEYSTORE" | awk '{print $1}')"
+          if [ "$ACTUAL_KEYSTORE_SHA256" != "$EXPECTED_KEYSTORE_SHA256" ]; then
+            echo "::error::G1_CI_KEYSTORE_B64 does not contain the expected G1 CI debug signing key."
+            exit 1
+          fi
+
+          keytool -list \
+            -keystore "$KEYSTORE" \
+            -storepass 'g1-ci-debug-only' \
+            -alias 'g1-ci' >/dev/null
+
+          echo "G1_CI_SIGNING_STORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
+          echo "G1_VERSION_CODE=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+
       - name: Install Node Dependencies
         run: npm ci
 
@@ -55,6 +83,55 @@ jobs:
         run: |
           cd android
           ./gradlew assembleDebug --stacktrace
+
+      - name: Apply Stable CI Debug Signature
+        run: |
+          APK="$(find android/app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [ -z "$APK" ] || [ -z "$APKSIGNER" ]; then
+            echo "::error::Unable to locate debug APK or apksigner."
+            exit 1
+          fi
+
+          SIGNED_APK="${APK%.apk}-stable.apk"
+          "$APKSIGNER" sign \
+            --ks "$G1_CI_SIGNING_STORE_FILE" \
+            --ks-key-alias 'g1-ci' \
+            --ks-pass 'pass:g1-ci-debug-only' \
+            --key-pass 'pass:g1-ci-debug-only' \
+            --out "$SIGNED_APK" \
+            "$APK"
+          mv "$SIGNED_APK" "$APK"
+
+      - name: Verify Debug APK Signature
+        run: |
+          APK="$(find android/app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [ -z "$APK" ] || [ -z "$APKSIGNER" ]; then
+            echo "::error::Unable to locate debug APK or apksigner."
+            exit 1
+          fi
+
+          EXPECTED_CERT_SHA256="8a64512b0fc4198f19a67f299c02594bc234877c1cb5a2df0f247bec5c1417aa"
+          CERT_OUTPUT="$("$APKSIGNER" verify --verbose --print-certs "$APK" 2>&1)"
+          printf '%s\n' "$CERT_OUTPUT"
+
+          ACTUAL_CERT_SHA256="$(
+            printf '%s\n' "$CERT_OUTPUT" \
+              | tr '[:upper:]' '[:lower:]' \
+              | grep -E 'signer.*certificate.*sha-?256.*digest' \
+              | head -n 1 \
+              | grep -Eo '([0-9a-f]{2}:){31}[0-9a-f]{2}|[0-9a-f]{64}' \
+              | head -n 1 \
+              | tr -d ':'
+          )"
+          echo "Debug APK certificate: ${ACTUAL_CERT_SHA256:-missing}"
+          if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::Debug APK was not signed by the stable G1 CI development certificate."
+            exit 1
+          fi
+          echo "Stable debug signing certificate verified: $ACTUAL_CERT_SHA256"
+          echo "APK versionCode: $G1_VERSION_CODE"
 
       - name: Build Release APK
         run: |

@@ -20,13 +20,27 @@ def enableProguardInReleaseBuilds = false
  */
 def jscFlavor = 'org.webkit:android-jsc:+'
 
-// Never commit signing files or passwords. A real release can be signed by
-// supplying all four values below from a protected CI/runtime environment.
+// Distribution/release signing remains protected and is never committed.
 def releaseStoreFile = System.getenv("G1_RELEASE_STORE_FILE")
 def releaseStorePassword = System.getenv("G1_RELEASE_STORE_PASSWORD")
 def releaseKeyAlias = System.getenv("G1_RELEASE_KEY_ALIAS")
 def releaseKeyPassword = System.getenv("G1_RELEASE_KEY_PASSWORD")
 def hasReleaseSigning = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
+// CI debug artifacts also need signature continuity so testers can install each
+// build as an update. The private development key is injected by the workflow
+// through a protected repository secret and is never stored in Git.
+def ciDebugStoreFile = System.getenv("G1_CI_SIGNING_STORE_FILE")
+def hasCiDebugSigning = ciDebugStoreFile && file(ciDebugStoreFile).exists()
+
+// GitHub Actions supplies a monotonically increasing run number. Local builds
+// retain versionCode 1 unless the caller explicitly provides G1_VERSION_CODE.
+def resolvedVersionCode = 1
+try {
+    resolvedVersionCode = Math.max(1, Integer.parseInt(System.getenv("G1_VERSION_CODE") ?: "1"))
+} catch (ignored) {
+    resolvedVersionCode = 1
+}
 
 android {
     ndkVersion rootProject.ext.ndkVersion
@@ -38,12 +52,20 @@ android {
         applicationId "com.directchat"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
+        versionCode resolvedVersionCode
         versionName "1.0"
     }
 
-    if (hasReleaseSigning) {
-        signingConfigs {
+    signingConfigs {
+        if (hasCiDebugSigning) {
+            ciDebug {
+                storeFile file(ciDebugStoreFile)
+                storePassword "g1-ci-debug-only"
+                keyAlias "g1-ci"
+                keyPassword "g1-ci-debug-only"
+            }
+        }
+        if (hasReleaseSigning) {
             release {
                 storeFile file(releaseStoreFile)
                 storePassword releaseStorePassword
@@ -55,7 +77,12 @@ android {
 
     buildTypes {
         debug {
-            // Use Android's normal debug signing. Never reuse a release key for debug builds.
+            // Local development keeps Android's normal generated debug key.
+            // CI injects one stable development-only key so successive APKs
+            // can update each other without uninstalling application data.
+            if (hasCiDebugSigning) {
+                signingConfig signingConfigs.ciDebug
+            }
         }
         release {
             // Without protected signing inputs Gradle still builds an unsigned release APK,
