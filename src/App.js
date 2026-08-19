@@ -145,6 +145,10 @@ export default function App() {
   }, []);
 
   const handleConnectLan = async (ip, port = 8089) => {
+    if (coordinatorP2pAttemptRef.current) {
+      setStatusText('محاولة اتصال Wi-Fi Direct جارية بالفعل…');
+      return false;
+    }
     let connectedHere = false;
     try {
       const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
@@ -1157,6 +1161,10 @@ export default function App() {
   };
 
   const btConnect = async (address) => {
+    if (coordinatorP2pAttemptRef.current) {
+      setStatusText('محاولة اتصال Wi-Fi Direct جارية بالفعل…');
+      return false;
+    }
     setState(States.BT_CONNECTING);
     try {
       await BT.stopDiscovery().catch(() => {});
@@ -1753,6 +1761,9 @@ coordinatorP2pAttemptRef.current = null;
 
   const maybeAnswerIncomingInvitation = peers => {
     if (!mountedRef.current || disconnectingRef.current) {
+      return;
+    }
+    if (coordinatorP2pAttemptRef.current) {
       return;
     }
     if (stateRef.current !== States.IDLE && stateRef.current !== States.DISCONNECTED) {
