@@ -113,12 +113,17 @@ jobs:
           fi
 
           EXPECTED_CERT_SHA256="8a64512b0fc4198f19a67f299c02594bc234877c1cb5a2df0f247bec5c1417aa"
+          CERT_OUTPUT="$("$APKSIGNER" verify --verbose --print-certs "$APK" 2>&1)"
+          printf '%s\n' "$CERT_OUTPUT"
+
           ACTUAL_CERT_SHA256="$(
-            "$APKSIGNER" verify --print-certs "$APK" \
-              | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' \
+            printf '%s\n' "$CERT_OUTPUT" \
+              | tr '[:upper:]' '[:lower:]' \
+              | grep -E 'signer.*certificate.*sha-?256.*digest' \
               | head -n 1 \
-              | tr -d ':' \
-              | tr '[:upper:]' '[:lower:]'
+              | grep -Eo '([0-9a-f]{2}:){31}[0-9a-f]{2}|[0-9a-f]{64}' \
+              | head -n 1 \
+              | tr -d ':'
           )"
           echo "Debug APK certificate: ${ACTUAL_CERT_SHA256:-missing}"
           if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
