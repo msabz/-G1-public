@@ -1,0 +1,68 @@
+name: Phase 6b-b concurrency guard patch
+
+on:
+  push:
+    branches:
+      - 'phase6b-b/outbound-p2p-coordinator'
+    paths:
+      - '.github/workflows/phase6bb-concurrency-guard.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: phase6b-b/outbound-p2p-coordinator
+          fetch-depth: 0
+
+      - name: Patch App concurrency guards
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/App.js')
+          text = path.read_text()
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 match, found {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "  const handleConnectLan = async (ip, port = 8089) => {\n    let connectedHere = false;",
+              "  const handleConnectLan = async (ip, port = 8089) => {\n    if (coordinatorP2pAttemptRef.current) {\n      setStatusText('محاولة اتصال Wi-Fi Direct جارية بالفعل…');\n      return false;\n    }\n    let connectedHere = false;",
+              'manual LAN guard',
+          )
+
+          replace_once(
+              "  const maybeAnswerIncomingInvitation = peers => {\n    if (!mountedRef.current || disconnectingRef.current) {\n      return;\n    }",
+              "  const maybeAnswerIncomingInvitation = peers => {\n    if (!mountedRef.current || disconnectingRef.current) {\n      return;\n    }\n    if (coordinatorP2pAttemptRef.current) {\n      return;\n    }",
+              'incoming invitation guard',
+          )
+
+          replace_once(
+              "  const btConnect = async (address) => {\n    setState(States.BT_CONNECTING);",
+              "  const btConnect = async (address) => {\n    if (coordinatorP2pAttemptRef.current) {\n      setStatusText('محاولة اتصال Wi-Fi Direct جارية بالفعل…');\n      return false;\n    }\n    setState(States.BT_CONNECTING);",
+              'Bluetooth guard',
+          )
+
+          path.write_text(text)
+          PY
+
+      - name: Commit and self-delete
+        shell: bash
+        run: |
+          rm -f .github/workflows/phase6bb-concurrency-guard.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/App.js .github/workflows/phase6bb-concurrency-guard.yml
+          git diff --cached --check
+          git commit -m 'phase6b-b: fence concurrent connection owners'
+          git push origin HEAD:phase6b-b/outbound-p2p-coordinator
