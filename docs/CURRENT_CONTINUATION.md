@@ -2,7 +2,7 @@
 
 This is the rolling resume pointer. Update it at every material phase transition. Dated checkpoint files remain the historical archive.
 
-Last prepared: 2026-08-19 after LAN Phase 5d physical verification, Stage A5 Phase 6a/6b-a seams, and the newly observed P2P discovery regression.
+Last prepared: 2026-08-19 after stable CI update continuity, Wi-Fi Direct physical recovery/verification on the Samsung A16+A06 pair, bidirectional chat verification, and device-agent conformance hardening.
 
 ## Read first
 
@@ -15,117 +15,216 @@ Historical Phase 5c checkpoint:
 Phase 5d checkpoint:
 `docs/DEVELOPMENT_CHECKPOINT_2026-08-18_LAN_STABILIZATION_PHASE5D.md`.
 
-## Current verified baseline
-
-- Canonical repository: `msabz/-G1-public`.
-- Canonical branch: `main`.
-- PR #10 merged first LAN stabilization at `efb58b20281e363d4a9517260f6ff19a3d053bd2`.
-- PR #11 merged LAN race hardening at `8b3e6aad2783697c2df0fb6278a7830b8cc998fe`.
-- PR #12 merged foreground/task-dismissal session rehydration at `f90c4d913a4efe30edb67ca788544ce9fb3e74e8`.
-- User physical revalidation after PR #12 passed the previously failing ordinary-LAN matrix: two-way chat, simultaneous connect, repeated disconnect/reconnect, files, voice/video call convergence, busy behavior, and foreground resume after removing one App task while the peer remained in-session.
-- Phase 5d ordinary-LAN networking is therefore **CODED / UNIT VERIFIED / CI VERIFIED / DEVICE VERIFIED** for the tested matrix.
-- PR #13 merged Stage A5 Phase 6a at `55b7d37c043651215757705fe0f8c4a883debe9d` (`refactor: establish coordinator-owned Wi-Fi Direct boundary`).
-- PR #13 final head `5e7193569b46db6a79d68dac495a8c5f31582211` passed GitHub Actions run #179 (`32177708754`): JavaScript tests, production bundle, Android unit tests, Debug APK, Release APK and both artifact uploads.
-- PR #14 merged the Phase 6b App-handoff seam at `fdaea620d64644ea1c535479579893f1528e7227` (`refactor: prepare live App P2P handoff to coordinator`). Its final head `f6e8e43aa6334bdfde9c439b5bfd3c59b6f3fe11` passed GitHub Actions run #185 (`32178516885`) and CodeRabbit, with no review threads at merge time.
-
-## Phase 5d LAN conclusions
-
-Confirmed in code/tests and then device revalidation:
-
-- recovered outbound signaling sessions replay stable local G1 identity;
-- simultaneous same-peer LAN races use deterministic stable-deviceId arbitration rather than socket arrival order;
-- different peers cannot steal a healthy session;
-- provisional duplicate promotion is make-before-break with rollback;
-- coalesced and segmented signaling frames survive promotion;
-- UTF-8 signaling frame limits are enforced consistently;
-- graceful disconnect suppresses transient recovery redial;
-- passive/background LAN session state can rehydrate a new React UI after task dismissal without opening a second socket;
-- signaling remains the one socket/session/heartbeat/same-route-recovery owner.
-
-Do not revive the historical TCP-KeepAlive root-cause claim. `SignalingSession` already enables keepalive best-effort and physical evidence did not establish KeepAlive as the cause.
-
-## APK update/signing gate — ACTIVE PRIORITY
-
-Physical installation repeatedly showed that a new CI Debug APK cannot update the previous Debug APK in place. The current cause is confirmed in configuration:
-
-- CI runners use Android's generated debug keystore, so signing identity is not stable across runs;
-- `versionCode` was fixed at `1`;
-- the historical experimental release/debug signing material is retired and must not be reused.
-
-Current remediation branch: `fix/stable-ci-signing`.
-
-Target behavior:
-
-- CI Debug APKs use one dedicated development-only signing key injected only through protected GitHub Secrets;
-- the private key is never committed;
-- CI `versionCode` advances from the GitHub Actions run number;
-- CI refuses to publish another installable Debug artifact if the stable signing secret is absent or wrong;
-- CI verifies the expected signing certificate before artifact upload.
-
-Because currently installed APKs were signed by earlier ephemeral debug keys, one final uninstall/clean install is unavoidable when switching to the new stable development key. After that cutover, later CI Debug APKs must install as updates without deleting app data.
-
-## Current phase — Stage A5 / P2P migration
-
-### Phase 6a — MERGED / UNIT VERIFIED / CI VERIFIED
-
-PR #13 established the transport/coordinator ownership boundary:
-
-- `WifiDirectTransportAdapter` owns Android Wi-Fi Direct route lifecycle: stable-identity-backed P2P observations, group negotiation, process bind/unbind and group cleanup.
-- Raw Wi-Fi Direct MAC / `deviceAddress` is route metadata only and never becomes G1 peer identity by itself.
-- `ConnectionCoordinator.connectP2pPeer()` owns logical P2P connection state.
-- `signalingOwner` supports both outbound signaling and group-owner inbound accept/wait through the existing `signaling.js` runtime.
-- `signaling.js` remains the single signaling socket/session/heartbeat/recovery owner; the coordinator does not start a second heartbeat for externally managed sessions.
-- Coordinator P2P cancellation/failure/terminal teardown delegates Android group cleanup to the P2P adapter.
-- `TransportFallbackEngine` defaults P2P to the coordinator path when no compatibility handler is supplied, while legacy handler precedence remains during migration.
-
-### Phase 6b-a — MERGED / UNIT VERIFIED / CI VERIFIED / DEVICE RESULT SUPERSEDED
-
-PR #14 added `p2pAppBridge` as a narrow presentation-to-coordinator seam without changing `src/App.js` yet:
-
-- a saved stable contact plus a fresh Wi-Fi Direct route is projected into `PeerRegistry` as a P2P endpoint;
-- DNS-SD-confirmed `peerId` may supply stable G1 identity, but raw `deviceAddress` alone never may;
-- logical connect delegates to `ConnectionCoordinator.connectP2pPeer()`;
-- the bridge verifies the exact stable peer and P2P transport own the resulting coordinator session;
-- the returned UI projection carries display name, route, transport and coordinator control ownership rather than socket ownership.
-
-An earlier short physical report was recorded as a P2P regression PASS. That result is now superseded by later direct device evidence: with the intended P2P test setup, the two devices did not discover each other at all and the application presented no usable Wi-Fi Direct peer path. Therefore **P2P discovery/live behavior is NOT DEVICE VERIFIED** and Phase 6b-b is paused until this regression is diagnosed from evidence.
-
-## P2P user-experience requirement
-
-The full-screen legacy `IdleScreen` transition shown during Wi-Fi Direct discovery/connection is not desired for normal use. Normal connection should remain on the conversations/contact UI while discovery, group negotiation, network bind and signaling run in the background. A compact per-peer/connection progress indication is acceptable. Android system permission/confirmation UI remains outside application control.
-
-## Immediate execution order
-
-1. Complete and verify stable CI Debug signing/update continuity.
-2. Perform one evidence-first P2P discovery diagnosis on the exact failing build; do not continue live App ownership migration while peers are invisible.
-3. Restore device discovery first, then re-run one focused P2P bootstrap test.
-4. Only after discovery/bootstrap is physically stable, resume Phase 6b-b live App→Coordinator migration.
-5. Remove the full-screen legacy connection transition from the normal user flow as part of the live-path migration, not as a masking workaround for transport failure.
-
-Do not begin I2P. Stage B remains gated on the full Stage A release-ready bar.
-
-## Remaining Stage A order
-
-After P2P ownership migration:
-
-- background/process lifecycle ownership;
-- complete call state machine and durable call history;
-- APK/APKS/signing/update correctness;
-- file-transfer isolation/performance and messaging completeness;
-- UI/UX and release/security/CI hardening.
-
-Only then add I2P as an independent overlay route. I2P destination is route addressing, not peer identity. Cryptographic peer authentication/pairing is a hard prerequisite before Internet-reachable control signaling.
-
-## Evidence rules
+## Evidence vocabulary
 
 Use: `CONFIRMED`, `LIKELY`, `HYPOTHESIS`, `GOAL`, `NOT VERIFIED`.
+
+Completion grades:
+- `CODED`
+- `UNIT VERIFIED`
+- `CI VERIFIED`
+- `DEVICE VERIFIED`
+- `CROSS-OEM VERIFIED`
+- `RELEASE READY`
 
 Priority of truth:
 1. current code/tests;
 2. CI on the same SHA/tree;
 3. reproducible raw device evidence;
-4. this rolling continuation;
-5. dated checkpoints/handoffs;
-6. external-agent interpretations.
+4. direct human observation during the controlled physical test;
+5. this rolling continuation;
+6. dated checkpoints/handoffs;
+7. external-agent interpretation.
 
-Do not store secrets or private identity material in the public repository.
+CI success is not physical-device success.
+
+## Verified baseline
+
+### Ordinary LAN — Phase 5d
+
+Phase 5d remains **CODED / UNIT VERIFIED / CI VERIFIED / DEVICE VERIFIED** for the tested matrix.
+
+Previously revalidated physically after PR #12:
+- two-way chat;
+- simultaneous connect;
+- repeated disconnect/reconnect;
+- files;
+- voice/video call convergence;
+- busy behavior;
+- foreground resume after removing one app task while the peer remained in-session.
+
+Signaling remains the one socket/session/heartbeat/same-route-recovery owner.
+
+Do not revive the historical TCP-KeepAlive root-cause claim; physical evidence did not establish it.
+
+### Stage A5 ownership seams
+
+PR #13 — Phase 6a — merged and CI verified:
+- coordinator-owned Wi-Fi Direct boundary;
+- `WifiDirectTransportAdapter` owns Android P2P route lifecycle;
+- raw Wi-Fi Direct MAC / `deviceAddress` remains route metadata, never stable peer identity;
+- `ConnectionCoordinator.connectP2pPeer()` owns logical P2P connection state;
+- `signaling.js` remains the single signaling socket/session/heartbeat/recovery owner.
+
+PR #14 — Phase 6b-a — merged and CI verified:
+- introduced `p2pAppBridge` as the App→Coordinator handoff seam;
+- stable G1 identity stays separate from P2P addressing;
+- logical connect delegates toward the coordinator boundary.
+
+Live App P2P ownership is still only partially migrated; Phase 6b-b remains the next engineering migration step.
+
+## Stable CI Debug signing/update gate — CLOSED
+
+The earlier CI Debug update problem is resolved.
+
+- PR #15 made CI Debug APK updates installable with a stable protected development signing identity and CI-derived advancing `versionCode`.
+- Run #197 installed cleanly.
+- Run #201 installed over #197 without uninstall and preserved the application update path.
+- The human tester physically confirmed the in-place update worked.
+- PR #16 documented the verified stable CI update continuity and was merged.
+
+Status: **DEVICE VERIFIED on the tested device** for stable CI Debug in-place update continuity.
+
+Do not expose or commit signing secrets/private key material.
+
+## Wi-Fi Direct / P2P physical status — RECOVERED AND VERIFIED ON TESTED PAIR
+
+The earlier statement that P2P discovery was not device verified is superseded by later controlled physical evidence.
+
+Test devices:
+- Samsung A16
+- Samsung A06
+
+Installed tested build:
+- G1 `versionName 1.0`
+- `versionCode 215`
+
+### Discovery
+
+CONFIRMED on the tested pair:
+- A06 discovered A16 in machine-observed P2P evidence.
+- The human tester directly observed A16 discover A06 in repeated scan rounds.
+- Earlier A16 shell-agent reports showing zero peers/zero samples were diagnostic-capture false negatives and must not be interpreted as proof that A16 discovery failed.
+
+Status: **DEVICE VERIFIED** for bidirectional peer visibility/discovery on the tested A16+A06 pair.
+
+### Real P2P connection/group formation
+
+Mission `p2p-connect-observe-006` physically established a real Wi-Fi Direct group.
+
+CONFIRMED:
+- A06 became Group Owner.
+- A16 became the client.
+- Android reported `groupFormed: true` on both sides.
+- G1 reached connected/chat state.
+- No terminal disconnect was observed during that connection check.
+
+Status: **DEVICE VERIFIED** for P2P group/connection establishment on the tested pair.
+
+### Chat over Wi-Fi Direct
+
+The physical tester subsequently confirmed bidirectional chat succeeded over the Wi-Fi Direct session and requested that this milestone be treated as passed rather than repeatedly rerun.
+
+Supporting machine evidence from the prior chat mission included:
+- formed P2P group retained;
+- G1 connected state retained;
+- signaling session became active;
+- one transient `Broken pipe` socket error recovered and the session continued;
+- outbound chat send evidence was captured.
+
+Status: **DEVICE VERIFIED** for bidirectional chat over Wi-Fi Direct on the tested A16+A06 pair.
+
+This is not `CROSS-OEM VERIFIED`; both devices are Samsung.
+
+## P2P diagnostic branch / PR #17
+
+PR #17 (`diag: capture Wi-Fi Direct discovery evidence`) remains diagnostic work, not proof of a production discovery defect.
+
+Its CI head passed, but physical A16 capture behavior demonstrated that the diagnostic harness/agent could miss scan-period evidence while the UI visibly discovered the peer.
+
+Therefore:
+- do not continue debugging the hypothesis “A16 cannot discover A06”;
+- do not treat zero A16 diagnostic samples as authoritative negative P2P evidence;
+- decide separately whether PR #17 should be retained/merged as useful diagnostics or closed/retired;
+- do not merge it merely because CI is green.
+
+## Device-lab agent status
+
+The physical-device evidence agents for A16 and A06 were hardened and then passed a final conformance check.
+
+Current agent contract:
+- fresh session evidence window per command;
+- canonical separation of `human_observed`, `machine_observed`, and `not_observed`;
+- top-level capture-health reporting;
+- `COMPLETE / PARTIAL / FAILED / BLOCKED` grading from actual evidence;
+- no stale-log reuse;
+- no arbitrary GitHub comment execution;
+- no unnecessary full-system logcat for status-only missions;
+- historical command IDs are not rerun;
+- duplicate execution of a completed command is prevented.
+
+The final conformance mission completed successfully on both devices. No additional agent-conformance loop is required unless an agent/model/prompt/control protocol is materially reset or changed.
+
+Shizuku/rish remains a lab diagnostic tool only and must never become a G1 production dependency.
+
+## Current engineering phase — Stage A5 / P2P migration
+
+The physical gate that paused Phase 6b-b is now cleared for the tested A16+A06 pair:
+- discovery works;
+- P2P group formation works;
+- G1 reaches connected state;
+- bidirectional chat works.
+
+Next engineering step: resume **Phase 6b-b live App→Coordinator P2P ownership migration** using the established surgical strategy.
+
+Do not big-bang rewrite.
+
+Required migration discipline:
+1. re-read current main HEAD and ownership map;
+2. identify the smallest live App P2P responsibility that can move behind `p2pAppBridge` / coordinator without changing behavior;
+3. add/retain characterization coverage;
+4. make one migration;
+5. run tests/CI;
+6. fix only causal failures;
+7. green checkpoint;
+8. then proceed to the next ownership slice.
+
+Keep these invariants:
+- stable peer identity is independent of route/IP/MAC;
+- LAN and Wi-Fi Direct remain independent transport candidates;
+- signaling/control stays separate from bulk data;
+- one owner per concern;
+- make-before-break where applicable;
+- bounded recovery;
+- security/consent first.
+
+## P2P UX requirement
+
+The full-screen legacy `IdleScreen` transition during Wi-Fi Direct discovery/connection is not desired for normal use.
+
+Normal connection should remain on the conversations/contact UI while discovery, group negotiation, network bind, and signaling run in the background. A compact per-peer/connection progress indication is acceptable. Android system permission/confirmation UI remains outside application control.
+
+Remove the legacy full-screen transition as part of the live-path ownership migration, not as a workaround for transport behavior.
+
+## Immediate execution order for next session
+
+1. Verify current `main` HEAD and CI state before editing.
+2. Review PR #17 status but do not merge automatically.
+3. Resume Phase 6b-b with the smallest behavior-preserving App→Coordinator P2P handoff slice.
+4. Add/maintain regression coverage around the moved ownership boundary.
+5. Push → CI → causal fixes only → green checkpoint.
+6. Use the physical A16/A06 lab only when the next code slice requires device evidence; do not repeat already-verified discovery/connection/chat milestones by default.
+
+After P2P ownership migration, continue Stage A in the planned order:
+- background/process lifecycle ownership;
+- complete call state machine and durable call history;
+- file-transfer isolation/performance and messaging completeness;
+- UI/UX and release/security/CI hardening.
+
+Do not begin I2P yet. Stage B remains gated on the full Stage A release-ready bar.
+
+I2P, when reached, is an independent overlay route. I2P destination is route addressing, not peer identity. Cryptographic peer authentication/pairing is a hard prerequisite before Internet-reachable control signaling.
+
+## Security note
+
+Do not store secrets, credentials, private keys, signing material, raw MAC addresses, Android IDs, serials, IMEIs, or equivalent unique device identifiers in the public repository.
