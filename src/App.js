@@ -17,6 +17,7 @@ import {
 import { lanDiscovery } from './network/LanDiscovery';
 import { peerRegistry, TRANSPORTS } from './network/PeerRegistry';
 import { connectionCoordinator } from './network/ConnectionCoordinator';
+import { connectP2pFromApp, resolveStableP2pDeviceId } from './network/p2pAppBridge';
 import { resolveKnownLanTarget } from './network/knownLanTarget';
 import { setLanPassiveAdmissionContextProvider } from './network/LanPassiveAdmission';
 import {
@@ -232,6 +233,7 @@ export default function App() {
   const contactsRef = useRef([]);
   const targetPeerRef = useRef(null);
   const pendingKnownLanPeerIdRef = useRef(null);
+  const coordinatorP2pAttemptRef = useRef(null);
   const connectionAddressTrackerRef = useRef(createConnectionAddressTracker());
   const rtcNegotiatingRef = useRef(false);
   const inCallRef = useRef(false);
@@ -897,6 +899,15 @@ export default function App() {
 
   const handlePeerConnected = async initialInfo => {
     if (!initialInfo?.groupFormed || disconnectingRef.current) return;
+    const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+    if (
+      coordinatorStatus.transport === TRANSPORTS.P2P &&
+      (coordinatorStatus.state === 'CONNECTING' || coordinatorStatus.state === 'CONNECTED')
+    ) {
+      // Adapter/coordinator owns this group event; App must not open a second
+      // signaling path for the same Wi-Fi Direct route.
+      return;
+    }
     if (stateRef.current === States.CONNECTED || connectionSetupRef.current) return;
     if (
       !connectionAddressTrackerRef.current.activateConnection(
@@ -1108,7 +1119,13 @@ export default function App() {
         console.log('[Wi-Fi Direct] تجاهل بث انفصال P2P لأن النقل النشط ليس P2P');
         return;
       }
-      finishWifiDisconnect({ unexpected: true });
+      if (activeControlOwnerRef.current === CONTROL_PLANE_OWNERS.COORDINATOR) {
+        finishCurrentTransportDisconnect({ unexpected: true }).catch(error => {
+          console.warn('[App] coordinator P2P disconnect cleanup failed:', error?.message || error);
+        });
+      } else {
+        finishWifiDisconnect({ unexpected: true });
+      }
     } else if (
       stateRef.current === States.WIFI_CONNECTING &&
       connectionSetupRef.current
@@ -1348,6 +1365,23 @@ export default function App() {
     return clean;
   };
 
+  const waitForCoordinatorP2pCleanup = async (timeoutMs = 10000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const p2p = connectionCoordinator.getCoordinatorStatus()?.p2p;
+      if (!p2p || (
+        p2p.state === 'IDLE' &&
+        !p2p.activeRoute &&
+        !p2p.pendingPeerId
+      )) {
+        return true;
+      }
+      if (p2p.state === 'ERROR') return false;
+      await delay(250);
+    }
+    return false;
+  };
+
   const finishLogicalDisconnect = async ({
     remote = false,
     unexpected = false,
@@ -1362,7 +1396,22 @@ export default function App() {
       setStatusText('جاري إنهاء الاتصال…');
     }
 
+    const coordinatorOwnsP2p =
+      disconnectViaCoordinator && activeTransportRef.current === TRANSPORTS.P2P;
     cleanupSessionResources({ disconnectViaCoordinator });
+
+    if (coordinatorOwnsP2p) {
+      const clean = await waitForCoordinatorP2pCleanup(10000);
+      if (!clean) {
+        if (mountedRef.current) {
+          stateRef.current = States.ERROR;
+          setState(States.ERROR);
+          setStatusText('لم يؤكد منسق الاتصال تنظيف مسار Wi-Fi Direct خلال المهلة.');
+        }
+        disconnectingRef.current = false;
+        return false;
+      }
+    }
 
     if (mountedRef.current) {
       resetActiveSessionUi({ clearMessages: !unexpected });
@@ -1390,7 +1439,7 @@ export default function App() {
       unexpected,
     });
 
-    if (plan.cleanupWifiDirect) {
+    if (plan.cleanupWifiDirect && !plan.disconnectViaCoordinator) {
       return finishWifiDisconnect({ remote, unexpected });
     }
 
@@ -1528,6 +1577,140 @@ export default function App() {
   };
 
   const beginWifiNegotiation = async (selected, { incoming = false } = {}) => {
+    const stableDeviceId = incoming ? null : resolveStableP2pDeviceId(selected, selected);
+    if (stableDeviceId) {
+      connectionAddressTrackerRef.current.beginAttempt();
+      targetPeerRef.current = selected;
+      connectionSetupRef.current = false;
+      const coordinatorAttemptId = ++connectionAttemptRef.current;
+      coordinatorP2pAttemptRef.current = {
+        attemptId: coordinatorAttemptId,
+        deviceId: stableDeviceId,
+      };
+      setMessages([]);
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+
+      connectionPhaseRef.current = 'اتصال Wi-Fi Direct عبر المنسق';
+      if (mountedRef.current) {
+        setStatusText(`جاري الاتصال بـ ${selected.customName || selected.name || 'الجهاز'} عبر Wi-Fi Direct…`);
+      }
+
+      try {
+        const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
+        if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
+        identityRef.current = identity;
+        connectionCoordinator.setIdentity(identity);
+
+        const result = await connectP2pFromApp({
+contact: selected,
+discoveredPeer: selected,
+timeoutMs: 30000,
+        });
+
+        if (
+!mountedRef.current ||
+disconnectingRef.current ||
+coordinatorAttemptId !== connectionAttemptRef.current
+        ) {
+connectionCoordinator.disconnect();
+return false;
+        }
+
+        const route = result.route || {};
+        if (route.connectionEpoch != null) {
+connectionAddressTrackerRef.current.activateConnection(route.connectionEpoch);
+        }
+
+        const peer = result.peer;
+        const displayName =
+result.displayName || selected.customName || selected.name ||
+peer.deviceName || 'الجهاز الآخر';
+        await savePeer(peer.deviceId, peer.deviceName || displayName, '');
+        await savePeerAddress(
+peer.deviceId,
+selected.deviceAddress,
+peer.deviceName || displayName
+        );
+        const history = await loadMessages(peer.deviceId, 300);
+
+        peerIdRef.current = peer.deviceId;
+        peerIpRef.current = route.isGroupOwner ? null : (route.groupOwnerAddress || null);
+        lastConnectionRef.current = null;
+        activeTransportRef.current = TRANSPORTS.P2P;
+        activeControlOwnerRef.current = CONTROL_PLANE_OWNERS.COORDINATOR;
+        reconnectAttemptRef.current = 0;
+        targetPeerRef.current = {
+...selected,
+deviceId: peer.deviceId,
+peerId: peer.deviceId,
+name: displayName,
+        };
+
+        setActivePeerInfo({
+...selected,
+deviceId: peer.deviceId,
+peerId: peer.deviceId,
+name: displayName,
+transport: 'p2p',
+        });
+        setPeerDisplayName(displayName);
+        startTransferServer().catch(() => {});
+        ensureMicGuard();
+        startConnectionService('متصل عبر واي فاي مباشر');
+        const normalizedHistory = (history || []).map(item => ({
+...item,
+time: Number(item.time),
+        }));
+        setMessages(prev => mergePeerMessageHistory(normalizedHistory, prev));
+
+        connectionPhaseRef.current = 'متصل';
+        stateRef.current = States.CONNECTED;
+        setState(States.CONNECTED);
+        setActiveTier(Tiers.WIFI_DIRECT);
+        setStatusText('');
+        setChatOpen(true);
+        refreshContacts();
+        return true;
+      } catch (error) {
+        console.warn('[App] coordinator P2P connect failed:', error?.message || error);
+        const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+        if (
+coordinatorStatus.transport === TRANSPORTS.P2P &&
+coordinatorStatus.peer?.deviceId === stableDeviceId &&
+coordinatorStatus.state !== 'IDLE'
+        ) {
+connectionCoordinator.disconnect();
+        }
+        if (
+mountedRef.current &&
+!disconnectingRef.current &&
+coordinatorAttemptId === connectionAttemptRef.current
+        ) {
+activeTransportRef.current = null;
+activeControlOwnerRef.current = null;
+peerIpRef.current = null;
+lastConnectionRef.current = null;
+targetPeerRef.current = null;
+stateRef.current = States.IDLE;
+setState(States.IDLE);
+setActiveTier(Tiers.NONE);
+setStatusText(
+  `فشل اتصال Wi-Fi Direct عبر المنسق: ${error?.message || 'خطأ غير معروف'}`
+);
+        }
+        return false;
+      } finally {
+        if (coordinatorP2pAttemptRef.current?.attemptId === coordinatorAttemptId) {
+coordinatorP2pAttemptRef.current = null;
+        }
+      }
+    }
+
+    // Incoming invitations and peers without a provable stable G1 identity stay
+    // on the legacy path for this surgical slice.
     connectionAddressTrackerRef.current.beginAttempt();
     targetPeerRef.current = selected;
     connectionSetupRef.current = false;
@@ -1615,6 +1798,10 @@ export default function App() {
     }
     if (stateRef.current === States.DISCONNECTING || disconnectingRef.current) {
       Alert.alert('جاري إنهاء الاتصال', 'انتظر حتى يكتمل إنهاء الاتصال الحالي.');
+      return;
+    }
+    if (coordinatorP2pAttemptRef.current) {
+      setStatusText('محاولة اتصال Wi-Fi Direct جارية بالفعل…');
       return;
     }
     if (scanningRef.current) return scanPromiseRef.current;
@@ -1792,6 +1979,10 @@ export default function App() {
 
     if (stateRef.current === States.DISCONNECTING || disconnectingRef.current) {
       Alert.alert('جاري إنهاء الاتصال', 'انتظر حتى يكتمل إنهاء الاتصال الحالي.');
+      return;
+    }
+    if (coordinatorP2pAttemptRef.current) {
+      setStatusText('محاولة اتصال Wi-Fi Direct جارية بالفعل…');
       return;
     }
 
