@@ -17,7 +17,7 @@ import {
 
 describe('p2pDiscoveryDiagnostics', () => {
   test('tolerates partial/non-Android React Native runtime metadata', () => {
-    expect(getAndroidApiLevel(undefined)).toBeNull();
+    expect(getAndroidApiLevel(null)).toBeNull();
     expect(getAndroidApiLevel({ OS: 'ios', Version: '18' })).toBeNull();
     expect(getAndroidApiLevel({ OS: 'android', Version: 34 })).toBe(34);
   });
