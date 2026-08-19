@@ -22,8 +22,15 @@ const safeCall = async (fn, fallback = null) => {
   }
 };
 
+export const getAndroidApiLevel = (platform = Platform) => {
+  if (platform?.OS !== 'android' || platform?.Version == null) return null;
+  const version = Number(platform.Version);
+  return Number.isFinite(version) ? version : null;
+};
+
 const readNearbyPermission = async () => {
-  if (Platform.OS !== 'android' || Number(Platform.Version) < 33) return 'not-required';
+  const apiLevel = getAndroidApiLevel();
+  if (apiLevel == null || apiLevel < 33) return 'not-required';
   const permission = PermissionsAndroid?.PERMISSIONS?.NEARBY_WIFI_DEVICES;
   if (!permission || typeof PermissionsAndroid?.check !== 'function') return 'unknown';
   try {
@@ -42,10 +49,11 @@ export const normalizeP2pPeers = peers => (
 }));
 
 export async function captureP2pDiscoverySnapshot(nativeModule = DirectConnection) {
+  const apiLevel = getAndroidApiLevel();
   if (!nativeModule) {
     return {
       available: false,
-      apiLevel: Platform.OS === 'android' ? Number(Platform.Version) : null,
+      apiLevel,
       nearbyPermission: await readNearbyPermission(),
       peers: [],
       peerCount: 0,
@@ -69,7 +77,7 @@ export async function captureP2pDiscoverySnapshot(nativeModule = DirectConnectio
 
   return {
     available: true,
-    apiLevel: Platform.OS === 'android' ? Number(Platform.Version) : null,
+    apiLevel,
     supported: supported && !supported.error ? supported : null,
     locationEnabled: locationEnabled && !locationEnabled.error ? locationEnabled : null,
     nearbyPermission,
@@ -84,7 +92,7 @@ export async function captureP2pDiscoverySnapshot(nativeModule = DirectConnectio
 }
 
 function createEmitter(nativeModule) {
-  if (!nativeModule) return null;
+  if (!nativeModule || typeof NativeEventEmitter !== 'function') return null;
   try {
     return new NativeEventEmitter(nativeModule);
   } catch (error) {
@@ -96,18 +104,26 @@ export function startP2pDiscoveryDiagnostics(options = {}) {
   if (activeStop) return activeStop;
 
   const nativeModule = options.nativeModule || DirectConnection;
-  const emitter = options.emitter || createEmitter(nativeModule);
-  const pollMs = Number(options.pollMs) > 0 ? Number(options.pollMs) : DEFAULT_POLL_MS;
   const logger = options.logger || console.log;
-  let stopped = false;
-  let pollSequence = 0;
-  const subscriptions = [];
-
   const log = (kind, payload = {}) => {
     try {
       logger(`${MARKER} ${kind} ${JSON.stringify(payload)}`);
     } catch (error) {}
   };
+
+  // Unit-test/bootstrap environments and non-Android runtimes intentionally
+  // expose only partial React Native mocks. Diagnostics must never keep those
+  // processes alive or throw simply because the Android native module is absent.
+  if (!nativeModule) {
+    log('UNAVAILABLE', { reason: 'DirectConnectionModule unavailable' });
+    return () => {};
+  }
+
+  const emitter = options.emitter || createEmitter(nativeModule);
+  const pollMs = Number(options.pollMs) > 0 ? Number(options.pollMs) : DEFAULT_POLL_MS;
+  let stopped = false;
+  let pollSequence = 0;
+  const subscriptions = [];
 
   const snapshot = async source => {
     if (stopped) return null;
@@ -116,24 +132,20 @@ export function startP2pDiscoveryDiagnostics(options = {}) {
     return data;
   };
 
-  if (!nativeModule) {
-    log('UNAVAILABLE', { reason: 'DirectConnectionModule unavailable' });
-  } else {
-    const eventNames = [
-      'WIFI_P2P_STATE_CHANGED',
-      'PEERS_UPDATED',
-      'MUSAB_PEER_FOUND',
-      'PEER_CONNECTED',
-      'PEER_DISCONNECTED',
-      'PEER_ADDRESS_RESOLVED',
-    ];
-    if (emitter?.addListener) {
-      eventNames.forEach(name => {
-        subscriptions.push(emitter.addListener(name, payload => {
-          log('EVENT', { name, payload: payload || null });
-        }));
-      });
-    }
+  const eventNames = [
+    'WIFI_P2P_STATE_CHANGED',
+    'PEERS_UPDATED',
+    'MUSAB_PEER_FOUND',
+    'PEER_CONNECTED',
+    'PEER_DISCONNECTED',
+    'PEER_ADDRESS_RESOLVED',
+  ];
+  if (emitter?.addListener) {
+    eventNames.forEach(name => {
+      subscriptions.push(emitter.addListener(name, payload => {
+        log('EVENT', { name, payload: payload || null });
+      }));
+    });
   }
 
   snapshot('startup');
