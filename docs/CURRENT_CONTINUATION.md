@@ -2,7 +2,7 @@
 
 This is the rolling resume pointer. Update it at every material phase transition. Dated checkpoint files remain the historical archive.
 
-Last prepared: 2026-08-19 after Phase 6b-b PR #18 reached CI green and the first automated device installation attempt exposed a G1LAB installer capability defect.
+Last prepared: 2026-08-20 after Phase 6b-b PR #18 remained CI green, the legacy G1LAB installer failure was reproduced and confirmed not to install build 242, and the protocol-2.2 staged-installer/self-update repair was merged in the private lab repository.
 
 ## Read first
 
@@ -12,11 +12,8 @@ Latest Phase 6b-b checkpoint:
 Master execution strategy:
 GitHub issue #5 — `Master execution strategy: release-ready G1 → independent I2P overlay`.
 
-Historical Phase 5c checkpoint:
-`docs/DEVELOPMENT_CHECKPOINT_2026-08-18_INCOMING_LAN_ADOPTION_PHASE5C.md`.
-
-Phase 5d checkpoint:
-`docs/DEVELOPMENT_CHECKPOINT_2026-08-18_LAN_STABILIZATION_PHASE5D.md`.
+Private physical-lab continuation:
+`msabz/shizuku-controller/CURRENT_CONTINUATION.md`.
 
 ## Evidence vocabulary
 
@@ -101,14 +98,6 @@ This is not `CROSS-OEM VERIFIED`.
 
 Do not repeatedly rerun the old baseline before installing the new code under test.
 
-## PR #17 diagnostics
-
-PR #17 (`diag: capture Wi-Fi Direct discovery evidence`) remains diagnostic work, not proof of a production discovery defect.
-
-Earlier A16 shell-agent zero-sample results were false negatives relative to direct UI observation. Do not resume the obsolete hypothesis that A16 cannot discover A06.
-
-Decide later whether PR #17 is useful enough to retain/merge or should be retired; do not merge it solely because CI is green.
-
 ## Current engineering phase — Stage A5 / Phase 6b-b
 
 PR #18:
@@ -117,7 +106,7 @@ PR #18:
 Branch:
 `phase6b-b/outbound-p2p-coordinator`
 
-CI-verified head at this checkpoint:
+CI-verified head:
 `c31a4ef7dd5dee82375997deb6d78736093f8274`
 
 PR #18 remains **open and draft**. Do not merge before physical regression.
@@ -127,15 +116,14 @@ PR #18 remains **open and draft**. Do not merge before physical regression.
 For outbound Wi-Fi Direct where stable G1 identity is provable:
 - `App.js` delegates through `p2pAppBridge` to `ConnectionCoordinator`;
 - coordinator ownership prevents the legacy App `PEER_CONNECTED` path from opening a second signaling path;
-- coordinator-owned disconnect does not fall back to legacy App reconnect;
+- coordinator-owned P2P does not fall back into App legacy reconnect;
 - coordinator-owned cleanup is awaited before App finalizes logical disconnect;
 - raw P2P route addresses are rejected as logical identities;
 - incoming invitations and identity-unproven P2P peers remain on the legacy path for this surgical slice;
-- incoming invitation handling, scanning, manual LAN connection, and Bluetooth connection are blocked while an outbound coordinator P2P attempt is active, preventing concurrent control owners.
+- incoming invitation handling, scanning, manual LAN connection and Bluetooth connection are blocked while an outbound coordinator P2P attempt is active, preventing concurrent control owners;
+- `signaling.js` remains the sole signaling/socket/session/heartbeat owner.
 
-The UI remains on the conversations/contact flow rather than intentionally switching to a full-screen legacy connection owner during this coordinator-owned outbound attempt.
-
-### Verification
+### CI verification
 
 Final CI run: **#242 / SUCCESS**.
 
@@ -151,65 +139,85 @@ Verified on the same head:
 Debug artifact:
 - `G1-DirectChat-debug-apk`
 - artifact id `9385559100`
-- versionCode `242`
+- expected versionCode `242`.
 
 Current code grade: **CODED / UNIT VERIFIED / CI VERIFIED**.
 
 Current device grade for Phase 6b-b: **NOT DEVICE VERIFIED**.
 
-## Immediate blocker — G1LAB INSTALL_RUN_ARTIFACT
+## Device deployment evidence — authoritative
 
-Private G1LAB command:
+Original automated install:
 `phase6bb-install-031`
 
-Target:
-A16 + A06.
+Controlled reproduction:
+`phase6bb-install-retry-034`
 
-Both persistent daemons accepted the command and correctly produced one `STARTED` followed by `FAILED`.
+Both legacy G1LAB daemons failed at the same stdin-based installer boundary.
 
-Both failed at the same installer boundary:
-`RuntimeError: pm install -r failed:`
+Immediate independent post-state verification:
+`phase6bb-verify-after-retry-035`
 
-No actionable `pm` stdout/stderr was preserved in the report.
+Result:
+- A16 remained `com.directchat` versionCode `215`;
+- A06 remained `com.directchat` versionCode `215`.
 
-Interpretation:
-- command bus and persistent daemons are functioning;
-- failure reporting is functioning;
-- the `INSTALL_RUN_ARTIFACT` capability itself is incomplete/defective;
-- do not assume build 242 is installed on either phone;
-- do not classify PR #18 as DEVICE VERIFIED;
-- do not make manual APK installation the normal workaround.
+Therefore build 242 was **not installed** on either phone. This confirms the legacy lab transport defect rather than merely missing Package Manager output.
 
-The private lab repository contains the detailed continuation and must be read before resuming device work.
+Do not retry the same stdin-based installer and do not classify this as a PR #18 product failure.
 
-## G1LAB must evolve from real usage
+## G1LAB protocol-2.2 repair
 
-The lab is an engineering system, not a static harness.
+Private lab PR #3 merged as:
+`3e5d74bb00d95808857a11425bab1ed0b4186ba4`
 
-Operational rule:
+The repaired lab runtime adds:
+- shared-storage staging of the validated APK;
+- Shizuku-shell copy into `/data/local/tmp`;
+- path-based `pm install -r` rather than stdin APK transport;
+- explicit remote installer exit marker and structured evidence;
+- post-install exact version verification;
+- cleanup of temporary APK material;
+- retry + `pm list packages --show-versioncode` fallback for transient package-state reads;
+- daemon-side typed `SYNC_AGENT_RUNTIME` self-update;
+- corrected tmux supervisor singleton verification.
 
-`real failure → preserve evidence → identify causal lab weakness → improve lab code/protocol → add regression coverage → deploy runtime update → retry original mission → verify improvement`
+The repair is **MERGED IN LAB CODE but NOT YET DEPLOYED/DEVICE VERIFIED**.
 
-An automatable lab capability should be repaired rather than replaced by repeated manual work.
+## Direct controller command path — VERIFIED
 
-Human interaction is reserved for genuinely physical/system-consent operations that Android does not permit the lab to automate safely.
+The user does not need to type a local test trigger for normal device missions.
 
-## Immediate execution order for next session
+Direct structured commands from the controller were autonomously consumed by both persistent daemons, including `daemon-status-autonomous-20260820-002` and `legacy-daemon-status-after-v22-pending-037`.
 
-1. Read this file and `docs/DEVELOPMENT_CHECKPOINT_2026-08-19_PHASE6BB_PR18.md`.
-2. Read private `msabz/shizuku-controller/CURRENT_CONTINUATION.md`.
-3. Do **not** edit PR #18 first; its code and CI are already green.
-4. Diagnose and repair G1LAB `INSTALL_RUN_ARTIFACT` using `phase6bb-install-031` as the real failure case.
-5. Improve installer evidence so stdout/stderr/exit status and package-version verification are preserved.
-6. Add regression coverage for the installer capability.
-7. Safely update the persistent lab runtime on A16/A06.
-8. Retry build 242 with a **new command ID**; never reuse `phase6bb-install-031`.
-9. Verify `com.directchat` versionCode 242 on both devices.
-10. Run one focused outbound Phase 6b-b P2P regression on the A16+A06 pair.
-11. If device evidence passes, checkpoint as DEVICE VERIFIED and then decide whether PR #18 is ready to merge.
-12. If device evidence fails, fix only the causal Phase 6b-b defect and repeat the targeted regression.
+At the latest checkpoint both phones still reported G1LAB `protocol_version: 2`, proving command delivery is healthy while the new self-update handler is not yet installed.
 
-After Phase 6b-b, continue Stage A in the planned order. Do not begin I2P until the full Stage A release-ready gate is satisfied.
+Migration command:
+`lab-runtime-migrate-v22-036`
+
+is pending and correctly produced no STARTED/REPORT from the legacy protocol-2 daemons because `SYNC_AGENT_RUNTIME` is not in their installed allowlist.
+
+## Current blocker — one-time lab runtime migration
+
+The installed protocol-2 daemons cannot safely replace their own Termux-private runtime because they do not contain a self-update handler.
+
+The first transition to protocol 2.2 must use an already-trusted bootstrap/recovery process in Termux context. Do not bypass this boundary with command injection, path traversal, arbitrary-shell listeners, unrelated UI automation or manual APK installation.
+
+After the one-time migration, future lab runtime updates are designed to be controller-driven through the typed `SYNC_AGENT_RUNTIME` action without local `اختبر` triggers.
+
+## Immediate execution order
+
+1. Migrate both A16 and A06 from G1LAB protocol 2 → 2.2 using the trusted bootstrap/recovery path.
+2. Verify each device reports protocol 2.2 and exactly one healthy daemon responder.
+3. Exercise daemon-side `SYNC_AGENT_RUNTIME` once to prove future autonomous self-update.
+4. Issue a fresh `INSTALL_RUN_ARTIFACT` for CI run 242 using a new command ID.
+5. Require independent post-install `com.directchat` versionCode 242 on both phones.
+6. Start G1 and confirm runtime health.
+7. Run one focused outbound Phase 6b-b P2P regression on the A16+A06 pair.
+8. If device evidence passes, checkpoint Phase 6b-b as DEVICE VERIFIED and then decide whether PR #18 is ready to merge.
+9. If device evidence fails, fix only the causal product/lab defect and repeat the targeted regression.
+
+After Phase 6b-b, continue Stage A in planned order. Do not begin I2P until the full Stage A release-ready gate is satisfied.
 
 ## Invariants
 
@@ -220,8 +228,9 @@ After Phase 6b-b, continue Stage A in the planned order. Do not begin I2P until 
 - make-before-break where applicable;
 - bounded recovery;
 - security/consent first;
+- no generic arbitrary-shell lab control path;
 - Shizuku/rish is lab-only and never a G1 production dependency.
 
 ## Security note
 
-Do not store secrets, credentials, private keys, signing material, raw MAC addresses, Android IDs, serials, IMEIs, or equivalent unique device identifiers in the public repository.
+Do not store secrets, credentials, private keys, signing material, raw MAC addresses, Android IDs, serials, IMEIs or equivalent unique device identifiers in the public repository.
