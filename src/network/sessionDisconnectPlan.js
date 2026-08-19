@@ -16,11 +16,15 @@ export function getSessionDisconnectPlan({
   unexpected = false,
 } = {}) {
   const cleanupWifiDirect = requiresWifiDirectCleanup(transport);
+  const coordinatorOwned = controlOwner === CONTROL_PLANE_OWNERS.COORDINATOR;
 
   return {
-    disconnectViaCoordinator: controlOwner === CONTROL_PLANE_OWNERS.COORDINATOR,
+    disconnectViaCoordinator: coordinatorOwned,
     cleanupWifiDirect,
-    attemptLegacyWifiDirectReconnect: unexpected && cleanupWifiDirect,
+    // Once the coordinator owns a P2P session, reconnect/recovery must stay
+    // behind that ownership boundary. Falling back to App's legacy signaling
+    // reconnect would create two control-plane owners for the same route.
+    attemptLegacyWifiDirectReconnect: unexpected && cleanupWifiDirect && !coordinatorOwned,
   };
 }
 
