@@ -84,6 +84,25 @@ jobs:
           cd android
           ./gradlew assembleDebug --stacktrace
 
+      - name: Apply Stable CI Debug Signature
+        run: |
+          APK="$(find android/app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [ -z "$APK" ] || [ -z "$APKSIGNER" ]; then
+            echo "::error::Unable to locate debug APK or apksigner."
+            exit 1
+          fi
+
+          SIGNED_APK="${APK%.apk}-stable.apk"
+          "$APKSIGNER" sign \
+            --ks "$G1_CI_SIGNING_STORE_FILE" \
+            --ks-key-alias 'g1-ci' \
+            --ks-pass 'pass:g1-ci-debug-only' \
+            --key-pass 'pass:g1-ci-debug-only' \
+            --out "$SIGNED_APK" \
+            "$APK"
+          mv "$SIGNED_APK" "$APK"
+
       - name: Verify Debug APK Signature
         run: |
           APK="$(find android/app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
@@ -101,6 +120,7 @@ jobs:
               | tr -d ':' \
               | tr '[:upper:]' '[:lower:]'
           )"
+          echo "Debug APK certificate: ${ACTUAL_CERT_SHA256:-missing}"
           if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
             echo "::error::Debug APK was not signed by the stable G1 CI development certificate."
             exit 1
