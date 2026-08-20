@@ -45,6 +45,10 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     private val SERVICE_NAME = "_musabchat"
     private val SERVICE_TYPE = "_presence._tcp"
     private val PASSIVE_RESTORE_DELAY_MS = 12_000L
+    // AOSP tears an otherwise idle P2P interface down after 150 seconds even
+    // while the client Channel is still alive. Keep the owned passive presence
+    // below that deadline with a read-only request that does not stop discovery.
+    private val PASSIVE_PRESENCE_LEASE_REFRESH_MS = 45_000L
     private var serviceInfo: WifiP2pDnsSdServiceInfo? = null
     private var serviceRequest: WifiP2pDnsSdServiceRequest? = null
     private var advertising = false
@@ -102,6 +106,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     }
                     serviceInfo = info
                     advertising = true
+                    schedulePassivePresenceLease(generation)
                     promise.resolve(true)
                 }
 
@@ -137,6 +142,26 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 promise.reject("ERROR", e.message)
             }
         }
+    }
+
+    private fun schedulePassivePresenceLease(generation: Int) {
+        mainHandler.postDelayed({
+            if (generation != advertisingGeneration || !advertising || serviceInfo == null) {
+                return@postDelayed
+            }
+            val manager = wifiP2pManager ?: return@postDelayed
+            val currentChannel = channel ?: return@postDelayed
+
+            // REQUEST_PEERS is read-only. In AOSP's inactive P2P state it still
+            // counts as a client operation and re-schedules the idle-shutdown
+            // timer, unlike startListening(), which stops an active find.
+            try { manager.requestPeers(currentChannel) { _ -> } } catch (_: Exception) {}
+
+            if (generation == advertisingGeneration && advertising &&
+                serviceInfo != null && currentChannel === channel) {
+                schedulePassivePresenceLease(generation)
+            }
+        }, PASSIVE_PRESENCE_LEASE_REFRESH_MS)
     }
 
     @ReactMethod
