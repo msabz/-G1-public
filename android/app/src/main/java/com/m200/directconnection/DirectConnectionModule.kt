@@ -44,6 +44,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     private val SERVICE_NAME = "_musabchat"
     private val SERVICE_TYPE = "_presence._tcp"
+    private val PASSIVE_RESTORE_DELAY_MS = 12_000L
     private var serviceInfo: WifiP2pDnsSdServiceInfo? = null
     private var serviceRequest: WifiP2pDnsSdServiceRequest? = null
     private var advertising = false
@@ -600,7 +601,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 if (restorePassive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     mainHandler.postDelayed({
                         restorePassiveListeningAfterScan(currentChannel, connectionEpoch, 0)
-                    }, 3200L)
+                    }, PASSIVE_RESTORE_DELAY_MS)
                 }
                 promise.resolve("Discovery started")
             }
