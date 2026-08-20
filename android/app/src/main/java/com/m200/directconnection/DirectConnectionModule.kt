@@ -548,10 +548,13 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         var settled = false
         var lastRemoveAt = 0L
         var consecutiveEmptyChecks = 0
-        var lastRemoveFailure: Int? = null
+        var lastFailure: Int? = null
 
         serviceDiscoveryGeneration++
         serviceRequest = null
+
+        fun withinDeadline(): Boolean =
+            SystemClock.elapsedRealtime() - startedAt < timeout
 
         fun finish(clean: Boolean, timedOut: Boolean, reinitialized: Boolean) {
             if (settled) return
@@ -561,12 +564,12 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 putBoolean("timedOut", timedOut)
                 putBoolean("channelReinitialized", reinitialized)
                 putDouble("elapsedMs", (SystemClock.elapsedRealtime() - startedAt).toDouble())
-                if (lastRemoveFailure == null) {
+                if (lastFailure == null) {
                     putNull("lastFailureCode")
                     putNull("lastFailureName")
                 } else {
-                    putInt("lastFailureCode", lastRemoveFailure!!)
-                    putString("lastFailureName", reasonName(lastRemoveFailure!!))
+                    putInt("lastFailureCode", lastFailure!!)
+                    putString("lastFailureName", reasonName(lastFailure!!))
                 }
             })
         }
@@ -596,7 +599,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                             manager.removeGroup(operationChannel, object : ActionListener {
                                 override fun onSuccess() { mainHandler.postDelayed({ pollGroup() }, 250L) }
                                 override fun onFailure(reason: Int) {
-                                    lastRemoveFailure = reason
+                                    lastFailure = reason
                                     mainHandler.postDelayed({ pollGroup() }, 400L)
                                 }
                             })
@@ -612,27 +615,77 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             }
         }
 
-        try {
-            manager.stopPeerDiscovery(operationChannel, object : ActionListener {
-                override fun onSuccess() {}
-                override fun onFailure(reason: Int) {}
-            })
-        } catch (_: Exception) {}
-        try {
-            manager.clearServiceRequests(operationChannel, object : ActionListener {
-                override fun onSuccess() {}
-                override fun onFailure(reason: Int) {}
-            })
-        } catch (_: Exception) {}
-
-        try {
-            manager.cancelConnect(operationChannel, object : ActionListener {
-                override fun onSuccess() { mainHandler.postDelayed({ pollGroup() }, 450L) }
-                override fun onFailure(reason: Int) { mainHandler.postDelayed({ pollGroup() }, 450L) }
-            })
-        } catch (_: Exception) {
-            pollGroup()
+        fun cancelThenPoll() {
+            if (settled) return
+            try {
+                manager.cancelConnect(operationChannel, object : ActionListener {
+                    override fun onSuccess() {
+                        mainHandler.postDelayed({ pollGroup() }, 300L)
+                    }
+                    override fun onFailure(reason: Int) {
+                        mainHandler.postDelayed({ pollGroup() }, 300L)
+                    }
+                })
+            } catch (_: Exception) {
+                pollGroup()
+            }
         }
+
+        lateinit var clearRequestsThenCancel: (Int) -> Unit
+        clearRequestsThenCancel = { attempt ->
+            if (!settled) {
+                try {
+                    manager.clearServiceRequests(operationChannel, object : ActionListener {
+                        override fun onSuccess() {
+                            mainHandler.postDelayed({ cancelThenPoll() }, 250L)
+                        }
+                        override fun onFailure(reason: Int) {
+                            lastFailure = reason
+                            if (reason == BUSY && attempt < 4 && withinDeadline()) {
+                                mainHandler.postDelayed({
+                                    clearRequestsThenCancel(attempt + 1)
+                                }, 350L * (attempt + 1))
+                            } else {
+                                mainHandler.postDelayed({ cancelThenPoll() }, 250L)
+                            }
+                        }
+                    })
+                } catch (_: Exception) {
+                    cancelThenPoll()
+                }
+            }
+        }
+
+        lateinit var stopDiscoveryThenClear: (Int) -> Unit
+        stopDiscoveryThenClear = { attempt ->
+            if (!settled) {
+                try {
+                    manager.stopPeerDiscovery(operationChannel, object : ActionListener {
+                        override fun onSuccess() {
+                            mainHandler.postDelayed({ clearRequestsThenCancel(0) }, 350L)
+                        }
+                        override fun onFailure(reason: Int) {
+                            lastFailure = reason
+                            if (reason == BUSY && attempt < 4 && withinDeadline()) {
+                                mainHandler.postDelayed({
+                                    stopDiscoveryThenClear(attempt + 1)
+                                }, 350L * (attempt + 1))
+                            } else {
+                                mainHandler.postDelayed({ clearRequestsThenCancel(0) }, 350L)
+                            }
+                        }
+                    })
+                } catch (_: Exception) {
+                    clearRequestsThenCancel(0)
+                }
+            }
+        }
+
+        // Do not launch these operations in parallel. On Samsung, DNS-SD can
+        // remain BUSY when clearServiceRequests races stopPeerDiscovery even if
+        // the group is already gone. Wait for each ActionListener before moving
+        // to the next stage, then verify group removal and recreate the Channel.
+        stopDiscoveryThenClear(0)
     }
 
     @ReactMethod
