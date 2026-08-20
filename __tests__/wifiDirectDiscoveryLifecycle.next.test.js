@@ -6,7 +6,6 @@ describe('Wi-Fi Direct corrected discovery lifecycle', () => {
     path.join(__dirname, '..', 'android', 'app', 'src', 'main', 'java', 'com', 'm200', 'directconnection', 'DirectConnectionModule.kt'),
     'utf8'
   );
-  const appSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.js'), 'utf8');
 
   test('normal advertising owns an exact local service without broad clear-first', () => {
     const start = nativeSource.indexOf('fun startAdvertising(deviceLabel: String, deviceId: String, promise: Promise)');
@@ -39,6 +38,15 @@ describe('Wi-Fi Direct corrected discovery lifecycle', () => {
     expect(slice).not.toContain('clearServiceRequests');
   });
 
+  test('teardown keeps the previously proven serialized broad cleanup path', () => {
+    const start = nativeSource.indexOf('fun cleanupConnection(timeoutMs: Double, promise: Promise)');
+    const end = nativeSource.indexOf('fun getConnectionInfo(promise: Promise)', start);
+    const slice = nativeSource.slice(start, end);
+    expect(slice).toContain('stopDiscoveryThenClear(0)');
+    expect(slice).toContain('manager.clearServiceRequests(operationChannel');
+    expect(slice).toContain('manager.cancelConnect(operationChannel');
+  });
+
   test('channel recreation drops stale channel-scoped service ownership', () => {
     const start = nativeSource.indexOf('private fun resetChannelScopedServiceState()');
     const end = nativeSource.indexOf('private fun reasonName', start);
@@ -50,15 +58,18 @@ describe('Wi-Fi Direct corrected discovery lifecycle', () => {
     expect(slice).toContain('resetChannelScopedServiceState()');
   });
 
-  test('manual fresh discovery returns to passive listen after the generic scan', () => {
-    const start = appSource.indexOf('const runFreshDiscovery = async () => {');
-    const end = appSource.indexOf('const findFreshPeer = contact =>', start);
-    const slice = appSource.slice(start, end);
-    const genericScan = slice.indexOf('await DirectConnection.discoverPeers();');
-    const passiveListen = slice.lastIndexOf('await DirectConnection.startPassiveListening();');
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    expect(genericScan).toBeGreaterThanOrEqual(0);
-    expect(passiveListen).toBeGreaterThan(genericScan);
+  test('manual DNS-SD-to-generic scan lifecycle restores passive listening without touching App ownership', () => {
+    const stopStart = nativeSource.indexOf('fun stopServiceDiscovery(promise: Promise)');
+    const discoverStart = nativeSource.indexOf('fun discoverPeers(promise: Promise)');
+    const restoreStart = nativeSource.indexOf('private fun restorePassiveListeningAfterScan(');
+    const stopSlice = nativeSource.slice(stopStart, discoverStart);
+    const discoverSlice = nativeSource.slice(discoverStart, restoreStart + 1200);
+
+    expect(stopSlice).toContain('restorePassiveAfterNextPeerScan = true');
+    expect(discoverSlice).toContain('val restorePassive = restorePassiveAfterNextPeerScan');
+    expect(discoverSlice).toContain('restorePassiveAfterNextPeerScan = false');
+    expect(discoverSlice).toContain('restorePassiveListeningAfterScan(currentChannel, connectionEpoch, 0)');
+    expect(discoverSlice).toContain('manager.startListening(expectedChannel');
+    expect(discoverSlice).toContain('connectionGeneration != connectionEpoch');
   });
 });
