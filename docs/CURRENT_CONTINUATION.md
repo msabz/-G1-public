@@ -1,236 +1,212 @@
 # G1 Current Continuation
 
-This is the rolling resume pointer. Update it at every material phase transition. Dated checkpoint files remain the historical archive.
+This is the rolling public resume pointer. Prefer exact current code/tests, same-SHA CI, and reproducible device evidence over older documentation.
 
-Last prepared: 2026-08-20 after Phase 6b-b PR #18 remained CI green, the legacy G1LAB installer failure was reproduced and confirmed not to install build 242, and the protocol-2.2 staged-installer/self-update repair was merged in the private lab repository.
+Last prepared: 2026-08-20 14:22 BST after exact Build253 installation/verification on the active Samsung A16 + Motorola moto g35 5G pair, cross-OEM P2P discovery evidence, and research-first root-cause analysis of the current DNS-SD BUSY/passive-listen failure.
 
 ## Read first
-
-Latest Phase 6b-b checkpoint:
-`docs/DEVELOPMENT_CHECKPOINT_2026-08-19_PHASE6BB_PR18.md`
 
 Master execution strategy:
 GitHub issue #5 — `Master execution strategy: release-ready G1 → independent I2P overlay`.
 
-Private physical-lab continuation:
+Current public PR:
+#18 — `Phase 6b-b: migrate outbound P2P ownership to coordinator`.
+
+Canonical cross-project handoff:
+`msabz/shizuku-controller/G1_PROJECT_HANDOFF_2026-08-20.md`.
+
+Private physical-lab rolling continuation:
 `msabz/shizuku-controller/CURRENT_CONTINUATION.md`.
 
 ## Evidence vocabulary
 
 Use: `CONFIRMED`, `LIKELY`, `HYPOTHESIS`, `GOAL`, `NOT VERIFIED`.
-
-Completion grades:
-- `CODED`
-- `UNIT VERIFIED`
-- `CI VERIFIED`
-- `DEVICE VERIFIED`
-- `CROSS-OEM VERIFIED`
-- `RELEASE READY`
+Completion grades: `CODED`, `UNIT VERIFIED`, `CI VERIFIED`, `DEVICE VERIFIED`, `CROSS-OEM VERIFIED`, `RELEASE READY`.
 
 Priority of truth:
 1. current code/tests;
 2. CI on the same SHA/tree;
 3. reproducible raw device evidence;
 4. direct human observation during a controlled physical test;
-5. this rolling continuation;
-6. dated checkpoints/handoffs;
-7. external-agent interpretation.
+5. current handoff/continuation;
+6. dated checkpoints/history;
+7. external analogies.
 
 CI success is not physical-device success.
 
+## Permanent engineering method
+
+For nontrivial bugs, especially networking/P2P:
+1. read exact current code and failing evidence;
+2. inspect H100/G1/public history and prior fixes;
+3. check Android/AOSP/official behavior and CTS where relevant;
+4. compare mature open-source implementations close to the failing layer;
+5. eliminate plausible competing explanations;
+6. design the smallest causal patch with explicit PASS/FAIL criteria;
+7. run diff review/unit/CI first;
+8. use physical phones only as the final proof gate, not as a random hypothesis generator.
+
+Move faster by doing research/analysis/patch/CI in one bounded engineering cycle instead of many speculative device pokes.
+
 ## Verified baseline
 
-### Ordinary LAN — Phase 5d
+Ordinary LAN Phase 5d remains device-verified for the previously tested matrix. `signaling.js` remains the one socket/session/heartbeat/same-route-recovery owner.
 
-Phase 5d remains **CODED / UNIT VERIFIED / CI VERIFIED / DEVICE VERIFIED** for the tested matrix.
-
-Previously revalidated physically after PR #12:
-- two-way chat;
-- simultaneous connect;
-- repeated disconnect/reconnect;
-- files;
-- voice/video call convergence;
-- busy behavior;
-- foreground resume after removing one app task while the peer remained in-session.
-
-`signaling.js` remains the one socket/session/heartbeat/same-route-recovery owner.
-
-### Stage A5 ownership seams
-
-PR #13 — Phase 6a — merged and CI verified:
-- `WifiDirectTransportAdapter` owns Android P2P route lifecycle;
-- raw Wi-Fi Direct MAC / `deviceAddress` remains route metadata, never stable peer identity;
-- `ConnectionCoordinator.connectP2pPeer()` owns logical P2P connection state;
-- `signaling.js` remains the signaling socket/session/heartbeat/recovery owner.
-
-PR #14 — Phase 6b-a — merged and CI verified:
-- introduced `p2pAppBridge` as the App→Coordinator handoff seam;
-- stable G1 identity stays separate from P2P addressing;
-- logical connect delegates toward the coordinator boundary.
-
-## Stable CI Debug signing/update gate — CLOSED
-
-PR #15 established stable protected CI Debug signing and advancing CI `versionCode`.
-Run #197 installed cleanly; run #201 updated over it without uninstall, and the physical tester confirmed the in-place update path worked.
-PR #16 documented that result and was merged.
-
-Status: **DEVICE VERIFIED on the tested device** for stable CI Debug update continuity.
-
-Do not expose or commit signing secrets/private key material.
-
-## Wi-Fi Direct physical baseline — DEVICE VERIFIED ON TESTED PAIR
-
-Test devices:
-- Samsung A16
-- Samsung A06
-
-The pre-Phase-6b-b build physically established:
+Historical Samsung A16+A06 Wi-Fi Direct baseline remains valid:
 - bidirectional peer visibility/discovery;
-- real Wi-Fi Direct group formation;
-- A06 Group Owner / A16 client in the controlled connection test;
+- real P2P group formation;
+- A06 Group Owner / A16 client in a controlled run;
 - G1 connected/chat state;
 - bidirectional basic chat;
-- transient signaling recovery on one observed Broken-pipe event.
+- one transient Broken-pipe recovery observation.
 
-Status: **DEVICE VERIFIED** for that tested baseline on the Samsung A16+A06 pair.
+Do not claim the Samsung pair never worked.
 
-This is not `CROSS-OEM VERIFIED`.
+## Stage A5 ownership invariants
 
-Do not repeatedly rerun the old baseline before installing the new code under test.
-
-## Current engineering phase — Stage A5 / Phase 6b-b
-
-PR #18:
-`Phase 6b-b: migrate outbound P2P ownership to coordinator`
-
-Branch:
-`phase6b-b/outbound-p2p-coordinator`
-
-CI-verified head:
-`c31a4ef7dd5dee82375997deb6d78736093f8274`
-
-PR #18 remains **open and draft**. Do not merge before physical regression.
-
-### Implemented live slice
-
-For outbound Wi-Fi Direct where stable G1 identity is provable:
-- `App.js` delegates through `p2pAppBridge` to `ConnectionCoordinator`;
-- coordinator ownership prevents the legacy App `PEER_CONNECTED` path from opening a second signaling path;
-- coordinator-owned P2P does not fall back into App legacy reconnect;
-- coordinator-owned cleanup is awaited before App finalizes logical disconnect;
-- raw P2P route addresses are rejected as logical identities;
-- incoming invitations and identity-unproven P2P peers remain on the legacy path for this surgical slice;
-- incoming invitation handling, scanning, manual LAN connection and Bluetooth connection are blocked while an outbound coordinator P2P attempt is active, preventing concurrent control owners;
+Merged earlier phases established:
+- `WifiDirectTransportAdapter` owns Android P2P route lifecycle;
+- raw Wi-Fi Direct `deviceAddress` is route metadata, not stable identity;
+- `ConnectionCoordinator` owns logical P2P connection orchestration;
+- `p2pAppBridge` is the App→Coordinator handoff seam;
 - `signaling.js` remains the sole signaling/socket/session/heartbeat owner.
 
-### CI verification
+Do not big-bang rewrite these boundaries.
 
-Final CI run: **#242 / SUCCESS**.
+## Current engineering phase — PR #18 / Phase 6b-b
 
-Verified on the same head:
-- JavaScript tests;
-- RN bundle;
-- Android tests;
-- Debug APK build;
-- stable CI Debug signing/certificate verification;
-- Release APK build;
-- artifact upload.
+Repository: `msabz/-G1-public`
+Branch: `phase6b-b/outbound-p2p-coordinator`
+Current canonical PR head at this checkpoint:
+`c1166ffd98900d18bcd0a6f50e8aabbcc639766b`
 
-Debug artifact:
+PR state: OPEN / DRAFT / NOT MERGED.
+
+CI on exact head:
+- workflow run number `253`
+- run id `32323155248`
+- conclusion: SUCCESS.
+
+Exact physical artifact/build:
 - `G1-DirectChat-debug-apk`
-- artifact id `9385559100`
-- expected versionCode `242`.
+- artifact id `9390566857`
+- package `com.directchat`
+- versionCode `253`
+- APK SHA-256 `87cddf9b91140f13d353f333bcff4ed1ef6d867a1a53d233f268eadfceb90ae8`.
 
-Current code grade: **CODED / UNIT VERIFIED / CI VERIFIED**.
+Build253 is installed/verified on the active A16 + Motorola pair.
 
-Current device grade for Phase 6b-b: **NOT DEVICE VERIFIED**.
+A rejected unreferenced staging commit `0460c53a952046ffb167aaf2d16061f859865607` was created only for diff inspection and accidentally showed 133 unrelated `App.js` deletions. The PR branch was never moved to it. Treat it as rejected/non-canonical staging only.
 
-## Device deployment evidence — authoritative
+## Active physical devices
 
-Original automated install:
-`phase6bb-install-031`
+Primary active pair:
+- Samsung A16
+- Motorola moto g35 5G
 
-Controlled reproduction:
-`phase6bb-install-retry-034`
+Backup only:
+- Samsung A06
 
-Both legacy G1LAB daemons failed at the same stdin-based installer boundary.
+Motorola G1LAB onboarding to protocol `2.2-overlay` is complete. Do not ask the user to redo bootstrap/auth unless fresh machine evidence proves a new failure.
 
-Immediate independent post-state verification:
-`phase6bb-verify-after-retry-035`
+## Current Build253 P2P result
 
-Result:
-- A16 remained `com.directchat` versionCode `215`;
-- A06 remained `com.directchat` versionCode `215`.
+CONFIRMED:
+- generic Wi-Fi Direct discovery can expose A16 and Motorola to each other cross-OEM;
+- DNS-SD identity confirmation still reports `Clear service requests failed: 2 (BUSY)`;
+- generic Wi-Fi Direct peers are correctly shown as unverified rather than falsely confirmed DirectChat identity;
+- after one side initiates search, the phones can appear briefly and later disappear again from nearby P2P lists.
 
-Therefore build 242 was **not installed** on either phone. This confirms the legacy lab transport defect rather than merely missing Package Manager output.
+Because DNS-SD identity confidence failed, stable-identity coordinator connect/chat gates were intentionally not run from a generic peer card.
 
-Do not retry the same stdin-based installer and do not classify this as a PR #18 product failure.
+Do not connect unrelated/generic peers such as Fire TV just because Android reports availability.
 
-## G1LAB protocol-2.2 repair
+## Current strongest root-cause model
 
-Private lab PR #3 merged as:
-`3e5d74bb00d95808857a11425bab1ed0b4186ba4`
+Two distinct lifecycle defects are strongly supported.
 
-The repaired lab runtime adds:
-- shared-storage staging of the validated APK;
-- Shizuku-shell copy into `/data/local/tmp`;
-- path-based `pm install -r` rather than stdin APK transport;
-- explicit remote installer exit marker and structured evidence;
-- post-install exact version verification;
-- cleanup of temporary APK material;
-- retry + `pm list packages --show-versioncode` fallback for transient package-state reads;
-- daemon-side typed `SYNC_AGENT_RUNTIME` self-update;
-- corrected tmux supervisor singleton verification.
+### A. DNS-SD BUSY
 
-The repair is **MERGED IN LAB CODE but NOT YET DEPLOYED/DEVICE VERIFIED**.
+Historical/current native flow inherited broad `clearLocalServices()` / `clearServiceRequests()` behavior before adding the exact newly owned service/request.
 
-## Direct controller command path — VERIFIED
+After comparison with H100 history, AOSP/Android behavior, Signal Android and Bada:
+- broad `CLEAR_*` operations on a fresh/recreated P2P client/channel may return BUSY without activating P2P;
+- activating operations such as `ADD_LOCAL_SERVICE`, `ADD_SERVICE_REQUEST`, `DISCOVER_SERVICES`, `DISCOVER_PEERS` move through active P2P paths;
+- client/Channel removal already clears client-scoped service state, so broad clear-first is not justified as mandatory normal initialization on a fresh Channel;
+- Signal Android owns a specific DNS-SD request and follows `addServiceRequest → discoverServices → remove exact request` rather than mandatory broad clear-before-add;
+- Bada includes a modern OEM workaround that primes P2P with an activating discovery lifecycle.
 
-The user does not need to type a local test trigger for normal device missions.
+This matches the physical symptom: DNS-SD clear fails BUSY while later generic peer discovery can work.
 
-Direct structured commands from the controller were autonomously consumed by both persistent daemons, including `daemon-status-autonomous-20260820-002` and `legacy-daemon-status-after-v22-pending-037`.
+Treat this as high-confidence causal analysis, not final device proof until a corrected build passes cross-OEM.
 
-At the latest checkpoint both phones still reported G1LAB `protocol_version: 2`, proving command delivery is healthy while the new self-update handler is not yet installed.
+### B. Appear-then-disappear peer visibility
 
-Migration command:
-`lab-runtime-migrate-v22-036`
+H100 previously documented that cleanup/`stopPeerDiscovery()` can leave Samsung outside passive LISTEN and that advertising alone is insufficient.
 
-is pending and correctly produced no STARTED/REPORT from the legacy protocol-2 daemons because `SYNC_AGENT_RUNTIME` is not in their installed allowlist.
+Current manual `runFreshDiscovery()` performs one-shot cleanup/discovery but does not restore `startPassiveListening()` at the end of that scan path. This matches the human observation that phones can appear after a scan and disappear after the discovery window.
 
-## Current blocker — one-time lab runtime migration
+## Reference source corpus confirmed in G1 project sources
 
-The installed protocol-2 daemons cannot safely replace their own Termux-private runtime because they do not contain a self-update handler.
+Confirmed uploaded ZIPs:
+- `Bada-main.zip`
+- `Signal-Android-main.zip`
+- `briar-master.zip`
+- `briar-mailbox-main.zip`
+- `berty-master.zip`
+- `meshenger-android-master.zip`
 
-The first transition to protocol 2.2 must use an already-trusted bootstrap/recovery process in Termux context. Do not bypass this boundary with command injection, path traversal, arbitrary-shell listeners, unrelated UI automation or manual APK installation.
+Current priority for the P2P bug:
+1. Bada — modern Android Wi-Fi Direct/OEM lifecycle.
+2. Signal Android — exact DNS-SD request ownership.
+3. Briar/Briar Mailbox — bounded BUSY/channel recovery and multi-transport patterns.
+4. Berty — identity/transport separation.
+5. Meshenger — later direct call/signaling/addressing reference.
 
-After the one-time migration, future lab runtime updates are designed to be controller-driven through the typed `SYNC_AGENT_RUNTIME` action without local `اختبر` triggers.
+Check licenses before literal code reuse.
 
-## Immediate execution order
+The user also requested a second source batch around AOSP Wi-Fi/CTS, KDE Connect, LocalSend/protocol and Jami. Verify actual project-source availability in the next session before claiming those files are present.
 
-1. Migrate both A16 and A06 from G1LAB protocol 2 → 2.2 using the trusted bootstrap/recovery path.
-2. Verify each device reports protocol 2.2 and exactly one healthy daemon responder.
-3. Exercise daemon-side `SYNC_AGENT_RUNTIME` once to prove future autonomous self-update.
-4. Issue a fresh `INSTALL_RUN_ARTIFACT` for CI run 242 using a new command ID.
-5. Require independent post-install `com.directchat` versionCode 242 on both phones.
-6. Start G1 and confirm runtime health.
-7. Run one focused outbound Phase 6b-b P2P regression on the A16+A06 pair.
-8. If device evidence passes, checkpoint Phase 6b-b as DEVICE VERIFIED and then decide whether PR #18 is ready to merge.
-9. If device evidence fails, fix only the causal product/lab defect and repeat the targeted regression.
+## Intended next patch direction
 
-After Phase 6b-b, continue Stage A in planned order. Do not begin I2P until the full Stage A release-ready gate is satisfied.
+Do not implement from memory alone; re-read exact current files first.
 
-## Invariants
+Expected narrow direction:
+- exact local-service/DNS-SD request ownership instead of mandatory broad clear on the normal hot path;
+- assign ownership only after successful add;
+- remove the exact owned service/request on stop/retry/cleanup where possible;
+- broad clear only as bounded recovery/fallback if justified;
+- Channel recreation remains bounded recovery, not default hammer;
+- restore passive listening after manual one-shot discovery when not CONNECTING/CONNECTED/DISCONNECTING;
+- do not modify coordinator/signaling/TCP P2P bind/stable identity/data plane without direct evidence.
 
-- stable peer identity is independent of route/IP/MAC;
-- LAN and Wi-Fi Direct remain independent transport candidates;
-- signaling/control stays separate from bulk data;
-- one owner per concern;
-- make-before-break where applicable;
-- bounded recovery;
-- security/consent first;
-- no generic arbitrary-shell lab control path;
-- Shizuku/rish is lab-only and never a G1 production dependency.
+Regression coverage should prove:
+- no mandatory pre-add `clearServiceRequests()` in normal DNS-SD discovery;
+- exact request ownership/removal;
+- stale channel-scoped ownership resets on Channel recreation;
+- manual fresh discovery restores passive listening;
+- generic P2P availability remains unverified identity.
 
-## Security note
+## Required next execution order
 
-Do not store secrets, credentials, private keys, signing material, raw MAC addresses, Android IDs, serials, IMEIs or equivalent unique device identifiers in the public repository.
+1. Read `msabz/shizuku-controller/G1_PROJECT_HANDOFF_2026-08-20.md`.
+2. Verify current PR18 head before editing.
+3. Re-read current `DirectConnectionModule.kt`, `src/App.js` fresh discovery flow, and existing lifecycle tests.
+4. Complete the research-first comparison against Bada/Signal/Briar and relevant Android/AOSP behavior.
+5. Eliminate competing explanations before any phone test.
+6. Obtain the explicit source-write authorization for the specific patch batch.
+7. Build the smallest patch and inspect the diff mechanically for unrelated changes.
+8. Run JS/Android/unit/build CI.
+9. Only after green CI install the exact successful artifact on A16+Motorola through G1LAB and verify exact build identity.
+10. Run one bounded discovery gate: old BUSY string absent, stable DirectChat identity confirmed, peer visibility remains healthy after the one-shot scan window.
+11. Only then run coordinator group formation, bidirectional chat and disconnect cleanup.
+12. Do not merge PR #18 until physical gates pass and the user explicitly authorizes merge.
+
+## Known G1LAB note
+
+`extract_ui_hierarchy()` can false-fail when valid UI XML is split between stdout/stderr because the parser checks streams separately. `DUMP_G1_UI FAILED` with `uiautomator rc=0` and valid DirectChat hierarchy is not evidence of an app crash.
+
+## Security
+
+Do not store/expose credentials, device codes, private keys/signing material, raw MACs, Android IDs, serials, IMEIs or equivalent unique identifiers in the public repository.
+Shizuku/rish remains lab-only and never a production dependency.
