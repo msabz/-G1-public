@@ -118,13 +118,60 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             if (channel == null && !ensureChannel()) {
                 promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return
             }
-            val manager = wifiP2pManager ?: run { promise.reject("ERROR", "غير متاح"); return }
-            val currentChannel = channel ?: run { promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return }
             val generation = ++serviceDiscoveryGeneration
+            discoverMusabPeersWithRetry(promise, generation, 0, false)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
+    }
 
+    private fun discoverMusabPeersWithRetry(
+        promise: Promise,
+        generation: Int,
+        attempt: Int,
+        channelReset: Boolean
+    ) {
+        if (generation != serviceDiscoveryGeneration) {
+            promise.resolve(false)
+            return
+        }
+
+        val manager = wifiP2pManager ?: run {
+            promise.reject("ERROR", "غير متاح")
+            return
+        }
+        val currentChannel = channel ?: run {
+            promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر")
+            return
+        }
+
+        fun failOrRetry(stage: String, reason: Int) {
+            if (generation != serviceDiscoveryGeneration) {
+                promise.resolve(false)
+                return
+            }
+            if (reason == BUSY && attempt < 4) {
+                mainHandler.postDelayed({
+                    discoverMusabPeersWithRetry(promise, generation, attempt + 1, channelReset)
+                }, 700L * (attempt + 1))
+            } else if (reason == BUSY && !channelReset && recreateChannel()) {
+                // Samsung can keep DNS-SD operations BUSY on a stale Channel even
+                // after group cleanup. Recreate the Channel once, then replay the
+                // whole bounded DNS-SD sequence so listeners and requests belong
+                // to the new Channel.
+                mainHandler.postDelayed({
+                    discoverMusabPeersWithRetry(promise, generation, 0, true)
+                }, 900L)
+            } else {
+                promise.reject("ERROR", "$stage failed: $reason (${reasonName(reason)})")
+            }
+        }
+
+        try {
             manager.setDnsSdResponseListeners(currentChannel,
                 { instanceName, registrationType, device ->
-                    if (instanceName.contains("musabchat", ignoreCase = true)) {
+                    if (generation == serviceDiscoveryGeneration &&
+                        instanceName.contains("musabchat", ignoreCase = true)) {
                         sendEvent("MUSAB_PEER_FOUND", Arguments.createMap().apply {
                             putString("deviceName", device.deviceName)
                             putString("deviceAddress", device.deviceAddress)
@@ -135,7 +182,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 },
                 { fullDomain, record, device ->
                     val app = record["app"]
-                    if (app == "musabchat") {
+                    if (generation == serviceDiscoveryGeneration && app == "musabchat") {
                         sendEvent("MUSAB_PEER_FOUND", Arguments.createMap().apply {
                             putString("deviceName", record["name"] ?: device.deviceName)
                             putString("deviceAddress", device.deviceAddress)
@@ -167,21 +214,29 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                                     promise.resolve(generation == serviceDiscoveryGeneration)
                                 }
                                 override fun onFailure(reason: Int) {
-                                    promise.reject("ERROR", "Service discovery failed: $reason (${reasonName(reason)})")
+                                    failOrRetry("Service discovery", reason)
                                 }
                             })
                         }
                         override fun onFailure(reason: Int) {
-                            promise.reject("ERROR", "Service request failed: $reason (${reasonName(reason)})")
+                            failOrRetry("Service request", reason)
                         }
                     })
                 }
                 override fun onFailure(reason: Int) {
-                    promise.reject("ERROR", "Clear service requests failed: $reason (${reasonName(reason)})")
+                    failOrRetry("Clear service requests", reason)
                 }
             })
         } catch (e: Exception) {
-            promise.reject("ERROR", e.message)
+            if (generation != serviceDiscoveryGeneration) {
+                promise.resolve(false)
+            } else if (!channelReset && recreateChannel()) {
+                mainHandler.postDelayed({
+                    discoverMusabPeersWithRetry(promise, generation, 0, true)
+                }, 900L)
+            } else {
+                promise.reject("ERROR", e.message)
+            }
         }
     }
 
