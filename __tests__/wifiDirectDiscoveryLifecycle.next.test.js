@@ -58,18 +58,23 @@ describe('Wi-Fi Direct corrected discovery lifecycle', () => {
     expect(slice).toContain('resetChannelScopedServiceState()');
   });
 
-  test('manual DNS-SD-to-generic scan lifecycle restores passive listening without touching App ownership', () => {
+  test('manual DNS-SD-to-generic scan keeps a full discovery dwell before passive listening', () => {
     const stopStart = nativeSource.indexOf('fun stopServiceDiscovery(promise: Promise)');
     const discoverStart = nativeSource.indexOf('fun discoverPeers(promise: Promise)');
     const restoreStart = nativeSource.indexOf('private fun restorePassiveListeningAfterScan(');
     const stopSlice = nativeSource.slice(stopStart, discoverStart);
     const discoverSlice = nativeSource.slice(discoverStart, restoreStart + 1200);
+    const dwellMatch = nativeSource.match(/private val PASSIVE_RESTORE_DELAY_MS = ([0-9_]+)L/);
 
     expect(stopSlice).toContain('restorePassiveAfterNextPeerScan = true');
     expect(discoverSlice).toContain('val restorePassive = restorePassiveAfterNextPeerScan');
     expect(discoverSlice).toContain('restorePassiveAfterNextPeerScan = false');
     expect(discoverSlice).toContain('restorePassiveListeningAfterScan(currentChannel, connectionEpoch, 0)');
+    expect(discoverSlice).toContain('}, PASSIVE_RESTORE_DELAY_MS)');
     expect(discoverSlice).toContain('manager.startListening(expectedChannel');
     expect(discoverSlice).toContain('connectionGeneration != connectionEpoch');
+    expect(dwellMatch).not.toBeNull();
+    expect(Number(dwellMatch[1].replaceAll('_', ''))).toBeGreaterThanOrEqual(10000);
+    expect(nativeSource).not.toContain('}, 3200L)');
   });
 });
