@@ -44,6 +44,7 @@ describe('Wi-Fi Direct passive presence lease', () => {
     const start = nativeSource.indexOf('private fun schedulePassivePresenceLease(');
     const end = nativeSource.indexOf('@ReactMethod\n    fun stopAdvertising', start);
     const slice = nativeSource.slice(start, end);
+    const executableSlice = slice.replace(/\/\/.*$/gm, '');
 
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
@@ -52,10 +53,10 @@ describe('Wi-Fi Direct passive presence lease', () => {
     expect(slice).toContain('generation != advertisingGeneration');
     expect(slice).toContain('currentChannel === channel');
     expect(slice).toContain('PASSIVE_PRESENCE_LEASE_REFRESH_MS');
-    expect(slice).not.toContain('startListening(');
-    expect(slice).not.toContain('discoverPeers(');
-    expect(slice).not.toContain('addLocalService(');
-    expect(slice).not.toContain('clearLocalServices(');
-    expect(slice).not.toContain('clearServiceRequests(');
+    expect(executableSlice).not.toContain('startListening(');
+    expect(executableSlice).not.toContain('discoverPeers(');
+    expect(executableSlice).not.toContain('addLocalService(');
+    expect(executableSlice).not.toContain('clearLocalServices(');
+    expect(executableSlice).not.toContain('clearServiceRequests(');
   });
 });
