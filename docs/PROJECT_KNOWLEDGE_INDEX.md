@@ -1,139 +1,131 @@
-# G1 Project Knowledge Index
+# G1 Public Project Knowledge Index
 
-Status: canonical entry point for humans and AI agents continuing G1 development.
+Status: **PUBLIC PRODUCT/ARCHITECTURE INDEX — NOT THE CANONICAL PRIVATE RESUME STATE**
 
-## 1. Source-of-truth order
-When information conflicts, use this order:
-1. Current code and automated tests on `main`.
-2. Reproducible device logs and captured evidence.
-3. This knowledge index and architecture invariants.
-4. Dated handoff/development-memory documents.
-5. Hypotheses and external analogies.
+This index describes stable public product architecture and points to historical/public engineering documents. It must not be used as the sole bootstrap source for a G1 project-authorized ChatGPT conversation.
 
-Never convert an unverified hypothesis into a fact. Never put credentials, signing passwords, private keys, tokens, device identifiers, or personal data in project memory.
+For project-authorized agents with access, policy precedence and current volatile state live in `msabz/shizuku-controller`, beginning with `G1_POLICY_REGISTRY.md` and `CURRENT_CONTINUATION.md`. Live GitHub PR/branch/HEAD/CI metadata must be queried before edits.
+
+## 1. Evidence order for public product facts
+
+Use:
+1. exact current code/tests on the branch/SHA being discussed;
+2. exact-SHA CI evidence;
+3. reproducible device evidence when available;
+4. canonical private continuation for project-authorized work;
+5. dated public/private handoffs and checkpoints;
+6. external analogies/hypotheses.
+
+Never convert an unverified hypothesis into fact. Never put credentials, signing material, tokens, private keys, raw device identifiers or personal data in public project memory.
 
 ## 2. Product definition
-G1 DirectChat is an Android-first local/direct communications application. Its core design objective is resilient peer-to-peer messaging, calls and high-speed file transfer across whatever usable local transport exists, without forcing one transport to be a prerequisite for another.
 
-The user should interact with peers and conversations, not network plumbing. Discovery, route evaluation, transport selection, upgrade, downgrade and recovery should increasingly become automatic and hidden.
+G1 DirectChat is an Android-first local/direct communications application. Its design objective is resilient peer-to-peer messaging, calls and high-speed file transfer across usable local transports without making one transport an obligatory prerequisite for another.
 
-## 3. Non-negotiable architecture invariants
-- Transport independence: LAN, Wi-Fi Direct and future transports are peers in capability, not a mandatory dependency chain.
-- Any viable layer may bootstrap a session. Bluetooth or another low layer must never become a mandatory negotiation prerequisite.
-- Prefer the best currently viable route, but availability of a preferred route must not destroy a working lower-priority route before replacement is proven healthy.
-- Control/signaling and bulk file transfer are logically separate. A file transfer failure must not silently kill signaling.
-- Transport migration is make-before-break whenever the platform permits it.
-- Peer identity is stable; IP addresses, sockets and interfaces are ephemeral route attributes and must not become identity.
-- Recovery is explicit state-machine behavior, not scattered reconnect side effects.
-- Background delivery/call behavior is a product requirement, while Android Force Stop is explicitly outside the promise because the OS suppresses app execution.
-- Security and user consent outrank convenience. Never silently weaken Android installation, permission, signing or sandbox boundaries.
+Normal users should interact with peers/conversations, not network plumbing. Discovery, route evaluation, selection, fallback, recovery and migration should progressively become hidden/automatic.
 
-## 4. Canonical documents
-Read these before substantial changes:
-- `docs/CURRENT_CONTINUATION.md` — rolling first-stop pointer to the latest verified work and exact resume step.
-- `docs/DEVELOPMENT_CHECKPOINT_2026-08-18_LIVE_LAN_PHASE5_SEAMS_COMPLETE.md` — latest dated networking checkpoint at the time of this index update.
-- `docs/DEVELOPMENT_HANDOFF_2026-08-17.md` — broad implementation handoff and known state.
-- `docs/DEVELOPMENT_HANDOFF_NETWORKING_2026-08-17.md` — networking-specific handoff.
-- `docs/G1_NETWORKING_DEVELOPMENT_MEMORY.md` — detailed networking history, evidence and decisions.
-- `docs/G1_NEXT_PHASE_PRODUCT_GOALS.md` — product roadmap.
-- `docs/G1_MESSAGING_CALLS_FEATURE_PARITY_GOALS.md` — messaging/calling parity targets.
-- `docs/G1_FUTURE_UI_UX_VISION.md` — future-facing UI direction.
-- `SECURITY_PUBLICATION_AUDIT.md` — public-repository security constraints.
-- `RESUME_AFTER_ACTIONS_RESET.md` — historical CI/recovery context; use only where still applicable.
+## 3. Stable architecture invariants
 
-Supporting operational documents added with this index:
+- Transport independence: LAN, Wi-Fi Direct and future Bluetooth are peer candidates, not a dependency chain.
+- Any viable transport may bootstrap a session.
+- `Identity != Route`; IP/MAC/deviceAddress/socket/interface data are ephemeral route metadata.
+- `Discovery != Transport != Signaling Session`.
+- `Control Plane != Data Plane`.
+- Prefer make-before-break where possible; do not destroy a healthy route before validating replacement.
+- One authoritative owner per concern.
+- `ConnectionCoordinator` owns logical connection orchestration in the current architecture direction.
+- `signaling.js` is the sole signaling/session/heartbeat owner unless a future evidence-backed migration deliberately changes that ownership.
+- File-transfer failures must not silently own/destroy signaling.
+- Recovery is bounded and explicit.
+- Background delivery/call behavior is a product requirement where Android permits it; Force Stop is a distinct OS boundary.
+- Security and user consent outrank convenience.
+
+## 4. Public document map
+
+Useful static/historical product documents include:
+- `docs/CURRENT_CONTINUATION.md` — public pointer only; not canonical volatile memory.
 - `docs/ARCHITECTURE_AND_STATE_MACHINES.md`
 - `docs/DEVELOPMENT_RUNBOOK.md`
-- `docs/RESEARCH_REFERENCES.md`
 - `docs/GOALS_AND_ACCEPTANCE_CRITERIA.md`
+- `docs/G1_NETWORKING_DEVELOPMENT_MEMORY.md`
+- `docs/G1_NEXT_PHASE_PRODUCT_GOALS.md`
+- `docs/G1_MESSAGING_CALLS_FEATURE_PARITY_GOALS.md`
+- `docs/G1_FUTURE_UI_UX_VISION.md`
+- `docs/RESEARCH_REFERENCES.md`
+- `SECURITY_PUBLICATION_AUDIT.md`
+
+Dated files such as `docs/DEVELOPMENT_HANDOFF_2026-08-17.md`, networking handoffs/checkpoints and `RESUME_AFTER_ACTIONS_RESET.md` are `HISTORICAL_REFERENCE`. Words such as `canonical`, `current`, `master` or `resume` inside those older snapshots do not make them current authority.
 
 ## 5. Logical system tree
+
 ```text
 G1
 ├── Presentation / UX
-│   ├── conversations and messages
-│   ├── calls and incoming-call surface
-│   ├── file/application sharing
-│   └── connection state shown only when useful
 ├── Application runtime
-│   ├── foreground UI runtime
-│   ├── BackgroundRuntime
-│   ├── CallRuntime
+│   ├── foreground UI
+│   ├── background/call runtime
 │   ├── persistence
 │   └── notifications
 ├── Peer/session layer
 │   ├── stable peer identity
 │   ├── peer registry
-│   ├── active logical session
 │   └── route/capability knowledge
-├── Signaling/control plane
-│   ├── handshake / identity
-│   ├── chat and call control
+├── Signaling / control plane
+│   ├── identity/handshake
+│   ├── chat/call control
 │   ├── heartbeat
-│   ├── disconnect observation
-│   └── transient recovery
+│   └── bounded recovery
 ├── Transport orchestration
 │   ├── discovery
-│   ├── candidate scoring
+│   ├── candidate evaluation
 │   ├── LAN
 │   ├── Wi-Fi Direct
-│   ├── upgrade/downgrade
-│   └── fallback/recovery
+│   └── future Bluetooth / migration
 ├── Data plane
-│   ├── file transfer
-│   ├── image/voice payloads
-│   ├── APK naming/storage
-│   └── throughput/backpressure
+│   └── files/images/voice/media payloads
 └── Android integration
-    ├── foreground/background services
-    ├── notifications / full-screen call UX where permitted
-    ├── MediaStore / URI permissions
-    ├── package installation intents
-    └── Telecom/call-log integration where platform policy permits
+    ├── lifecycle/services
+    ├── notifications/call UX
+    ├── storage/MediaStore/URI
+    └── package installation
 ```
 
-## 6. Development decision rule
-For every networking change answer, in order:
-1. What stable peer/session state is being changed?
-2. Is this control plane or data plane?
-3. Which transport(s) are candidates, and are they independent?
-4. What happens if the preferred transport appears mid-session?
-5. What happens if it disappears during signaling, call, or file transfer?
-6. Is replacement proven healthy before the old route is released?
-7. What state is persisted across foreground/background transitions?
-8. What deterministic test reproduces success, timeout, duplicate connection and recovery?
-9. What two-device Android test proves the behavior on real hardware?
+## 6. Engineering decision discipline
 
-## 7. Evidence discipline
-Classify findings as:
-- CONFIRMED: demonstrated by code, automated test, or captured device logs.
-- LIKELY: strongly supported but missing one side of evidence.
-- HYPOTHESIS: plausible explanation awaiting reproduction.
-- GOAL: intended future behavior, not implemented fact.
+For a networking change determine:
+1. which stable peer/session state changes;
+2. control plane vs data plane;
+3. transport candidate independence;
+4. ownership before/after the change;
+5. migration/fallback behavior;
+6. replacement validation before retiring a healthy route;
+7. persisted/background behavior;
+8. deterministic software tests;
+9. real-device proof only where device/OEM behavior genuinely requires it.
 
-A Samsung-only log cannot establish the internal reason a Motorola peer closed a socket. A `Broken pipe` establishes a failed write to a dead/broken socket; the remote cause requires remote evidence.
+## 7. Evidence vocabulary
 
-## 8. Current CI baseline
-The public clean-history repository uses GitHub-hosted Actions as the canonical build/test environment. Local Android building on the user's phone is not part of the development workflow. JavaScript tests and Android validation must remain green before device testing is treated as a candidate release.
+- `CONFIRMED` — demonstrated by exact code/test/device evidence.
+- `LIKELY` — strongly supported but missing decisive evidence.
+- `HYPOTHESIS` — plausible and awaiting proof.
+- `GOAL` — intended future behavior.
+- `NOT VERIFIED` — explicitly unproven.
 
-For the exact newest continuation state and CI references, read `docs/CURRENT_CONTINUATION.md` and the dated checkpoint it names before relying on the historical baseline below.
+CI success is not physical-device success.
 
-### Current verified public baseline — 2026-08-18
-- Repository: `msabz/-G1-public`, branch `main`.
-- The public clean-history snapshot was force-published to `main` after confirming the obsolete release password string was absent from the cloned public history.
-- The first public CI run reached JavaScript validation but failed because `__tests__/backgroundRuntime.test.js` imported `react-native` through `CallRuntime`, causing Jest to parse React Native's Flow/ES-module syntax from `node_modules`. This was a test/configuration integration failure, not evidence that the signaling tests were failing; the other reported suites passed.
-- That Jest/background-runtime issue was subsequently corrected and the next observed GitHub Actions run completed green.
-- Therefore the post-fix public `main` state reached a verified green CI checkpoint. Do not use the older Actions-minutes exhaustion note in `RESUME_AFTER_ACTIONS_RESET.md` to claim that the public repository is currently blocked or that its current HEAD is unvalidated.
-- This checkpoint does not imply that every future commit is green. For any later HEAD, inspect its own Actions result before calling it validated.
+## 8. CI and current state
 
-When a newer reproducible CI result exists, it supersedes this dated checkpoint.
+GitHub Actions is the canonical hosted build/test environment for the public product repository where applicable. Never assume a remembered/embedded old CI result applies to a new HEAD.
+
+This index deliberately contains no `current HEAD`, run number or artifact. Query the live active branch/PR and its exact-SHA workflow results.
 
 ## 9. Definition of done
-A change is not done merely because it compiles. It is done when:
-- relevant automated tests pass;
-- CI is green;
-- no secret/security regression is introduced;
-- state-machine behavior is deterministic;
-- failure and recovery paths are tested;
-- for transport/background/call/file changes, a real two-device test plan exists and the result is recorded;
-- durable architectural changes are reflected in project memory.
+
+A product change is not done merely because it compiles. Applicable completion requires:
+- relevant tests;
+- exact-SHA CI;
+- security/privacy preserved;
+- deterministic ownership/state behavior;
+- failure/recovery coverage;
+- device evidence where the mission requires real Android/OEM proof;
+- canonical durable project memory updated by project-authorized work.
