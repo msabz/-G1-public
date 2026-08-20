@@ -160,7 +160,7 @@ export default function ContactsScreen({
         ) : (
           discovered.map((d, index) => {
             const dName = d.deviceName || d.name || d.deviceAddress || 'جهاز مجاور';
-            const isConfirmed = !!d.isMusab || !!d.available;
+            const isConfirmed = d.isMusab === true;
             return (
               <TouchableOpacity
                 key={d.deviceAddress || index}
@@ -171,7 +171,7 @@ export default function ContactsScreen({
                 <View style={styles.peerInfo}>
                   <Text style={[styles.peerName, { color: theme.text }]}>{dName}</Text>
                   <Text style={[styles.peerStatus, { color: isConfirmed ? theme.accent : theme.textMuted }]}>
-                    {isConfirmed ? '✓ DirectChat متاح للاتصال' : 'جهاز متاح للمحاولة'}
+                    {isConfirmed ? '✓ DirectChat مؤكد' : 'جهاز Wi-Fi Direct قريب — غير مؤكد كـ DirectChat'}
                   </Text>
                 </View>
                 <Button
