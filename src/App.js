@@ -334,43 +334,52 @@ export default function App() {
 
   useEffect(() => {
     mountedRef.current = true;
-    requestPerms().then(async granted => {
-      if (granted) {
-        try {
-          await DirectConnection.initialize();
-          // يزيل بقايا جلسة من v31 فور فتح النسخة الجديدة على الهاتفين،
-          // قبل الإعلان أو البحث. هذا مهم لأول تشغيل بعد الترقية تحديداً.
-          const startupCleanup = await DirectConnection.cleanupConnection(8000);
-          await DirectConnection.unbindNetwork().catch(() => false);
-          await delay(350);
-          if (startupCleanup?.clean !== true) {
-            if (mountedRef.current) {
-              const nativeReason = startupCleanup?.lastFailureCode != null
-                ? ` الرمز ${startupCleanup.lastFailureCode} (${startupCleanup.lastFailureName || 'UNKNOWN'}).`
-                : '';
-              stateRef.current = States.ERROR;
-              setState(States.ERROR);
-              setStatusText(`وجد Android مجموعة Wi-Fi Direct قديمة ولم ينهِ تنظيفها بعد.${nativeReason} اضغط تحديث للمحاولة مجدداً.`);
-            }
-            return;
-          }
+    requestWifiDirectPerms().then(async granted => {
+      if (!granted) {
+        if (mountedRef.current) {
+          setStatusText('اسمح لـ G1 بالوصول إلى الأجهزة القريبة لتفعيل Wi-Fi Direct.');
+        }
+        return;
+      }
 
-          // نعلن عن أنفسنا طول ما التطبيق مفتوح — عشان يلاقونا الآخرون فوراً
-          const id = await getDeviceIdentity();
-          identityRef.current = id;
-          await DirectConnection.startAdvertising(
-            id?.deviceName || 'Musabchat',
-            id?.deviceId || ''
-          );
-          // بعد التنظيف يكون إطار Samsung خارج وضع الاستماع. الإعلان وحده
-          // لا يكفي لاستقبال دعوة اتصال ثانية، لذلك نعيد LISTEN صراحةً.
-          await DirectConnection.startPassiveListening().catch(() => false);
-        } catch (e) {
+      try {
+        await DirectConnection.initialize();
+        // يزيل بقايا جلسة من v31 فور فتح النسخة الجديدة على الهاتفين،
+        // قبل الإعلان أو البحث. هذا مهم لأول تشغيل بعد الترقية تحديداً.
+        const startupCleanup = await DirectConnection.cleanupConnection(8000);
+        await DirectConnection.unbindNetwork().catch(() => false);
+        await delay(350);
+        if (startupCleanup?.clean !== true) {
           if (mountedRef.current) {
-            setStatusText(`تعذّر تهيئة Wi-Fi Direct: ${e?.message || 'خطأ غير معروف'}`);
+            const nativeReason = startupCleanup?.lastFailureCode != null
+              ? ` الرمز ${startupCleanup.lastFailureCode} (${startupCleanup.lastFailureName || 'UNKNOWN'}).`
+              : '';
+            stateRef.current = States.ERROR;
+            setState(States.ERROR);
+            setStatusText(`وجد Android مجموعة Wi-Fi Direct قديمة ولم ينهِ تنظيفها بعد.${nativeReason} اضغط تحديث للمحاولة مجدداً.`);
           }
+          return;
+        }
+
+        // نعلن عن أنفسنا طول ما التطبيق مفتوح — عشان يلاقونا الآخرون فوراً
+        const id = await getDeviceIdentity();
+        identityRef.current = id;
+        await DirectConnection.startAdvertising(
+          id?.deviceName || 'Musabchat',
+          id?.deviceId || ''
+        );
+        // بعد التنظيف يكون إطار Samsung خارج وضع الاستماع. الإعلان وحده
+        // لا يكفي لاستقبال دعوة اتصال ثانية، لذلك نعيد LISTEN صراحةً.
+        await DirectConnection.startPassiveListening().catch(() => false);
+      } catch (e) {
+        if (mountedRef.current) {
+          setStatusText(`تعذّر تهيئة Wi-Fi Direct: ${e?.message || 'خطأ غير معروف'}`);
         }
       }
+    }).finally(() => {
+      // حافظ على طلبات الوسائط/البلوتوث القديمة، لكن نتيجتها لا تملك قرار
+      // تشغيل Wi-Fi Direct. رفض الكاميرا أو الميكروفون لا يجعل P2P يختفي.
+      requestPerms().catch(() => false);
     });
 
     setOnMessage(async (msg) => {
@@ -796,6 +805,19 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  async function requestWifiDirectPerms() {
+    const permission = Platform.Version >= 33
+      ? PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES
+      : PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION;
+    try {
+      if (await PermissionsAndroid.check(permission)) return true;
+      const result = await PermissionsAndroid.request(permission);
+      return result === PermissionsAndroid.RESULTS.GRANTED;
+    } catch (e) {
+      return false;
+    }
+  }
+
   async function requestPerms() {
     const perms = [
       PermissionsAndroid.PERMISSIONS.CAMERA,
@@ -819,7 +841,7 @@ export default function App() {
   };
 
   const start = async () => {
-    if (!(await requestPerms())) { Alert.alert('الأذونات مطلوبة للاتصال'); return; }
+    if (!(await requestWifiDirectPerms())) { Alert.alert('إذن الأجهزة القريبة مطلوب للاتصال عبر Wi-Fi Direct'); return; }
     const locOn = await DirectConnection.isLocationEnabled().catch(() => true);
     if (!locOn) {
       Alert.alert('يجب تفعيل خدمة الموقع', 'اكتشاف Wi-Fi Direct يحتاج خدمة الموقع مفعّلة بالنظام.', [
@@ -1475,6 +1497,11 @@ export default function App() {
     if (scanPromiseRef.current) return scanPromiseRef.current;
 
     const task = (async () => {
+      const wifiPermissionGranted = await requestWifiDirectPerms();
+      if (!wifiPermissionGranted) {
+        throw new Error('إذن الأجهزة القريبة مطلوب لاستخدام Wi-Fi Direct');
+      }
+
       scanningRef.current = true;
       if (mountedRef.current) {
         setScanning(true);
