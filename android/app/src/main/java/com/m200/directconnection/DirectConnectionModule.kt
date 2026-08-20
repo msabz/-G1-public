@@ -50,6 +50,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     private var advertisingGeneration = 0
     private var serviceDiscoveryGeneration = 0
     private var connectionGeneration = 0L
+    private var restorePassiveAfterNextPeerScan = false
 
     @ReactMethod
     fun startAdvertising(deviceLabel: String, deviceId: String, promise: Promise) {
@@ -57,56 +58,115 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             if (channel == null && !ensureChannel()) {
                 promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return
             }
-            val manager = wifiP2pManager ?: run { promise.reject("ERROR", "غير متاح"); return }
-            val currentChannel = channel ?: run { promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return }
+            if (advertising && serviceInfo != null) {
+                promise.resolve(true)
+                return
+            }
             val generation = ++advertisingGeneration
+            startAdvertisingWithRetry(deviceLabel, deviceId, promise, generation, 0, false)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
+    }
 
-            val record = mapOf(
-                "app" to "musabchat",
-                "name" to deviceLabel,
-                "id" to deviceId,
-                "ver" to "1"
-            )
-            val info = WifiP2pDnsSdServiceInfo.newInstance(SERVICE_NAME, SERVICE_TYPE, record)
-            serviceInfo = info
+    private fun startAdvertisingWithRetry(
+        deviceLabel: String,
+        deviceId: String,
+        promise: Promise,
+        generation: Int,
+        attempt: Int,
+        channelReset: Boolean
+    ) {
+        if (generation != advertisingGeneration) {
+            promise.resolve(false)
+            return
+        }
+        val manager = wifiP2pManager ?: run { promise.reject("ERROR", "غير متاح"); return }
+        val currentChannel = channel ?: run { promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return }
+        val record = mapOf(
+            "app" to "musabchat",
+            "name" to deviceLabel,
+            "id" to deviceId,
+            "ver" to "1"
+        )
+        val info = WifiP2pDnsSdServiceInfo.newInstance(SERVICE_NAME, SERVICE_TYPE, record)
 
-            manager.clearLocalServices(currentChannel, object : ActionListener {
+        try {
+            manager.addLocalService(currentChannel, info, object : ActionListener {
                 override fun onSuccess() {
-                    if (generation != advertisingGeneration) {
+                    if (generation != advertisingGeneration || currentChannel !== channel) {
+                        try { manager.removeLocalService(currentChannel, info, null) } catch (_: Exception) {}
                         promise.resolve(false)
                         return
                     }
-                    manager.addLocalService(currentChannel, info, object : ActionListener {
-                        override fun onSuccess() {
-                            if (generation == advertisingGeneration) advertising = true
-                            promise.resolve(generation == advertisingGeneration)
-                        }
-
-                        override fun onFailure(reason: Int) {
-                            advertising = false
-                            promise.resolve(false)
-                        }
-                    })
+                    serviceInfo = info
+                    advertising = true
+                    promise.resolve(true)
                 }
 
                 override fun onFailure(reason: Int) {
-                    advertising = false
-                    promise.resolve(false)
+                    if (generation != advertisingGeneration) {
+                        promise.resolve(false)
+                    } else if (reason == BUSY && attempt < 4) {
+                        mainHandler.postDelayed({
+                            startAdvertisingWithRetry(
+                                deviceLabel, deviceId, promise, generation, attempt + 1, channelReset
+                            )
+                        }, 700L * (attempt + 1))
+                    } else if (reason == BUSY && !channelReset && recreateChannel()) {
+                        mainHandler.postDelayed({
+                            startAdvertisingWithRetry(
+                                deviceLabel, deviceId, promise, generation, 0, true
+                            )
+                        }, 900L)
+                    } else {
+                        advertising = false
+                        promise.resolve(false)
+                    }
                 }
             })
         } catch (e: Exception) {
-            promise.reject("ERROR", e.message)
+            if (generation != advertisingGeneration) {
+                promise.resolve(false)
+            } else if (!channelReset && recreateChannel()) {
+                mainHandler.postDelayed({
+                    startAdvertisingWithRetry(deviceLabel, deviceId, promise, generation, 0, true)
+                }, 900L)
+            } else {
+                promise.reject("ERROR", e.message)
+            }
         }
     }
 
     @ReactMethod
     fun stopAdvertising(promise: Promise) {
         try {
-            advertisingGeneration++
-            wifiP2pManager?.clearLocalServices(channel, object : ActionListener {
-                override fun onSuccess() { advertising = false; promise.resolve(true) }
+            val generation = ++advertisingGeneration
+            val info = serviceInfo
+            if (info == null) {
+                advertising = false
+                promise.resolve(true)
+                return
+            }
+            val manager = wifiP2pManager
+            val currentChannel = channel
+            if (manager == null || currentChannel == null) {
+                serviceInfo = null
+                advertising = false
+                promise.resolve(true)
+                return
+            }
+            manager.removeLocalService(currentChannel, info, object : ActionListener {
+                override fun onSuccess() {
+                    if (generation == advertisingGeneration && serviceInfo === info) {
+                        serviceInfo = null
+                        advertising = false
+                    }
+                    promise.resolve(true)
+                }
+
                 override fun onFailure(reason: Int) { promise.resolve(false) }
-            }) ?: promise.resolve(false)
+            })
         } catch (e: Exception) {
             promise.resolve(false)
         }
@@ -117,6 +177,10 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         try {
             if (channel == null && !ensureChannel()) {
                 promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return
+            }
+            if (serviceRequest != null) {
+                promise.reject("ERROR", "Service discovery request already active")
+                return
             }
             val generation = ++serviceDiscoveryGeneration
             discoverMusabPeersWithRetry(promise, generation, 0, false)
@@ -155,10 +219,6 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     discoverMusabPeersWithRetry(promise, generation, attempt + 1, channelReset)
                 }, 700L * (attempt + 1))
             } else if (reason == BUSY && !channelReset && recreateChannel()) {
-                // Samsung can keep DNS-SD operations BUSY on a stale Channel even
-                // after group cleanup. Recreate the Channel once, then replay the
-                // whole bounded DNS-SD sequence so listeners and requests belong
-                // to the new Channel.
                 mainHandler.postDelayed({
                     discoverMusabPeersWithRetry(promise, generation, 0, true)
                 }, 900L)
@@ -195,36 +255,47 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             )
 
             val request = WifiP2pDnsSdServiceRequest.newInstance(SERVICE_NAME, SERVICE_TYPE)
-            serviceRequest = request
-
-            manager.clearServiceRequests(currentChannel, object : ActionListener {
+            manager.addServiceRequest(currentChannel, request, object : ActionListener {
                 override fun onSuccess() {
-                    if (generation != serviceDiscoveryGeneration) {
+                    if (generation != serviceDiscoveryGeneration || currentChannel !== channel) {
+                        try { manager.removeServiceRequest(currentChannel, request, null) } catch (_: Exception) {}
                         promise.resolve(false)
                         return
                     }
-                    manager.addServiceRequest(currentChannel, request, object : ActionListener {
+                    serviceRequest = request
+                    manager.discoverServices(currentChannel, object : ActionListener {
                         override fun onSuccess() {
-                            if (generation != serviceDiscoveryGeneration) {
-                                promise.resolve(false)
-                                return
-                            }
-                            manager.discoverServices(currentChannel, object : ActionListener {
-                                override fun onSuccess() {
-                                    promise.resolve(generation == serviceDiscoveryGeneration)
-                                }
-                                override fun onFailure(reason: Int) {
-                                    failOrRetry("Service discovery", reason)
-                                }
-                            })
+                            promise.resolve(generation == serviceDiscoveryGeneration)
                         }
+
                         override fun onFailure(reason: Int) {
-                            failOrRetry("Service request", reason)
+                            removeOwnedServiceRequestBeforeRetry(
+                                manager,
+                                currentChannel,
+                                request,
+                                generation,
+                                channelReset,
+                                reason,
+                                onRemoved = { failOrRetry("Service discovery", reason) },
+                                onChannelReset = {
+                                    mainHandler.postDelayed({
+                                        discoverMusabPeersWithRetry(promise, generation, 0, true)
+                                    }, 900L)
+                                },
+                                onRemoveFailure = {
+                                    promise.reject(
+                                        "ERROR",
+                                        "Service discovery failed: $reason (${reasonName(reason)})"
+                                    )
+                                }
+                            )
                         }
                     })
                 }
+
                 override fun onFailure(reason: Int) {
-                    failOrRetry("Clear service requests", reason)
+                    if (serviceRequest === request) serviceRequest = null
+                    failOrRetry("Service request", reason)
                 }
             })
         } catch (e: Exception) {
@@ -240,15 +311,69 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         }
     }
 
+    private fun removeOwnedServiceRequestBeforeRetry(
+        manager: WifiP2pManager,
+        operationChannel: Channel,
+        request: WifiP2pDnsSdServiceRequest,
+        generation: Int,
+        channelReset: Boolean,
+        originalReason: Int,
+        onRemoved: () -> Unit,
+        onChannelReset: () -> Unit,
+        onRemoveFailure: () -> Unit
+    ) {
+        if (generation != serviceDiscoveryGeneration || serviceRequest !== request) {
+            onRemoved()
+            return
+        }
+        try {
+            manager.removeServiceRequest(operationChannel, request, object : ActionListener {
+                override fun onSuccess() {
+                    if (serviceRequest === request) serviceRequest = null
+                    onRemoved()
+                }
+
+                override fun onFailure(reason: Int) {
+                    if (originalReason == BUSY && !channelReset && recreateChannel()) {
+                        onChannelReset()
+                    } else {
+                        onRemoveFailure()
+                    }
+                }
+            })
+        } catch (_: Exception) {
+            if (originalReason == BUSY && !channelReset && recreateChannel()) {
+                onChannelReset()
+            } else {
+                onRemoveFailure()
+            }
+        }
+    }
+
     @ReactMethod
     fun stopServiceDiscovery(promise: Promise) {
         try {
             serviceDiscoveryGeneration++
-            serviceRequest = null
-            wifiP2pManager?.clearServiceRequests(channel, object : ActionListener {
-                override fun onSuccess() { promise.resolve(true) }
+            restorePassiveAfterNextPeerScan = true
+            val request = serviceRequest
+            if (request == null) {
+                promise.resolve(true)
+                return
+            }
+            val manager = wifiP2pManager
+            val currentChannel = channel
+            if (manager == null || currentChannel == null) {
+                serviceRequest = null
+                promise.resolve(true)
+                return
+            }
+            manager.removeServiceRequest(currentChannel, request, object : ActionListener {
+                override fun onSuccess() {
+                    if (serviceRequest === request) serviceRequest = null
+                    promise.resolve(true)
+                }
                 override fun onFailure(reason: Int) { promise.resolve(false) }
-            }) ?: promise.resolve(false)
+            })
         } catch (e: Exception) {
             promise.resolve(false)
         }
@@ -264,10 +389,18 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         return channel != null
     }
 
+    private fun resetChannelScopedServiceState() {
+        serviceInfo = null
+        serviceRequest = null
+        advertising = false
+        restorePassiveAfterNextPeerScan = false
+    }
+
     private fun recreateChannel(): Boolean {
         val manager = wifiP2pManager ?: return false
         val previousChannel = channel
         channel = null
+        resetChannelScopedServiceState()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             try { previousChannel?.close() } catch (_: Exception) {}
         }
@@ -390,7 +523,9 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun discoverPeers(promise: Promise) {
-        startDiscoveryWithRetry(promise, 0)
+        val restorePassive = restorePassiveAfterNextPeerScan
+        restorePassiveAfterNextPeerScan = false
+        startDiscoveryWithRetry(promise, 0, restorePassive, connectionGeneration)
     }
 
     @ReactMethod
@@ -425,9 +560,6 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                             startPassiveListeningWithRetry(promise, attempt + 1, channelReset)
                         }, 700L * (attempt + 1))
                     } else if (reason == BUSY && !channelReset && recreateChannel()) {
-                        // بعض أجهزة Samsung تبقى BUSY حتى بعد انتهاء المجموعة على
-                        // الـChannel القديم. بدل إجبار المستخدم على المحاولة الثانية،
-                        // نعيد إنشاء القناة مرة واحدة ثم نعيد LISTEN تلقائياً.
                         mainHandler.postDelayed({
                             startPassiveListeningWithRetry(promise, 0, true)
                         }, 900L)
@@ -451,17 +583,60 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         }
     }
 
-    private fun startDiscoveryWithRetry(promise: Promise, attempt: Int) {
-        wifiP2pManager?.discoverPeers(channel, object : ActionListener {
-            override fun onSuccess() { promise.resolve("Discovery started") }
+    private fun startDiscoveryWithRetry(
+        promise: Promise,
+        attempt: Int,
+        restorePassive: Boolean,
+        connectionEpoch: Long
+    ) {
+        val manager = wifiP2pManager
+        val currentChannel = channel
+        if (manager == null || currentChannel == null) {
+            promise.reject("ERROR", "Wi-Fi Direct not initialized")
+            return
+        }
+        manager.discoverPeers(currentChannel, object : ActionListener {
+            override fun onSuccess() {
+                if (restorePassive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    mainHandler.postDelayed({
+                        restorePassiveListeningAfterScan(currentChannel, connectionEpoch, 0)
+                    }, 3200L)
+                }
+                promise.resolve("Discovery started")
+            }
             override fun onFailure(reason: Int) {
-                if (reason == 2 && attempt < 4) {
-                    mainHandler.postDelayed({ startDiscoveryWithRetry(promise, attempt + 1) }, 700L * (attempt + 1))
+                if (reason == BUSY && attempt < 4) {
+                    mainHandler.postDelayed({
+                        startDiscoveryWithRetry(promise, attempt + 1, restorePassive, connectionEpoch)
+                    }, 700L * (attempt + 1))
                 } else {
                     promise.reject("ERROR", "Discovery failed: $reason (${reasonName(reason)})")
                 }
             }
-        }) ?: promise.reject("ERROR", "Wi-Fi Direct not initialized")
+        })
+    }
+
+    private fun restorePassiveListeningAfterScan(
+        expectedChannel: Channel,
+        connectionEpoch: Long,
+        attempt: Int
+    ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (channel !== expectedChannel || connectionGeneration != connectionEpoch) return
+        val manager = wifiP2pManager ?: return
+        try {
+            manager.startListening(expectedChannel, object : ActionListener {
+                override fun onSuccess() { emitCurrentPeers() }
+                override fun onFailure(reason: Int) {
+                    if (reason == BUSY && attempt < 4 &&
+                        channel === expectedChannel && connectionGeneration == connectionEpoch) {
+                        mainHandler.postDelayed({
+                            restorePassiveListeningAfterScan(expectedChannel, connectionEpoch, attempt + 1)
+                        }, 700L * (attempt + 1))
+                    }
+                }
+            })
+        } catch (_: Exception) {}
     }
 
     @ReactMethod
@@ -489,6 +664,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun createGroup(promise: Promise) {
+        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
         wifiP2pManager?.createGroup(channel, object : ActionListener {
             override fun onSuccess() { promise.resolve("Group creation started") }
@@ -498,6 +674,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun connectToPeer(deviceAddress: String, promise: Promise) {
+        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
         val config = WifiP2pConfig().apply { this.deviceAddress = deviceAddress }
         wifiP2pManager?.connect(channel, config, object : ActionListener {
@@ -508,6 +685,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun cancelConnect(promise: Promise) {
+        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
         try {
             wifiP2pManager?.cancelConnect(channel, object : ActionListener {
@@ -521,6 +699,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun disconnect(promise: Promise) {
+        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
         wifiP2pManager?.removeGroup(channel, object : ActionListener {
             override fun onSuccess() { promise.resolve("Disconnected") }
@@ -530,6 +709,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun cleanupConnection(timeoutMs: Double, promise: Promise) {
+        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
         if (!ensureChannel()) {
             promise.reject("ERROR", "Wi-Fi Direct not initialized")
@@ -619,12 +799,8 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             if (settled) return
             try {
                 manager.cancelConnect(operationChannel, object : ActionListener {
-                    override fun onSuccess() {
-                        mainHandler.postDelayed({ pollGroup() }, 300L)
-                    }
-                    override fun onFailure(reason: Int) {
-                        mainHandler.postDelayed({ pollGroup() }, 300L)
-                    }
+                    override fun onSuccess() { mainHandler.postDelayed({ pollGroup() }, 300L) }
+                    override fun onFailure(reason: Int) { mainHandler.postDelayed({ pollGroup() }, 300L) }
                 })
             } catch (_: Exception) {
                 pollGroup()
@@ -636,9 +812,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             if (!settled) {
                 try {
                     manager.clearServiceRequests(operationChannel, object : ActionListener {
-                        override fun onSuccess() {
-                            mainHandler.postDelayed({ cancelThenPoll() }, 250L)
-                        }
+                        override fun onSuccess() { mainHandler.postDelayed({ cancelThenPoll() }, 250L) }
                         override fun onFailure(reason: Int) {
                             lastFailure = reason
                             if (reason == BUSY && attempt < 4 && withinDeadline()) {
@@ -681,10 +855,6 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             }
         }
 
-        // Do not launch these operations in parallel. On Samsung, DNS-SD can
-        // remain BUSY when clearServiceRequests races stopPeerDiscovery even if
-        // the group is already gone. Wait for each ActionListener before moving
-        // to the next stage, then verify group removal and recreate the Channel.
         stopDiscoveryThenClear(0)
     }
 
