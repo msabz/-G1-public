@@ -1065,6 +1065,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
                     WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
                         val eventEpoch = connectionGeneration
+                        val connectionWasInProgress = connectionInProgress
                         val manager = wifiP2pManager ?: return
                         val currentChannel = channel ?: return
                         manager.requestConnectionInfo(currentChannel) { info ->
@@ -1072,11 +1073,17 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                                 return@requestConnectionInfo
                             }
                             groupActive = info.groupFormed
-                            connectionInProgress = false
                             if (info.groupFormed) {
+                                connectionInProgress = false
                                 val ip = info.groupOwnerAddress?.hostAddress
                                 if (info.isGroupOwner || ip != null) emitPeerConnected(info, ip, eventEpoch)
+                            } else if (connectionWasInProgress) {
+                                // A stale groupFormed=false broadcast from the previous cleanup can
+                                // arrive after a new connect() has started. Keep the attempt protected;
+                                // the JS timeout/native watchdog remains the bounded failure authority.
+                                emitCurrentPeers()
                             } else {
+                                connectionInProgress = false
                                 connectionGeneration++
                                 emitCurrentPeers()
                                 sendEvent("PEER_DISCONNECTED", Arguments.createMap())
