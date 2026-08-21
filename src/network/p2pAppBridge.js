@@ -25,14 +25,26 @@ function currentRouteValues(contact = {}, discoveredPeer = {}) {
 export function resolveStableP2pIdentity(contact = {}, discoveredPeer = {}) {
   const routeValues = currentRouteValues(contact, discoveredPeer);
 
-  // A DNS-SD TXT observation is the strongest discovery-time candidate, but
-  // it remains only DISCOVERY_ASSERTED until a session proof authenticates it.
+  // A DNS-SD TXT observation is only a discovery-time identity claim. It may
+  // supply a usable expected device identity, but it never proves ownership.
   const discoveredIdentity = discoveryIdentityFromPeer(discoveredPeer, routeValues);
   if (discoveredIdentity) return discoveredIdentity;
 
-  // Persisted IDs are allowed to route a known conversation/device. They are
-  // never reconstructed from a P2P MAC/IP and do not become SESSION_PROVEN by
-  // virtue of being saved locally.
+  // If DNS-SD explicitly made an identity claim and that claim was rejected
+  // because it is missing/route-derived, fail closed for this observation.
+  // A saved contact is ExpectedIdentity, not permission to replace a bad
+  // current claim and report it as though the route's identity were resolved.
+  const discoveryClaim = firstText(discoveredPeer.peerId, discoveredPeer.deviceId);
+  const hasDnsSdIdentityClaim = !!discoveryClaim && (
+    discoveredPeer.identitySource === IDENTITY_SOURCE.DNS_SD_TXT ||
+    (discoveredPeer.isMusab === true && !discoveredPeer.identitySource)
+  );
+  if (hasDnsSdIdentityClaim) return null;
+
+  // A persisted logical device ID remains useful as an *expected* target for a
+  // known contact when discovery did not assert a conflicting identity. It is
+  // not current-session proof and must eventually be checked by the identity
+  // authenticator after a provisional route/signaling channel is established.
   const persistedDeviceId = firstText(contact.deviceId, contact.peerId);
   if (isStableIdentityValue(persistedDeviceId, routeValues)) {
     return buildAdditivePeerIdentity({
@@ -83,7 +95,7 @@ export function buildCoordinatorP2pPeer({
   );
 
   if (!deviceId) {
-    throw new Error('تعذّر إثبات هوية G1 الثابتة لجهاز Wi-Fi Direct');
+    throw new Error('تعذّر تحديد هوية G1 الثابتة المتوقعة لجهاز Wi-Fi Direct');
   }
   if (!deviceAddress) {
     throw new Error('عنوان Wi-Fi Direct الحالي غير متاح');

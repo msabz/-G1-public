@@ -9,6 +9,7 @@ import { Badge } from './common/Badge';
 import { Button } from './common/Button';
 import { NearbyPeersList } from './discovery/NearbyPeersList';
 import { DeveloperDiagnosticsModal } from './discovery/DeveloperDiagnosticsModal';
+import G1IdentityModal from './G1IdentityModal';
 
 const P2P_PEER_DISPLAY_GRACE_MS = 6000;
 
@@ -50,6 +51,7 @@ export default function ContactsScreen({
   const { theme, isDark, setThemeMode, mode } = useAppTheme();
   const [activeTab, setActiveTab] = useState('chats'); // 'chats', 'discovery', 'calls'
   const [lanModalVisible, setLanModalVisible] = useState(false);
+  const [g1IdentityVisible, setG1IdentityVisible] = useState(false);
   const [addPeerOpen, setAddPeerOpen] = useState(false);
   const [visibleDiscovered, setVisibleDiscovered] = useState(discovered);
   const visibleDiscoveredRef = useRef({});
@@ -229,7 +231,7 @@ export default function ContactsScreen({
       />
 
       {/* Wi-Fi Direct Nearby Peers */}
-      <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.border, marginTop: 14 }]}>
+      <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.border, marginTop: 14 }]}> 
         <View style={styles.sectionHeaderRow}>
           <Text style={[styles.sectionTitle, { color: theme.primary }]}>📶 أجهزة Wi-Fi Direct المجاورة (P2P)</Text>
           {scanning && <ActivityIndicator size="small" color={theme.accent} />}
@@ -237,7 +239,7 @@ export default function ContactsScreen({
 
         {visibleDiscovered.length === 0 ? (
           <View style={styles.emptyBox}>
-            <Text style={[styles.emptyText, { color: theme.textMuted }]}>
+            <Text style={[styles.emptyText, { color: theme.textMuted }]}> 
               {scanning ? 'جاري البحث عن أجهزة قريبة...' : 'لم يتم العثور على أجهزة بعد. اضغط "بحث جديد" بالأسفل.'}
             </Text>
           </View>
@@ -303,7 +305,7 @@ export default function ContactsScreen({
 
       {/* Bluetooth Fallback Devices */}
       {btDevices && btDevices.length > 0 && (
-        <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.border, marginTop: 14 }]}>
+        <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.border, marginTop: 14 }]}> 
           <Text style={[styles.sectionTitle, { color: theme.primary }]}>ᛒ أجهزة بلوتوث المقترنة</Text>
           {btDevices.map((bt, i) => (
             <TouchableOpacity
@@ -329,21 +331,24 @@ export default function ContactsScreen({
     <View style={[styles.tabContent, styles.centerEmpty]}>
       <Text style={{ fontSize: 48, marginBottom: 12 }}>📞</Text>
       <Text style={[styles.emptyTitle, { color: theme.text }]}>سجل المكالمات المباشرة</Text>
-      <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}>
+      <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}> 
         يمكنك إجراء مكالمات صوت وفيديو مشفرة P2P عبر Wi-Fi Direct أو نفس شبكة الواي فاي LAN.
       </Text>
     </View>
   );
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}> 
       <StatusBar barStyle={theme.statusBar} backgroundColor={theme.primaryDark} />
 
       {/* DirectChat Top Header */}
-      <View style={[styles.header, { backgroundColor: theme.primary }]}>
+      <View style={[styles.header, { backgroundColor: theme.primary }]}> 
         <View style={styles.headerTop}>
           <Text style={styles.appTitle}>DirectChat</Text>
           <View style={styles.headerIcons}>
+            <TouchableOpacity onPress={() => setG1IdentityVisible(true)} style={styles.iconBtn}>
+              <Text style={styles.headerIconText}>🪪</Text>
+            </TouchableOpacity>
             <TouchableOpacity onPress={() => setLanModalVisible(true)} style={styles.iconBtn}>
               <Text style={styles.headerIconText}>🌐</Text>
             </TouchableOpacity>
@@ -397,7 +402,7 @@ export default function ContactsScreen({
           <View style={[styles.tabContent, styles.centerEmpty]}>
             <Text style={{ fontSize: 44, marginBottom: 12 }}>💬</Text>
             <Text style={[styles.emptyTitle, { color: theme.text }]}>لا توجد محادثات نشطة</Text>
-            <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}>
+            <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}> 
               انتقل لتبويب "الأجهزة والشبكة" أو اضغط على زر الواي فاي بالأسفل للاتصال بجهاز قريب.
             </Text>
             <Button
@@ -444,6 +449,11 @@ export default function ContactsScreen({
           <Text style={{ fontSize: 24, color: '#FFFFFF' }}>🔍</Text>
         </TouchableOpacity>
       </View>
+
+      <G1IdentityModal
+        visible={g1IdentityVisible}
+        onClose={() => setG1IdentityVisible(false)}
+      />
 
       {/* Developer Diagnostics Modal */}
       <DeveloperDiagnosticsModal

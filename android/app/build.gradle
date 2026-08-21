@@ -100,6 +100,13 @@ android {
 dependencies {
     implementation("com.facebook.react:react-android")
     implementation("androidx.core:core-ktx:1.13.1")
+
+    // JourneyApps 4.3.0 is used only for local QR rendering/scanning. G1 keeps
+    // minSdk 23, so pin ZXing core 3.3.0 as recommended by the library for
+    // Android API levels below 24 rather than silently raising the app minimum.
+    implementation('com.journeyapps:zxing-android-embedded:4.3.0') { transitive = false }
+    implementation('com.google.zxing:core:3.3.0')
+
     testImplementation("junit:junit:4.13.2")
 
     if (hermesEnabled.toBoolean()) {
