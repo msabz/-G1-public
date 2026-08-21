@@ -11,8 +11,19 @@ export const TRANSPORTS = {
   BLUETOOTH: 'BLUETOOTH',
 };
 
+const IDENTITY_TRUST_RANK = {
+  UNVERIFIED: 0,
+  DISCOVERY_ASSERTED: 1,
+  SESSION_PROVEN: 2,
+  PINNED: 3,
+};
+
 function now() {
   return Date.now();
+}
+
+function identityTrustRank(value) {
+  return IDENTITY_TRUST_RANK[value] ?? 0;
 }
 
 export class PeerRegistry {
@@ -58,6 +69,12 @@ export class PeerRegistry {
       transports: {},
       lastSeen: now(),
       connectedTransport: null,
+      userId: null,
+      g1Number: null,
+      keyFingerprint: null,
+      identityTrust: 'UNVERIFIED',
+      identitySource: null,
+      identityDisplayName: null,
     };
   }
 
@@ -211,6 +228,61 @@ export class PeerRegistry {
     } else if (!isOnline && existing.status !== PEER_STATUS.CONNECTED) {
       this._refreshPeerStatus(existing);
     }
+
+    this.peers.set(deviceId, existing);
+    this._notify();
+    return existing;
+  }
+
+  /**
+   * Adds cryptographic identity evidence without changing any route. Trust is
+   * monotonic in-memory: a DNS-SD/persisted claim can never overwrite a
+   * SESSION_PROVEN or PINNED identity for the same logical device.
+   */
+  upsertPeerIdentity(identity = {}) {
+    const deviceId = typeof identity.deviceId === 'string' ? identity.deviceId.trim() : '';
+    if (!deviceId || (this.myDeviceId && deviceId === this.myDeviceId)) return null;
+
+    const existing = this.peers.get(deviceId) || this._basePeer(
+      deviceId,
+      identity.displayName || identity.deviceName || 'G1 Device'
+    );
+    const currentRank = identityTrustRank(existing.identityTrust);
+    const incomingRank = identityTrustRank(identity.trust);
+    const incomingUserId = typeof identity.userId === 'string' && identity.userId.trim()
+      ? identity.userId.trim()
+      : null;
+
+    if (
+      existing.userId &&
+      incomingUserId &&
+      existing.userId !== incomingUserId &&
+      currentRank >= IDENTITY_TRUST_RANK.SESSION_PROVEN &&
+      incomingRank >= IDENTITY_TRUST_RANK.SESSION_PROVEN
+    ) {
+      throw new Error('Conflicting cryptographically proven G1 user identity for peer');
+    }
+
+    if (incomingRank < currentRank) {
+      this.peers.set(deviceId, existing);
+      return existing;
+    }
+
+    if (incomingUserId) existing.userId = incomingUserId;
+    if (typeof identity.g1Number === 'string' && identity.g1Number.trim()) {
+      existing.g1Number = identity.g1Number.trim();
+    }
+    if (typeof identity.keyFingerprint === 'string' && identity.keyFingerprint.trim()) {
+      existing.keyFingerprint = identity.keyFingerprint.trim();
+    }
+    if (typeof identity.displayName === 'string' && identity.displayName.trim()) {
+      existing.identityDisplayName = identity.displayName.trim();
+    }
+    existing.identityTrust = Object.prototype.hasOwnProperty.call(IDENTITY_TRUST_RANK, identity.trust)
+      ? identity.trust
+      : existing.identityTrust;
+    if (identity.source) existing.identitySource = identity.source;
+    existing.lastSeen = now();
 
     this.peers.set(deviceId, existing);
     this._notify();

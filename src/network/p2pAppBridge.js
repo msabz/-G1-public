@@ -43,13 +43,14 @@ export function resolveStableP2pIdentity(contact = {}, discoveredPeer = {}) {
 
   // A persisted logical device ID remains useful as an *expected* target for a
   // known contact when discovery did not assert a conflicting identity. It is
-  // not current-session proof and must eventually be checked by the identity
-  // authenticator after a provisional route/signaling channel is established.
+  // not current-session proof and must be checked by IdentityAuthenticator after
+  // a provisional route/signaling channel is established.
   const persistedDeviceId = firstText(contact.deviceId, contact.peerId);
   if (isStableIdentityValue(persistedDeviceId, routeValues)) {
     return buildAdditivePeerIdentity({
       deviceId: persistedDeviceId,
       userId: contact.userId,
+      g1Number: contact.g1Number,
       displayName: contact.displayName || contact.customName || contact.name,
       deviceName: contact.deviceName,
       keyFingerprint: contact.keyFingerprint || contact.identityKeyFingerprint,
@@ -65,6 +66,7 @@ export function resolveStableP2pIdentity(contact = {}, discoveredPeer = {}) {
     return buildAdditivePeerIdentity({
       deviceId: explicitDeviceId,
       userId: discoveredPeer.userId,
+      g1Number: discoveredPeer.g1Number,
       displayName:
         discoveredPeer.displayName || discoveredPeer.name || discoveredPeer.deviceName,
       deviceName: discoveredPeer.deviceName,
@@ -122,6 +124,8 @@ export function buildCoordinatorP2pPeer({
     isOnline: true,
   });
 
+  // Store only the strength actually present at this point. For DNS-SD or a
+  // saved contact this is expectation/claim state, never SESSION_PROVEN.
   registry.upsertPeerIdentity?.(identity);
 
   const peer = registry.getPeer(deviceId);
@@ -140,7 +144,9 @@ export function isCoordinatorOwnedP2pSession(status, deviceId) {
   return !!deviceId &&
     status?.state === 'CONNECTED' &&
     status?.transport === TRANSPORTS.P2P &&
-    status?.peer?.deviceId === deviceId;
+    status?.peer?.deviceId === deviceId &&
+    status?.provenIdentity?.deviceId === deviceId &&
+    status?.provenIdentity?.trust === IDENTITY_TRUST.SESSION_PROVEN;
 }
 
 export async function connectP2pFromApp({
@@ -151,22 +157,30 @@ export async function connectP2pFromApp({
   coordinator = connectionCoordinator,
   registry = peerRegistry,
 } = {}) {
-  const { peer, identity, displayName } = buildCoordinatorP2pPeer({
+  const { peer, identity: expectedIdentity, displayName } = buildCoordinatorP2pPeer({
     contact,
     discoveredPeer,
     registry,
   });
 
-  await coordinator.connectP2pPeer(peer, timeoutMs, { incoming });
+  await coordinator.connectP2pPeer(peer, timeoutMs, {
+    incoming,
+    expectedIdentity,
+  });
 
   const status = coordinator.getCoordinatorStatus();
   if (!isCoordinatorOwnedP2pSession(status, peer.deviceId)) {
-    throw new Error('انتهت جلسة Wi-Fi Direct قبل اكتمال تهيئة المحادثة');
+    throw new Error('انتهت جلسة Wi-Fi Direct قبل اكتمال إثبات هوية G1');
   }
 
+  const provenIdentity = status.provenIdentity;
+  registry.upsertPeerIdentity?.(provenIdentity);
+  const provenPeer = registry.getPeer(peer.deviceId) || status.peer || peer;
+
   return {
-    peer,
-    identity,
+    peer: provenPeer,
+    identity: provenIdentity,
+    expectedIdentity,
     displayName,
     route: status.p2p?.activeRoute || null,
     controlOwner: 'COORDINATOR',

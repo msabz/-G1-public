@@ -5,6 +5,7 @@ import { peerRegistry, PEER_STATUS, TRANSPORTS } from './PeerRegistry';
 export const COORDINATOR_STATE = {
   IDLE: 'IDLE',
   CONNECTING: 'CONNECTING',
+  AUTHENTICATING: 'AUTHENTICATING',
   CONNECTED: 'CONNECTED',
   DISCONNECTING: 'DISCONNECTING',
   ERROR: 'ERROR',
@@ -21,6 +22,7 @@ export class ConnectionCoordinator {
     this.activeSession = null;
     this.currentPeer = null;
     this.currentTransport = null;
+    this.provenIdentity = null;
     this.generation = 0;
 
     this.onStateChange = options.onStateChange || null;
@@ -42,10 +44,21 @@ export class ConnectionCoordinator {
     this.activeSessionManagedExternally = false;
     this.signalingDisconnectSubscription = null;
 
+    // Identity authentication is above the signaling route and below trusted
+    // logical-session promotion. It proves possession of the key-derived user
+    // identity; discovery/persistence values remain expectations only.
+    this.identityAuthenticator = options.identityAuthenticator || null;
+
     // Wi-Fi Direct transport adapter owns only Android P2P route lifecycle:
     // discovery observations, group negotiation, bind/unbind and cleanup. It
     // never owns signaling, heartbeat, peer identity semantics or UI state.
     this.p2pAdapter = options.p2pAdapter || null;
+  }
+
+  _isConnectionStateActive() {
+    return this.state === COORDINATOR_STATE.CONNECTING ||
+      this.state === COORDINATOR_STATE.AUTHENTICATING ||
+      this.state === COORDINATOR_STATE.CONNECTED;
   }
 
   setIdentity({ deviceId, deviceName }) {
@@ -55,20 +68,46 @@ export class ConnectionCoordinator {
     try {
       this.p2pAdapter?.setIdentity?.({ deviceId, deviceName });
     } catch (e) {}
+    try {
+      this.identityAuthenticator?.setLocalDeviceIdentity?.({ deviceId, deviceName });
+    } catch (e) {}
   }
 
   setSignalingOwner(owner) {
     if (owner === this.signalingOwner) return;
-    if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.CONNECTED) {
+    if (this._isConnectionStateActive()) {
       throw new Error('Cannot replace signaling owner while a connection is active');
     }
     this._clearSignalingOwnerDisconnectSubscription();
     this.signalingOwner = owner || null;
+    try {
+      this.identityAuthenticator?.setSignalingOwner?.(this.signalingOwner);
+    } catch (e) {}
+  }
+
+  setIdentityAuthenticator(authenticator) {
+    if (authenticator === this.identityAuthenticator) return;
+    if (this._isConnectionStateActive()) {
+      throw new Error('Cannot replace identity authenticator while a connection is active');
+    }
+    try { this.identityAuthenticator?.stop?.(); } catch (e) {}
+    this.identityAuthenticator = authenticator || null;
+    if (this.identityAuthenticator) {
+      try {
+        this.identityAuthenticator.setSignalingOwner?.(this.signalingOwner);
+        if (this.myDeviceId) {
+          this.identityAuthenticator.setLocalDeviceIdentity?.({
+            deviceId: this.myDeviceId,
+            deviceName: this.myDeviceName,
+          });
+        }
+      } catch (e) {}
+    }
   }
 
   setP2pAdapter(adapter) {
     if (adapter === this.p2pAdapter) return;
-    if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.CONNECTED) {
+    if (this._isConnectionStateActive()) {
       throw new Error('Cannot replace P2P adapter while a connection is active');
     }
     this.p2pAdapter = adapter || null;
@@ -196,6 +235,7 @@ export class ConnectionCoordinator {
     this.activeSessionManagedExternally = false;
     this.currentPeer = peerInfo;
     this.currentTransport = peerInfo.transport || TRANSPORTS.LAN;
+    this.provenIdentity = null;
 
     this._startHeartbeat();
     this._setState(COORDINATOR_STATE.CONNECTED, { peer: peerInfo, transport: this.currentTransport });
@@ -249,7 +289,7 @@ export class ConnectionCoordinator {
       throw new Error('Cannot adopt signaling owner session while disconnecting');
     }
 
-    if (this.state === COORDINATOR_STATE.CONNECTING) {
+    if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.AUTHENTICATING) {
       if (!samePeer) {
         throw new Error('Cannot adopt signaling owner session for a different peer while connecting');
       }
@@ -266,6 +306,7 @@ export class ConnectionCoordinator {
     this.activeSessionManagedExternally = true;
     this.currentPeer = peer;
     this.currentTransport = transport;
+    this.provenIdentity = null;
 
     this._stopHeartbeat();
     this._setState(COORDINATOR_STATE.CONNECTED, {
@@ -295,6 +336,7 @@ export class ConnectionCoordinator {
     };
     const currentGen = ++this.generation;
     this.cancelConnecting();
+    this.provenIdentity = null;
 
     this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: TRANSPORTS.LAN });
     peerRegistry.setPeerConnecting(peer.deviceId);
@@ -384,16 +426,27 @@ export class ConnectionCoordinator {
     if (!owner || typeof owner.getActiveSession !== 'function') {
       throw new Error('Configured signaling owner is required for Wi-Fi Direct');
     }
+    const authenticator = this.identityAuthenticator;
+    if (!authenticator || typeof authenticator.authenticatePeer !== 'function') {
+      throw new Error('Configured G1 identity authenticator is required for Wi-Fi Direct');
+    }
     if (!this.myDeviceId) {
       throw new Error('Local stable G1 identity is required before Wi-Fi Direct connect');
     }
 
     const currentGen = ++this.generation;
     this.cancelConnecting();
+    this.provenIdentity = null;
     this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: TRANSPORTS.P2P });
     peerRegistry.setPeerConnecting(peer.deviceId);
     this.currentPeer = peer;
     this.currentTransport = TRANSPORTS.P2P;
+
+    const expectedIdentity = connectOptions.expectedIdentity || {
+      deviceId: peer.deviceId,
+      userId: peer.userId || null,
+      g1Number: peer.g1Number || null,
+    };
 
     let settled = false;
     let cancelled = false;
@@ -402,6 +455,7 @@ export class ConnectionCoordinator {
       if (settled) return;
       settled = true;
       cancelled = true;
+      try { authenticator.cancelAuthentication?.('COORDINATOR_CANCELLED'); } catch (e) {}
       try { owner.cancelConnect?.(); } catch (e) {}
       try {
         const disconnected = owner.disconnect?.();
@@ -458,6 +512,44 @@ export class ConnectionCoordinator {
         throw new Error('Signaling owner completed Wi-Fi Direct connect without an active session');
       }
 
+      // A live socket is still only a route. Hold logical promotion at
+      // AUTHENTICATING until the remote proves possession of the key-derived
+      // UserId expected by the saved/QR/DNS-SD contact projection.
+      this.activeSession = session;
+      this.activeSessionManagedExternally = true;
+      this._stopHeartbeat();
+      this._setState(COORDINATOR_STATE.AUTHENTICATING, {
+        peer,
+        transport: TRANSPORTS.P2P,
+        route,
+      });
+
+      const provenIdentity = await authenticator.authenticatePeer({
+        expectedIdentity,
+        timeoutMs: connectOptions.authTimeoutMs || 12000,
+      });
+
+      if (cancelled || this.generation !== currentGen) {
+        return;
+      }
+      if (!provenIdentity || provenIdentity.deviceId !== peer.deviceId) {
+        throw new Error('Authenticated G1 device identity does not match the requested peer');
+      }
+
+      peerRegistry.upsertPeerIdentity?.(provenIdentity);
+      this.provenIdentity = provenIdentity;
+      this.currentPeer = peerRegistry.getPeer(peer.deviceId) || {
+        ...peer,
+        userId: provenIdentity.userId || null,
+        g1Number: provenIdentity.g1Number || null,
+        keyFingerprint: provenIdentity.keyFingerprint || null,
+        identityTrust: provenIdentity.trust || null,
+        identitySource: provenIdentity.source || null,
+      };
+
+      // Legacy identity metadata remains for older App/UI projection only. It is
+      // deliberately sent after cryptographic proof and is never itself treated
+      // as authentication evidence.
       const identitySent = typeof owner.sendMessage === 'function'
         ? owner.sendMessage({
             type: 'identity',
@@ -471,16 +563,14 @@ export class ConnectionCoordinator {
 
       settled = true;
       if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
-      this.activeSession = session;
-      this.activeSessionManagedExternally = true;
-      this._stopHeartbeat();
       this._setState(COORDINATOR_STATE.CONNECTED, {
-        peer,
+        peer: this.currentPeer,
         transport: TRANSPORTS.P2P,
         route,
+        provenIdentity,
       });
       peerRegistry.setPeerConnected(peer.deviceId, TRANSPORTS.P2P);
-      if (this.onConnected) this.onConnected(peer, TRANSPORTS.P2P);
+      if (this.onConnected) this.onConnected(this.currentPeer, TRANSPORTS.P2P);
       this._subscribeToSignalingOwnerDisconnect(owner, currentGen);
       return session;
     } catch (err) {
@@ -489,8 +579,13 @@ export class ConnectionCoordinator {
       }
       settled = true;
       if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+      try { authenticator.cancelAuthentication?.('COORDINATOR_AUTH_FAILED'); } catch (e) {}
       try { owner.disconnect?.(); } catch (e) {}
       try { await this.p2pAdapter.disconnect?.(); } catch (e) {}
+      this._clearSignalingOwnerDisconnectSubscription();
+      this.activeSession = null;
+      this.activeSessionManagedExternally = false;
+      this.provenIdentity = null;
       if (this.generation === currentGen) {
         this._setState(COORDINATOR_STATE.ERROR, { error: err.message, transport: TRANSPORTS.P2P });
         peerRegistry.setPeerDisconnected(peer.deviceId);
@@ -624,6 +719,7 @@ export class ConnectionCoordinator {
     this.activeSessionManagedExternally = false;
     this.currentPeer = null;
     this.currentTransport = null;
+    this.provenIdentity = null;
     this._setState(COORDINATOR_STATE.IDLE);
 
     if (peer?.deviceId) {
@@ -653,10 +749,13 @@ export class ConnectionCoordinator {
       this.pendingConnectAbort();
       this.pendingConnectAbort = null;
     }
-    if (this.state === COORDINATOR_STATE.CONNECTING) {
+    if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.AUTHENTICATING) {
       const peer = this.currentPeer;
       this.currentPeer = null;
       this.currentTransport = null;
+      this.provenIdentity = null;
+      this.activeSession = null;
+      this.activeSessionManagedExternally = false;
       this._setState(COORDINATOR_STATE.IDLE);
       if (peer?.deviceId) {
         peerRegistry.setPeerDisconnected(peer.deviceId);
@@ -667,6 +766,7 @@ export class ConnectionCoordinator {
   disconnect() {
     this.generation++;
     this._stopHeartbeat();
+    try { this.identityAuthenticator?.cancelAuthentication?.('COORDINATOR_DISCONNECT'); } catch (e) {}
     this.cancelConnecting();
     const session = this.activeSession;
     const managedExternally = this.activeSessionManagedExternally;
@@ -676,6 +776,7 @@ export class ConnectionCoordinator {
     }
     this.activeSession = null;
     this.activeSessionManagedExternally = false;
+    this.provenIdentity = null;
     if (managedExternally) {
       try { this.signalingOwner?.disconnect?.(); } catch (e) {}
     } else if (session) {
@@ -694,6 +795,7 @@ export class ConnectionCoordinator {
       state: this.state,
       peer: this.currentPeer,
       transport: this.currentTransport,
+      provenIdentity: this.provenIdentity,
       generation: this.generation,
       p2p: this.p2pAdapter?.getStatus?.() || null,
     };

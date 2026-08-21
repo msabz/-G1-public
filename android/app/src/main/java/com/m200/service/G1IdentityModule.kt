@@ -9,15 +9,14 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
-import java.io.ByteArrayOutputStream
-import java.io.DataOutputStream
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
-import java.security.MessageDigest
 import java.security.PrivateKey
+import java.security.SecureRandom
 import java.security.Signature
+import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
@@ -34,10 +33,6 @@ class G1IdentityModule(private val reactContext: ReactApplicationContext) : Reac
         private const val RECOVERY_PRIVATE_CIPHER = "recovery_private_cipher"
         private const val RECOVERY_PRIVATE_IV = "recovery_private_iv"
         private const val PROFILE_NAME = "profile_name"
-        private const val GENESIS_VERSION = 1
-        private const val ROOT_ALGORITHM = "P256-SHA256-ECDSA"
-        private const val RECOVERY_ALGORITHM = "P256-SHA256-ECDSA"
-        private val GENESIS_DOMAIN = "G1-USER-GENESIS-V1".toByteArray(Charsets.UTF_8)
     }
 
     override fun getName() = "G1IdentityModule"
@@ -122,26 +117,6 @@ class G1IdentityModule(private val reactContext: ReactApplicationContext) : Reac
         return pair.public
     }
 
-    private fun canonicalGenesis(rootPublic: ByteArray, recoveryPublic: ByteArray): ByteArray {
-        val out = ByteArrayOutputStream()
-        DataOutputStream(out).use { data ->
-            data.writeInt(GENESIS_DOMAIN.size)
-            data.write(GENESIS_DOMAIN)
-            data.writeInt(GENESIS_VERSION)
-            val rootAlg = ROOT_ALGORITHM.toByteArray(Charsets.US_ASCII)
-            data.writeInt(rootAlg.size)
-            data.write(rootAlg)
-            data.writeInt(rootPublic.size)
-            data.write(rootPublic)
-            val recoveryAlg = RECOVERY_ALGORITHM.toByteArray(Charsets.US_ASCII)
-            data.writeInt(recoveryAlg.size)
-            data.write(recoveryAlg)
-            data.writeInt(recoveryPublic.size)
-            data.write(recoveryPublic)
-        }
-        return out.toByteArray()
-    }
-
     private data class IdentitySnapshot(
         val root: KeyPair,
         val recoveryPublic: java.security.PublicKey,
@@ -153,8 +128,7 @@ class G1IdentityModule(private val reactContext: ReactApplicationContext) : Reac
     private fun snapshot(): IdentitySnapshot {
         val root = getOrCreateRootKeyPair()
         val recoveryPublic = getOrCreateRecoveryPublicKey()
-        val genesis = canonicalGenesis(root.public.encoded, recoveryPublic.encoded)
-        val userId = G1IdentityFormat.bytesToHex(MessageDigest.getInstance("SHA-256").digest(genesis))
+        val userId = G1IdentityFormat.deriveUserId(root.public.encoded, recoveryPublic.encoded)
         return IdentitySnapshot(
             root = root,
             recoveryPublic = recoveryPublic,
@@ -164,18 +138,49 @@ class G1IdentityModule(private val reactContext: ReactApplicationContext) : Reac
         )
     }
 
+    private fun decodeChallenge(value: String): ByteArray {
+        val bytes = Base64.decode(value, Base64.NO_WRAP)
+        require(bytes.size in 16..64) { "Invalid G1 auth challenge" }
+        return bytes
+    }
+
+    private fun parseP256PublicKey(value: String, label: String): ECPublicKey {
+        val bytes = Base64.decode(value, Base64.NO_WRAP)
+        require(bytes.isNotEmpty() && bytes.size <= 4096) { "Invalid $label" }
+        val key = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(bytes))
+        require(key is ECPublicKey) { "Invalid $label type" }
+        require(key.params.curve.field.fieldSize == 256 && key.params.order.bitLength() == 256) {
+            "$label must use P-256"
+        }
+        return key
+    }
+
+    private fun verificationMap(
+        verified: Boolean,
+        reason: String,
+        userId: String,
+        g1Number: String,
+        rootKeyFingerprint: String,
+    ) = Arguments.createMap().apply {
+        putBoolean("verified", verified)
+        putString("reason", reason)
+        putString("userId", userId)
+        putString("g1Number", g1Number)
+        putString("rootKeyFingerprint", rootKeyFingerprint)
+    }
+
     @ReactMethod
     fun getUserIdentity(promise: Promise) {
         try {
             val identity = snapshot()
             promise.resolve(Arguments.createMap().apply {
-                putInt("genesisVersion", GENESIS_VERSION)
+                putInt("genesisVersion", G1IdentityFormat.GENESIS_VERSION)
                 putString("userId", identity.userId)
                 putString("g1Number", identity.g1Number)
                 putString("profileName", identity.profileName)
-                putString("rootAlgorithm", ROOT_ALGORITHM)
+                putString("rootAlgorithm", G1IdentityFormat.ROOT_ALGORITHM)
                 putString("rootPublicKeySpki", Base64.encodeToString(identity.root.public.encoded, Base64.NO_WRAP))
-                putString("recoveryAlgorithm", RECOVERY_ALGORITHM)
+                putString("recoveryAlgorithm", G1IdentityFormat.RECOVERY_ALGORITHM)
                 putString("recoveryPublicKeySpki", Base64.encodeToString(identity.recoveryPublic.encoded, Base64.NO_WRAP))
                 putString("identityStatus", "GENESIS_READY")
             })
@@ -195,10 +200,119 @@ class G1IdentityModule(private val reactContext: ReactApplicationContext) : Reac
         }
     }
 
+    @ReactMethod
+    fun createAuthNonce(promise: Promise) {
+        try {
+            val nonce = ByteArray(32)
+            SecureRandom().nextBytes(nonce)
+            promise.resolve(Base64.encodeToString(nonce, Base64.NO_WRAP))
+        } catch (e: Exception) {
+            promise.reject("G1_NONCE_ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun signSessionAuth(
+        purpose: String,
+        requestId: String,
+        challengeBase64: String,
+        signerUserId: String,
+        signerDeviceId: String,
+        challengerUserId: String,
+        challengerDeviceId: String,
+        promise: Promise,
+    ) {
+        try {
+            val identity = snapshot()
+            val normalizedSignerUserId = G1IdentityFormat.normalizeUserId(signerUserId)
+                ?: throw IllegalArgumentException("Invalid signer userId")
+            require(normalizedSignerUserId == identity.userId) {
+                "G1 root key cannot sign for a different user identity"
+            }
+            val transcript = G1SessionAuthFormat.canonicalTranscript(
+                purpose = purpose,
+                requestId = requestId,
+                challenge = decodeChallenge(challengeBase64),
+                signerUserId = identity.userId,
+                signerDeviceId = signerDeviceId,
+                challengerUserId = challengerUserId,
+                challengerDeviceId = challengerDeviceId,
+            )
+            val signature = Signature.getInstance("SHA256withECDSA")
+            signature.initSign(identity.root.private)
+            signature.update(transcript)
+            promise.resolve(Base64.encodeToString(signature.sign(), Base64.NO_WRAP))
+        } catch (e: Exception) {
+            promise.reject("G1_SESSION_SIGN_ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun verifySessionAuth(
+        rootPublicKeySpki: String,
+        recoveryPublicKeySpki: String,
+        claimedUserId: String,
+        claimedG1Number: String,
+        purpose: String,
+        requestId: String,
+        challengeBase64: String,
+        signerDeviceId: String,
+        challengerUserId: String,
+        challengerDeviceId: String,
+        signatureBase64: String,
+        promise: Promise,
+    ) {
+        try {
+            val rootPublic = parseP256PublicKey(rootPublicKeySpki, "G1 root public key")
+            val recoveryPublic = parseP256PublicKey(recoveryPublicKeySpki, "G1 recovery public key")
+            val derivedUserId = G1IdentityFormat.deriveUserId(rootPublic.encoded, recoveryPublic.encoded)
+            val derivedG1Number = G1IdentityFormat.deriveG1Number(derivedUserId)
+            val fingerprint = G1IdentityFormat.keyFingerprint(rootPublic.encoded)
+            val normalizedClaimedUserId = G1IdentityFormat.normalizeUserId(claimedUserId)
+            val normalizedClaimedNumber = G1IdentityFormat.normalizeG1Number(claimedG1Number)
+
+            if (normalizedClaimedUserId != derivedUserId) {
+                promise.resolve(verificationMap(false, "GENESIS_USER_ID_MISMATCH", derivedUserId, derivedG1Number, fingerprint))
+                return
+            }
+            if (normalizedClaimedNumber != derivedG1Number) {
+                promise.resolve(verificationMap(false, "G1_NUMBER_MISMATCH", derivedUserId, derivedG1Number, fingerprint))
+                return
+            }
+
+            val transcript = G1SessionAuthFormat.canonicalTranscript(
+                purpose = purpose,
+                requestId = requestId,
+                challenge = decodeChallenge(challengeBase64),
+                signerUserId = derivedUserId,
+                signerDeviceId = signerDeviceId,
+                challengerUserId = challengerUserId,
+                challengerDeviceId = challengerDeviceId,
+            )
+            val signatureBytes = Base64.decode(signatureBase64, Base64.NO_WRAP)
+            require(signatureBytes.size in 8..512) { "Invalid G1 auth signature" }
+            val verifier = Signature.getInstance("SHA256withECDSA")
+            verifier.initVerify(rootPublic)
+            verifier.update(transcript)
+            val verified = verifier.verify(signatureBytes)
+            promise.resolve(
+                verificationMap(
+                    verified,
+                    if (verified) "SESSION_PROVEN" else "SIGNATURE_INVALID",
+                    derivedUserId,
+                    derivedG1Number,
+                    fingerprint,
+                )
+            )
+        } catch (e: Exception) {
+            promise.reject("G1_SESSION_VERIFY_ERROR", e.message, e)
+        }
+    }
+
     /**
-     * Foundation for the later authenticated identity handshake. The root
-     * private key remains non-exportable in Android Keystore; JavaScript only
-     * receives a signature over caller-supplied challenge bytes.
+     * Legacy foundation primitive retained for compatibility with existing
+     * callers. New session identity proof uses signSessionAuth(), which binds
+     * both identities, device IDs, request ID, purpose and a fresh nonce.
      */
     @ReactMethod
     fun signRootChallenge(payloadBase64: String, promise: Promise) {

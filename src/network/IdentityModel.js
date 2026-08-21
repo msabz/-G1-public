@@ -62,6 +62,7 @@ export function isStableIdentityValue(value, routeValues = []) {
 export function buildAdditivePeerIdentity({
   deviceId,
   userId = null,
+  g1Number = null,
   displayName = null,
   deviceName = null,
   keyFingerprint = null,
@@ -75,10 +76,11 @@ export function buildAdditivePeerIdentity({
 
   return {
     deviceId: stableDeviceId,
-    // userId is deliberately additive. Existing conversation/PeerRegistry
-    // persistence continues to key by deviceId until a later explicit data
-    // migration is designed and verified.
+    // userId/G1 Number are deliberately additive. Existing conversation and
+    // route persistence still key by deviceId until a later explicit schema
+    // migration is designed and physically verified.
     userId: normalizeIdentityValue(userId) || null,
+    g1Number: normalizeIdentityValue(g1Number) || null,
     displayName:
       normalizeIdentityValue(displayName) ||
       normalizeIdentityValue(deviceName) ||
@@ -106,6 +108,7 @@ export function discoveryIdentityFromPeer(peer = {}, routeValues = []) {
   return buildAdditivePeerIdentity({
     deviceId: candidate,
     userId: peer.userId,
+    g1Number: peer.g1Number,
     displayName: peer.displayName || peer.label || peer.name || peer.deviceName,
     deviceName: peer.deviceName,
     keyFingerprint: peer.keyFingerprint || peer.identityKeyFingerprint,

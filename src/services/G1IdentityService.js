@@ -18,6 +18,13 @@ function requireMethod(module, method, label) {
   return module[method].bind(module);
 }
 
+function requiredText(value, label, max = 8192) {
+  if (typeof value !== 'string' || !value.trim() || value.length > max) {
+    throw new Error(`Invalid ${label}`);
+  }
+  return value.trim();
+}
+
 export async function getOwnG1Identity() {
   const raw = await requireMethod(identityNative, 'getUserIdentity', 'G1 identity')();
   const userId = normalizeUserId(raw?.userId);
@@ -28,9 +35,12 @@ export async function getOwnG1Identity() {
   }
   return {
     ...raw,
+    genesisVersion: Number(raw?.genesisVersion) || 1,
     userId,
     g1Number,
     profileName: typeof raw?.profileName === 'string' ? raw.profileName : '',
+    rootPublicKeySpki: requiredText(raw?.rootPublicKeySpki, 'G1 root public key'),
+    recoveryPublicKeySpki: requiredText(raw?.recoveryPublicKeySpki, 'G1 recovery public key'),
   };
 }
 
@@ -38,6 +48,75 @@ export async function setOwnProfileName(profileName) {
   const name = typeof profileName === 'string' ? profileName.trim().slice(0, 80) : '';
   await requireMethod(identityNative, 'setProfileName', 'G1 profile name')(name);
   return getOwnG1Identity();
+}
+
+export async function createG1AuthNonce() {
+  return requiredText(
+    await requireMethod(identityNative, 'createAuthNonce', 'G1 auth nonce')(),
+    'G1 auth nonce',
+    256
+  );
+}
+
+export async function signG1SessionAuth({
+  purpose,
+  requestId,
+  challenge,
+  signerUserId,
+  signerDeviceId,
+  challengerUserId,
+  challengerDeviceId,
+} = {}) {
+  const signature = await requireMethod(identityNative, 'signSessionAuth', 'G1 session signer')(
+    requiredText(purpose, 'G1 auth purpose', 32),
+    requiredText(requestId, 'G1 auth requestId', 256),
+    requiredText(challenge, 'G1 auth challenge', 256),
+    normalizeUserId(signerUserId) || '',
+    requiredText(signerDeviceId, 'signer deviceId', 200),
+    normalizeUserId(challengerUserId) || '',
+    requiredText(challengerDeviceId, 'challenger deviceId', 200)
+  );
+  return requiredText(signature, 'G1 auth signature', 8192);
+}
+
+export async function verifyG1SessionAuth({
+  rootPublicKeySpki,
+  recoveryPublicKeySpki,
+  claimedUserId,
+  claimedG1Number,
+  purpose,
+  requestId,
+  challenge,
+  signerDeviceId,
+  challengerUserId,
+  challengerDeviceId,
+  signature,
+} = {}) {
+  const result = await requireMethod(identityNative, 'verifySessionAuth', 'G1 session verifier')(
+    requiredText(rootPublicKeySpki, 'G1 root public key'),
+    requiredText(recoveryPublicKeySpki, 'G1 recovery public key'),
+    normalizeUserId(claimedUserId) || '',
+    normalizeG1Number(claimedG1Number) || '',
+    requiredText(purpose, 'G1 auth purpose', 32),
+    requiredText(requestId, 'G1 auth requestId', 256),
+    requiredText(challenge, 'G1 auth challenge', 256),
+    requiredText(signerDeviceId, 'signer deviceId', 200),
+    normalizeUserId(challengerUserId) || '',
+    requiredText(challengerDeviceId, 'challenger deviceId', 200),
+    requiredText(signature, 'G1 auth signature', 8192)
+  );
+  const userId = normalizeUserId(result?.userId);
+  const g1Number = normalizeG1Number(result?.g1Number);
+  return {
+    verified: result?.verified === true && !!userId && !!g1Number,
+    reason: typeof result?.reason === 'string' ? result.reason : 'VERIFY_RESULT_INVALID',
+    userId,
+    g1Number,
+    rootKeyFingerprint:
+      typeof result?.rootKeyFingerprint === 'string' && result.rootKeyFingerprint.trim()
+        ? result.rootKeyFingerprint.trim().toLowerCase()
+        : null,
+  };
 }
 
 export function buildOwnQrPayload(identity) {

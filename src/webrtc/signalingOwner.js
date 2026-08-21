@@ -1,5 +1,6 @@
 import {
   addSignalingDisconnectObserver,
+  addSignalingMessageObserver,
   cancelSignalingConnectAttempt,
   closeSignaling,
   connectToSignalingServer,
@@ -44,6 +45,10 @@ export const signalingOwner = {
 
   disconnect() {
     return closeSignaling();
+  },
+
+  subscribeMessage(observer) {
+    return addSignalingMessageObserver(observer);
   },
 
   subscribeDisconnect(observer) {

@@ -1,15 +1,23 @@
 package com.m200.service
 
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Locale
 
 object G1IdentityFormat {
+    const val GENESIS_VERSION = 1
+    const val ROOT_ALGORITHM = "P256-SHA256-ECDSA"
+    const val RECOVERY_ALGORITHM = "P256-SHA256-ECDSA"
+
     private const val PREFIX = "G1"
     private const val PAYLOAD_CHARS = 20
     private const val CHECK_CHARS = 3
     private const val COMPACT_CHARS = PAYLOAD_CHARS + CHECK_CHARS
     private const val USER_ID_HEX_CHARS = 64
     private const val ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    private val GENESIS_DOMAIN = "G1-USER-GENESIS-V1".toByteArray(Charsets.UTF_8)
 
     fun normalizeUserId(value: String?): String? {
         val text = value?.trim()?.lowercase(Locale.US) ?: return null
@@ -28,6 +36,34 @@ object G1IdentityFormat {
         }
         return out
     }
+
+    fun canonicalGenesis(rootPublic: ByteArray, recoveryPublic: ByteArray): ByteArray {
+        require(rootPublic.isNotEmpty() && rootPublic.size <= 4096) { "Invalid G1 root public key" }
+        require(recoveryPublic.isNotEmpty() && recoveryPublic.size <= 4096) { "Invalid G1 recovery public key" }
+        val out = ByteArrayOutputStream()
+        DataOutputStream(out).use { data ->
+            data.writeInt(GENESIS_DOMAIN.size)
+            data.write(GENESIS_DOMAIN)
+            data.writeInt(GENESIS_VERSION)
+            val rootAlg = ROOT_ALGORITHM.toByteArray(Charsets.US_ASCII)
+            data.writeInt(rootAlg.size)
+            data.write(rootAlg)
+            data.writeInt(rootPublic.size)
+            data.write(rootPublic)
+            val recoveryAlg = RECOVERY_ALGORITHM.toByteArray(Charsets.US_ASCII)
+            data.writeInt(recoveryAlg.size)
+            data.write(recoveryAlg)
+            data.writeInt(recoveryPublic.size)
+            data.write(recoveryPublic)
+        }
+        return out.toByteArray()
+    }
+
+    fun deriveUserId(rootPublic: ByteArray, recoveryPublic: ByteArray): String =
+        bytesToHex(MessageDigest.getInstance("SHA-256").digest(canonicalGenesis(rootPublic, recoveryPublic)))
+
+    fun keyFingerprint(publicKey: ByteArray): String =
+        bytesToHex(MessageDigest.getInstance("SHA-256").digest(publicKey))
 
     private fun encodeBits(bytes: ByteArray, bitLength: Int): String {
         val chars = (bitLength + 4) / 5
