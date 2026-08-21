@@ -30,38 +30,150 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         addAction(WIFI_P2P_PEERS_CHANGED_ACTION)
         addAction(WIFI_P2P_CONNECTION_CHANGED_ACTION)
         addAction(WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
+        addAction(WIFI_P2P_DISCOVERY_CHANGED_ACTION)
     }
     private var receiver: BroadcastReceiver? = null
     private var isReceiverRegistered = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    init {
-        wifiP2pManager = reactContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager?
-        channel = wifiP2pManager?.initialize(reactContext, Looper.getMainLooper(), null)
-    }
-
-    override fun getName() = "DirectConnectionModule"
-
     private val SERVICE_NAME = "_musabchat"
     private val SERVICE_TYPE = "_presence._tcp"
-    private val PASSIVE_RESTORE_DELAY_MS = 12_000L
-    // AOSP tears an otherwise idle P2P interface down after 150 seconds even
-    // while the client Channel is still alive. Keep the owned passive presence
-    // below that deadline with a read-only request that does not stop discovery.
-    private val PASSIVE_PRESENCE_LEASE_REFRESH_MS = 45_000L
+
+    // Keep responder-side P2P active instead of assuming extended LISTEN is a
+    // durable cross-OEM availability primitive. CTS/AOSP test both endpoints
+    // with active discovery, and several OEM stacks lazily create the P2P
+    // interface only after discoverPeers().
+    private val ACTIVE_PRESENCE_REFRESH_MS = 45_000L
+    private val CHANNEL_RECOVERY_BASE_DELAY_MS = 700L
+    private val MAX_CHANNEL_RECOVERY_ATTEMPTS = 2
+
     private var serviceInfo: WifiP2pDnsSdServiceInfo? = null
     private var serviceRequest: WifiP2pDnsSdServiceRequest? = null
     private var advertising = false
     private var advertisingGeneration = 0
     private var serviceDiscoveryGeneration = 0
     private var connectionGeneration = 0L
-    private var restorePassiveAfterNextPeerScan = false
+    private var presenceGeneration = 0
+    private var channelGeneration = 0L
+    private var recoveryGeneration = 0L
+    private var discoveryActive = false
+    private var cleanupInProgress = false
+    private var connectionInProgress = false
+    private var groupActive = false
+    private var desiredDeviceLabel: String? = null
+    private var desiredDeviceId: String? = null
+
+    init {
+        wifiP2pManager = reactContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager?
+        initializeChannel()
+    }
+
+    override fun getName() = "DirectConnectionModule"
+
+    private fun initializeChannel(): Boolean {
+        val manager = wifiP2pManager ?: return false
+        val generation = ++channelGeneration
+        channel = manager.initialize(
+            reactApplicationContext,
+            Looper.getMainLooper(),
+            ChannelListener {
+                if (generation != channelGeneration) return@ChannelListener
+                channel = null
+                resetChannelScopedServiceState()
+                sendEvent("WIFI_P2P_CHANNEL_CHANGED", Arguments.createMap().apply {
+                    putString("state", "disconnected")
+                    putDouble("generation", generation.toDouble())
+                })
+                scheduleBoundedChannelRecovery(generation)
+            }
+        )
+        return channel != null
+    }
+
+    private fun scheduleBoundedChannelRecovery(disconnectedGeneration: Long) {
+        val recovery = ++recoveryGeneration
+        fun attempt(attempt: Int) {
+            if (recovery != recoveryGeneration || channel != null) return
+            mainHandler.postDelayed({
+                if (recovery != recoveryGeneration || channel != null) return@postDelayed
+                if (initializeChannel()) {
+                    sendEvent("WIFI_P2P_CHANNEL_CHANGED", Arguments.createMap().apply {
+                        putString("state", "recovered")
+                        putDouble("fromGeneration", disconnectedGeneration.toDouble())
+                        putInt("attempt", attempt + 1)
+                    })
+                    restoreDesiredAdvertising(advertisingGeneration, 0)
+                } else if (attempt + 1 < MAX_CHANNEL_RECOVERY_ATTEMPTS) {
+                    attempt(attempt + 1)
+                } else {
+                    sendEvent("WIFI_P2P_CHANNEL_CHANGED", Arguments.createMap().apply {
+                        putString("state", "recovery_failed")
+                        putInt("attempts", MAX_CHANNEL_RECOVERY_ATTEMPTS)
+                    })
+                }
+            }, CHANNEL_RECOVERY_BASE_DELAY_MS * (attempt + 1))
+        }
+        attempt(0)
+    }
+
+    private fun ensureChannel(): Boolean {
+        if (wifiP2pManager == null) {
+            wifiP2pManager = reactApplicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager?
+        }
+        if (channel == null) initializeChannel()
+        return channel != null
+    }
+
+    private fun resetChannelScopedServiceState() {
+        serviceInfo = null
+        serviceRequest = null
+        advertising = false
+        discoveryActive = false
+        presenceGeneration++
+    }
+
+    private fun recreateChannel(): Boolean {
+        val previousChannel = channel
+        recoveryGeneration++
+        channel = null
+        resetChannelScopedServiceState()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            try { previousChannel?.close() } catch (_: Exception) {}
+        }
+        val created = initializeChannel()
+        if (created) {
+            mainHandler.postDelayed({ restoreDesiredAdvertising(advertisingGeneration, 0) }, 250L)
+        }
+        return created
+    }
+
+    private fun reasonName(reason: Int) = when (reason) {
+        ERROR -> "ERROR"
+        P2P_UNSUPPORTED -> "P2P_UNSUPPORTED"
+        BUSY -> "BUSY"
+        else -> "UNKNOWN"
+    }
+
+    private fun serviceInfoFor(deviceLabel: String, deviceId: String) =
+        WifiP2pDnsSdServiceInfo.newInstance(
+            SERVICE_NAME,
+            SERVICE_TYPE,
+            mapOf(
+                "app" to "musabchat",
+                "name" to deviceLabel,
+                "id" to deviceId,
+                "ver" to "1"
+            )
+        )
 
     @ReactMethod
     fun startAdvertising(deviceLabel: String, deviceId: String, promise: Promise) {
+        desiredDeviceLabel = deviceLabel
+        desiredDeviceId = deviceId
         try {
-            if (channel == null && !ensureChannel()) {
-                promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return
+            if (!ensureChannel()) {
+                promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر")
+                return
             }
             if (advertising && serviceInfo != null) {
                 promise.resolve(true)
@@ -86,15 +198,13 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             promise.resolve(false)
             return
         }
+        if (advertising && serviceInfo != null) {
+            promise.resolve(true)
+            return
+        }
         val manager = wifiP2pManager ?: run { promise.reject("ERROR", "غير متاح"); return }
         val currentChannel = channel ?: run { promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return }
-        val record = mapOf(
-            "app" to "musabchat",
-            "name" to deviceLabel,
-            "id" to deviceId,
-            "ver" to "1"
-        )
-        val info = WifiP2pDnsSdServiceInfo.newInstance(SERVICE_NAME, SERVICE_TYPE, record)
+        val info = serviceInfoFor(deviceLabel, deviceId)
 
         try {
             manager.addLocalService(currentChannel, info, object : ActionListener {
@@ -106,7 +216,8 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     }
                     serviceInfo = info
                     advertising = true
-                    schedulePassivePresenceLease(generation)
+                    val presence = ++presenceGeneration
+                    scheduleActivePresenceRefresh(presence)
                     promise.resolve(true)
                 }
 
@@ -144,28 +255,100 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         }
     }
 
-    private fun schedulePassivePresenceLease(generation: Int) {
+    private fun restoreDesiredAdvertising(generation: Int, attempt: Int) {
+        if (generation != advertisingGeneration || advertising || serviceInfo != null) return
+        val label = desiredDeviceLabel ?: return
+        val deviceId = desiredDeviceId ?: return
+        val manager = wifiP2pManager ?: return
+        val currentChannel = channel ?: return
+        val info = serviceInfoFor(label, deviceId)
+        try {
+            manager.addLocalService(currentChannel, info, object : ActionListener {
+                override fun onSuccess() {
+                    if (generation != advertisingGeneration || currentChannel !== channel) {
+                        try { manager.removeLocalService(currentChannel, info, null) } catch (_: Exception) {}
+                        return
+                    }
+                    serviceInfo = info
+                    advertising = true
+                    val presence = ++presenceGeneration
+                    scheduleActivePresenceRefresh(presence)
+                    // A recovered channel may belong to an OEM stack that only
+                    // materializes its P2P interface after active discovery.
+                    mainHandler.postDelayed({ refreshActivePresence(presence, 0) }, 250L)
+                }
+
+                override fun onFailure(reason: Int) {
+                    if (generation == advertisingGeneration && reason == BUSY && attempt < 3) {
+                        mainHandler.postDelayed({
+                            restoreDesiredAdvertising(generation, attempt + 1)
+                        }, 600L * (attempt + 1))
+                    }
+                }
+            })
+        } catch (_: Exception) {
+            if (generation == advertisingGeneration && attempt < 3) {
+                mainHandler.postDelayed({ restoreDesiredAdvertising(generation, attempt + 1) }, 700L)
+            }
+        }
+    }
+
+    private fun canRefreshPresence(presence: Int): Boolean =
+        presence == presenceGeneration &&
+            advertising && serviceInfo != null &&
+            serviceRequest == null &&
+            !cleanupInProgress && !connectionInProgress && !groupActive
+
+    private fun scheduleActivePresenceRefresh(presence: Int) {
         mainHandler.postDelayed({
-            if (generation != advertisingGeneration || !advertising || serviceInfo == null) {
+            if (!canRefreshPresence(presence)) {
+                if (presence == presenceGeneration && advertising && serviceInfo != null) {
+                    scheduleActivePresenceRefresh(presence)
+                }
                 return@postDelayed
             }
-            val manager = wifiP2pManager ?: return@postDelayed
-            val currentChannel = channel ?: return@postDelayed
+            refreshActivePresence(presence, 0)
+        }, ACTIVE_PRESENCE_REFRESH_MS)
+    }
 
-            // REQUEST_PEERS is read-only. In AOSP's inactive P2P state it still
-            // counts as a client operation and re-schedules the idle-shutdown
-            // timer, unlike startListening(), which stops an active find.
-            try { manager.requestPeers(currentChannel) { _ -> } } catch (_: Exception) {}
+    private fun refreshActivePresence(presence: Int, attempt: Int) {
+        if (!canRefreshPresence(presence)) return
+        val manager = wifiP2pManager ?: return
+        val currentChannel = channel ?: return
+        try {
+            manager.discoverPeers(currentChannel, object : ActionListener {
+                override fun onSuccess() {
+                    if (presence != presenceGeneration || currentChannel !== channel) return
+                    discoveryActive = true
+                    scheduleActivePresenceRefresh(presence)
+                }
 
-            if (generation == advertisingGeneration && advertising &&
-                serviceInfo != null && currentChannel === channel) {
-                schedulePassivePresenceLease(generation)
+                override fun onFailure(reason: Int) {
+                    if (presence != presenceGeneration || currentChannel !== channel) return
+                    if (reason == BUSY && attempt < 3) {
+                        mainHandler.postDelayed({ refreshActivePresence(presence, attempt + 1) }, 600L * (attempt + 1))
+                    } else if (reason == BUSY && recreateChannel()) {
+                        // recreateChannel restores desired advertising and starts
+                        // a fresh generation-scoped active-presence lease.
+                    } else {
+                        scheduleActivePresenceRefresh(presence)
+                    }
+                }
+            })
+        } catch (_: Exception) {
+            if (attempt < 2) {
+                mainHandler.postDelayed({ refreshActivePresence(presence, attempt + 1) }, 700L)
+            } else {
+                recreateChannel()
             }
-        }, PASSIVE_PRESENCE_LEASE_REFRESH_MS)
+        }
     }
 
     @ReactMethod
     fun stopAdvertising(promise: Promise) {
+        desiredDeviceLabel = null
+        desiredDeviceId = null
+        presenceGeneration++
         try {
             val generation = ++advertisingGeneration
             val info = serviceInfo
@@ -190,10 +373,9 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     }
                     promise.resolve(true)
                 }
-
                 override fun onFailure(reason: Int) { promise.resolve(false) }
             })
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             promise.resolve(false)
         }
     }
@@ -201,8 +383,9 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     @ReactMethod
     fun discoverMusabPeers(promise: Promise) {
         try {
-            if (channel == null && !ensureChannel()) {
-                promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return
+            if (!ensureChannel()) {
+                promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر")
+                return
             }
             if (serviceRequest != null) {
                 promise.reject("ERROR", "Service discovery request already active")
@@ -225,15 +408,8 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             promise.resolve(false)
             return
         }
-
-        val manager = wifiP2pManager ?: run {
-            promise.reject("ERROR", "غير متاح")
-            return
-        }
-        val currentChannel = channel ?: run {
-            promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر")
-            return
-        }
+        val manager = wifiP2pManager ?: run { promise.reject("ERROR", "غير متاح"); return }
+        val currentChannel = channel ?: run { promise.reject("ERROR", "تعذّرت تهيئة واي فاي مباشر"); return }
 
         fun failOrRetry(stage: String, reason: Int) {
             if (generation != serviceDiscoveryGeneration) {
@@ -254,10 +430,10 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         }
 
         try {
-            manager.setDnsSdResponseListeners(currentChannel,
-                { instanceName, registrationType, device ->
-                    if (generation == serviceDiscoveryGeneration &&
-                        instanceName.contains("musabchat", ignoreCase = true)) {
+            manager.setDnsSdResponseListeners(
+                currentChannel,
+                { instanceName, _, device ->
+                    if (generation == serviceDiscoveryGeneration && instanceName.contains("musabchat", ignoreCase = true)) {
                         sendEvent("MUSAB_PEER_FOUND", Arguments.createMap().apply {
                             putString("deviceName", device.deviceName)
                             putString("deviceAddress", device.deviceAddress)
@@ -266,9 +442,8 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                         })
                     }
                 },
-                { fullDomain, record, device ->
-                    val app = record["app"]
-                    if (generation == serviceDiscoveryGeneration && app == "musabchat") {
+                { _, record, device ->
+                    if (generation == serviceDiscoveryGeneration && record["app"] == "musabchat") {
                         sendEvent("MUSAB_PEER_FOUND", Arguments.createMap().apply {
                             putString("deviceName", record["name"] ?: device.deviceName)
                             putString("deviceAddress", device.deviceAddress)
@@ -290,10 +465,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     }
                     serviceRequest = request
                     manager.discoverServices(currentChannel, object : ActionListener {
-                        override fun onSuccess() {
-                            promise.resolve(generation == serviceDiscoveryGeneration)
-                        }
-
+                        override fun onSuccess() { promise.resolve(generation == serviceDiscoveryGeneration) }
                         override fun onFailure(reason: Int) {
                             removeOwnedServiceRequestBeforeRetry(
                                 manager,
@@ -304,15 +476,10 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                                 reason,
                                 onRemoved = { failOrRetry("Service discovery", reason) },
                                 onChannelReset = {
-                                    mainHandler.postDelayed({
-                                        discoverMusabPeersWithRetry(promise, generation, 0, true)
-                                    }, 900L)
+                                    mainHandler.postDelayed({ discoverMusabPeersWithRetry(promise, generation, 0, true) }, 900L)
                                 },
                                 onRemoveFailure = {
-                                    promise.reject(
-                                        "ERROR",
-                                        "Service discovery failed: $reason (${reasonName(reason)})"
-                                    )
+                                    promise.reject("ERROR", "Service discovery failed: $reason (${reasonName(reason)})")
                                 }
                             )
                         }
@@ -328,9 +495,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             if (generation != serviceDiscoveryGeneration) {
                 promise.resolve(false)
             } else if (!channelReset && recreateChannel()) {
-                mainHandler.postDelayed({
-                    discoverMusabPeersWithRetry(promise, generation, 0, true)
-                }, 900L)
+                mainHandler.postDelayed({ discoverMusabPeersWithRetry(promise, generation, 0, true) }, 900L)
             } else {
                 promise.reject("ERROR", e.message)
             }
@@ -358,21 +523,14 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     if (serviceRequest === request) serviceRequest = null
                     onRemoved()
                 }
-
                 override fun onFailure(reason: Int) {
-                    if (originalReason == BUSY && !channelReset && recreateChannel()) {
-                        onChannelReset()
-                    } else {
-                        onRemoveFailure()
-                    }
+                    if (originalReason == BUSY && !channelReset && recreateChannel()) onChannelReset()
+                    else onRemoveFailure()
                 }
             })
         } catch (_: Exception) {
-            if (originalReason == BUSY && !channelReset && recreateChannel()) {
-                onChannelReset()
-            } else {
-                onRemoveFailure()
-            }
+            if (originalReason == BUSY && !channelReset && recreateChannel()) onChannelReset()
+            else onRemoveFailure()
         }
     }
 
@@ -380,7 +538,6 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     fun stopServiceDiscovery(promise: Promise) {
         try {
             serviceDiscoveryGeneration++
-            restorePassiveAfterNextPeerScan = true
             val request = serviceRequest
             if (request == null) {
                 promise.resolve(true)
@@ -400,45 +557,9 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 }
                 override fun onFailure(reason: Int) { promise.resolve(false) }
             })
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             promise.resolve(false)
         }
-    }
-
-    private fun ensureChannel(): Boolean {
-        if (wifiP2pManager == null) {
-            wifiP2pManager = reactApplicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager?
-        }
-        if (channel == null) {
-            channel = wifiP2pManager?.initialize(reactApplicationContext, Looper.getMainLooper(), null)
-        }
-        return channel != null
-    }
-
-    private fun resetChannelScopedServiceState() {
-        serviceInfo = null
-        serviceRequest = null
-        advertising = false
-        restorePassiveAfterNextPeerScan = false
-    }
-
-    private fun recreateChannel(): Boolean {
-        val manager = wifiP2pManager ?: return false
-        val previousChannel = channel
-        channel = null
-        resetChannelScopedServiceState()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            try { previousChannel?.close() } catch (_: Exception) {}
-        }
-        channel = manager.initialize(reactApplicationContext, Looper.getMainLooper(), null)
-        return channel != null
-    }
-
-    private fun reasonName(reason: Int) = when (reason) {
-        ERROR -> "ERROR"
-        P2P_UNSUPPORTED -> "P2P_UNSUPPORTED"
-        BUSY -> "BUSY"
-        else -> "UNKNOWN"
     }
 
     @ReactMethod
@@ -452,7 +573,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         val lm = reactApplicationContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
         val enabled = try {
             lm.isProviderEnabled(LocationManager.GPS_PROVIDER) || lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-        } catch (e: Exception) { false }
+        } catch (_: Exception) { false }
         promise.resolve(enabled)
     }
 
@@ -491,7 +612,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 }
             }
             if (attempt < 10) {
-                mainHandler.postDelayed({ bindWithRetry(promise, attempt + 1) }, 500)
+                mainHandler.postDelayed({ bindWithRetry(promise, attempt + 1) }, 500L)
                 return
             }
             promise.resolve(false)
@@ -549,128 +670,72 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun discoverPeers(promise: Promise) {
-        val restorePassive = restorePassiveAfterNextPeerScan
-        restorePassiveAfterNextPeerScan = false
-        startDiscoveryWithRetry(promise, 0, restorePassive, connectionGeneration)
+        startDiscoveryWithRetry(promise, 0, false)
     }
 
     @ReactMethod
     fun startPassiveListening(promise: Promise) {
+        // Compatibility API name retained for JS callers. On modern Android we
+        // intentionally keep the responder in active discovery; startListening
+        // calls p2pStopFind() in AOSP and was the source of short visibility.
+        startDiscoveryWithRetry(promise, 0, false)
+    }
+
+    private fun startDiscoveryWithRetry(promise: Promise, attempt: Int, channelReset: Boolean) {
         if (!ensureChannel()) {
             promise.reject("ERROR", "Wi-Fi Direct not initialized")
             return
         }
-        startPassiveListeningWithRetry(promise, 0, false)
-    }
-
-    private fun startPassiveListeningWithRetry(promise: Promise, attempt: Int, channelReset: Boolean) {
-        val manager = wifiP2pManager ?: run {
-            promise.reject("ERROR", "Wi-Fi Direct not initialized")
-            return
-        }
-        val currentChannel = channel ?: run {
-            promise.reject("ERROR", "Wi-Fi Direct not initialized")
-            return
-        }
-
+        val manager = wifiP2pManager ?: run { promise.reject("ERROR", "Wi-Fi Direct not initialized"); return }
+        val currentChannel = channel ?: run { promise.reject("ERROR", "Wi-Fi Direct not initialized"); return }
         try {
-            val listener = object : ActionListener {
+            manager.discoverPeers(currentChannel, object : ActionListener {
                 override fun onSuccess() {
-                    emitCurrentPeers()
-                    promise.resolve(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) "listen" else "discovery")
+                    if (currentChannel !== channel) {
+                        promise.resolve(false)
+                        return
+                    }
+                    discoveryActive = true
+                    promise.resolve("Discovery started")
                 }
-
                 override fun onFailure(reason: Int) {
                     if (reason == BUSY && attempt < 4) {
-                        mainHandler.postDelayed({
-                            startPassiveListeningWithRetry(promise, attempt + 1, channelReset)
-                        }, 700L * (attempt + 1))
+                        mainHandler.postDelayed({ startDiscoveryWithRetry(promise, attempt + 1, channelReset) }, 700L * (attempt + 1))
                     } else if (reason == BUSY && !channelReset && recreateChannel()) {
-                        mainHandler.postDelayed({
-                            startPassiveListeningWithRetry(promise, 0, true)
-                        }, 900L)
+                        mainHandler.postDelayed({ startDiscoveryWithRetry(promise, 0, true) }, 900L)
                     } else {
-                        promise.reject("ERROR", "Passive listening failed: $reason (${reasonName(reason)})")
+                        promise.reject("ERROR", "Discovery failed: $reason (${reasonName(reason)})")
                     }
                 }
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                manager.startListening(currentChannel, listener)
-            } else {
-                manager.discoverPeers(currentChannel, listener)
-            }
+            })
         } catch (e: Exception) {
             if (!channelReset && recreateChannel()) {
-                mainHandler.postDelayed({ startPassiveListeningWithRetry(promise, 0, true) }, 900L)
+                mainHandler.postDelayed({ startDiscoveryWithRetry(promise, 0, true) }, 900L)
             } else {
                 promise.reject("ERROR", e.message)
             }
         }
     }
 
-    private fun startDiscoveryWithRetry(
-        promise: Promise,
-        attempt: Int,
-        restorePassive: Boolean,
-        connectionEpoch: Long
-    ) {
+    @ReactMethod
+    fun stopDiscovery(promise: Promise) {
         val manager = wifiP2pManager
         val currentChannel = channel
         if (manager == null || currentChannel == null) {
             promise.reject("ERROR", "Wi-Fi Direct not initialized")
             return
         }
-        manager.discoverPeers(currentChannel, object : ActionListener {
-            override fun onSuccess() {
-                if (restorePassive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    mainHandler.postDelayed({
-                        restorePassiveListeningAfterScan(currentChannel, connectionEpoch, 0)
-                    }, PASSIVE_RESTORE_DELAY_MS)
-                }
-                promise.resolve("Discovery started")
-            }
-            override fun onFailure(reason: Int) {
-                if (reason == BUSY && attempt < 4) {
-                    mainHandler.postDelayed({
-                        startDiscoveryWithRetry(promise, attempt + 1, restorePassive, connectionEpoch)
-                    }, 700L * (attempt + 1))
-                } else {
-                    promise.reject("ERROR", "Discovery failed: $reason (${reasonName(reason)})")
-                }
-            }
-        })
-    }
-
-    private fun restorePassiveListeningAfterScan(
-        expectedChannel: Channel,
-        connectionEpoch: Long,
-        attempt: Int
-    ) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        if (channel !== expectedChannel || connectionGeneration != connectionEpoch) return
-        val manager = wifiP2pManager ?: return
         try {
-            manager.startListening(expectedChannel, object : ActionListener {
-                override fun onSuccess() { emitCurrentPeers() }
-                override fun onFailure(reason: Int) {
-                    if (reason == BUSY && attempt < 4 &&
-                        channel === expectedChannel && connectionGeneration == connectionEpoch) {
-                        mainHandler.postDelayed({
-                            restorePassiveListeningAfterScan(expectedChannel, connectionEpoch, attempt + 1)
-                        }, 700L * (attempt + 1))
-                    }
+            manager.stopPeerDiscovery(currentChannel, object : ActionListener {
+                override fun onSuccess() {
+                    discoveryActive = false
+                    promise.resolve("Discovery stopped")
                 }
+                override fun onFailure(reason: Int) { promise.reject("ERROR", "Stop discovery failed: $reason (${reasonName(reason)})") }
             })
-        } catch (_: Exception) {}
-    }
-
-    @ReactMethod
-    fun stopDiscovery(promise: Promise) {
-        wifiP2pManager?.stopPeerDiscovery(channel, object : ActionListener {
-            override fun onSuccess() { promise.resolve("Discovery stopped") }
-            override fun onFailure(reason: Int) { promise.reject("ERROR", "Stop discovery failed: $reason (${reasonName(reason)})") }
-        }) ?: promise.reject("ERROR", "Wi-Fi Direct not initialized")
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
     }
 
     @ReactMethod
@@ -690,62 +755,81 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun createGroup(promise: Promise) {
-        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
+        connectionInProgress = true
         wifiP2pManager?.createGroup(channel, object : ActionListener {
             override fun onSuccess() { promise.resolve("Group creation started") }
-            override fun onFailure(reason: Int) { promise.reject("ERROR", "Create group failed: $reason (${reasonName(reason)})") }
-        }) ?: promise.reject("ERROR", "Wi-Fi Direct not initialized")
+            override fun onFailure(reason: Int) {
+                connectionInProgress = false
+                promise.reject("ERROR", "Create group failed: $reason (${reasonName(reason)})")
+            }
+        }) ?: run {
+            connectionInProgress = false
+            promise.reject("ERROR", "Wi-Fi Direct not initialized")
+        }
     }
 
     @ReactMethod
     fun connectToPeer(deviceAddress: String, promise: Promise) {
-        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
+        connectionInProgress = true
         val config = WifiP2pConfig().apply { this.deviceAddress = deviceAddress }
         wifiP2pManager?.connect(channel, config, object : ActionListener {
             override fun onSuccess() { promise.resolve("Connecting to peer") }
-            override fun onFailure(reason: Int) { promise.reject("ERROR", "Connection failed: $reason (${reasonName(reason)})") }
-        }) ?: promise.reject("ERROR", "Wi-Fi Direct not initialized")
+            override fun onFailure(reason: Int) {
+                connectionInProgress = false
+                promise.reject("ERROR", "Connection failed: $reason (${reasonName(reason)})")
+            }
+        }) ?: run {
+            connectionInProgress = false
+            promise.reject("ERROR", "Wi-Fi Direct not initialized")
+        }
     }
 
     @ReactMethod
     fun cancelConnect(promise: Promise) {
-        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
+        connectionInProgress = false
         try {
             wifiP2pManager?.cancelConnect(channel, object : ActionListener {
                 override fun onSuccess() { promise.resolve(true) }
                 override fun onFailure(reason: Int) { promise.resolve(false) }
             }) ?: promise.resolve(false)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             promise.resolve(false)
         }
     }
 
     @ReactMethod
     fun disconnect(promise: Promise) {
-        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
+        connectionInProgress = false
         wifiP2pManager?.removeGroup(channel, object : ActionListener {
-            override fun onSuccess() { promise.resolve("Disconnected") }
+            override fun onSuccess() {
+                groupActive = false
+                promise.resolve("Disconnected")
+            }
             override fun onFailure(reason: Int) { promise.reject("ERROR", "Disconnect failed: $reason (${reasonName(reason)})") }
         }) ?: promise.reject("ERROR", "Wi-Fi Direct not initialized")
     }
 
     @ReactMethod
     fun cleanupConnection(timeoutMs: Double, promise: Promise) {
-        restorePassiveAfterNextPeerScan = false
         connectionGeneration++
+        connectionInProgress = false
+        cleanupInProgress = true
         if (!ensureChannel()) {
+            cleanupInProgress = false
             promise.reject("ERROR", "Wi-Fi Direct not initialized")
             return
         }
         val manager = wifiP2pManager ?: run {
+            cleanupInProgress = false
             promise.reject("ERROR", "Wi-Fi Direct not initialized")
             return
         }
         val operationChannel = channel ?: run {
+            cleanupInProgress = false
             promise.reject("ERROR", "Wi-Fi Direct not initialized")
             return
         }
@@ -759,12 +843,13 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         serviceDiscoveryGeneration++
         serviceRequest = null
 
-        fun withinDeadline(): Boolean =
-            SystemClock.elapsedRealtime() - startedAt < timeout
+        fun withinDeadline(): Boolean = SystemClock.elapsedRealtime() - startedAt < timeout
 
         fun finish(clean: Boolean, timedOut: Boolean, reinitialized: Boolean) {
             if (settled) return
             settled = true
+            cleanupInProgress = false
+            if (clean) groupActive = false
             promise.resolve(Arguments.createMap().apply {
                 putBoolean("clean", clean)
                 putBoolean("timedOut", timedOut)
@@ -790,8 +875,11 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                         if (group == null) {
                             consecutiveEmptyChecks++
                             if (consecutiveEmptyChecks >= 2) {
-                                val reinitialized = recreateChannel()
-                                finish(clean = true, timedOut = false, reinitialized = reinitialized)
+                                // A clean/empty P2P state is not a reason to
+                                // destroy the channel. Keeping it alive avoids
+                                // repeatedly forcing OEM stacks back into a cold
+                                // interface state before each scan.
+                                finish(clean = true, timedOut = false, reinitialized = false)
                             } else {
                                 mainHandler.postDelayed({ pollGroup() }, 350L)
                             }
@@ -814,7 +902,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                             mainHandler.postDelayed({ pollGroup() }, 250L)
                         }
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     val reinitialized = recreateChannel()
                     finish(clean = false, timedOut = false, reinitialized = reinitialized)
                 }
@@ -842,9 +930,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                         override fun onFailure(reason: Int) {
                             lastFailure = reason
                             if (reason == BUSY && attempt < 4 && withinDeadline()) {
-                                mainHandler.postDelayed({
-                                    clearRequestsThenCancel(attempt + 1)
-                                }, 350L * (attempt + 1))
+                                mainHandler.postDelayed({ clearRequestsThenCancel(attempt + 1) }, 350L * (attempt + 1))
                             } else {
                                 mainHandler.postDelayed({ cancelThenPoll() }, 250L)
                             }
@@ -862,14 +948,13 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 try {
                     manager.stopPeerDiscovery(operationChannel, object : ActionListener {
                         override fun onSuccess() {
+                            discoveryActive = false
                             mainHandler.postDelayed({ clearRequestsThenCancel(0) }, 350L)
                         }
                         override fun onFailure(reason: Int) {
                             lastFailure = reason
                             if (reason == BUSY && attempt < 4 && withinDeadline()) {
-                                mainHandler.postDelayed({
-                                    stopDiscoveryThenClear(attempt + 1)
-                                }, 350L * (attempt + 1))
+                                mainHandler.postDelayed({ stopDiscoveryThenClear(attempt + 1) }, 350L * (attempt + 1))
                             } else {
                                 mainHandler.postDelayed({ clearRequestsThenCancel(0) }, 350L)
                             }
@@ -887,8 +972,14 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     @ReactMethod
     fun getConnectionInfo(promise: Promise) {
         val manager = wifiP2pManager
-        if (manager == null) { promise.reject("ERROR", "Wi-Fi Direct not initialized"); return }
-        manager.requestConnectionInfo(channel) { info: WifiP2pInfo ->
+        val currentChannel = channel
+        if (manager == null || currentChannel == null) {
+            promise.reject("ERROR", "Wi-Fi Direct not initialized")
+            return
+        }
+        manager.requestConnectionInfo(currentChannel) { info: WifiP2pInfo ->
+            groupActive = info.groupFormed
+            if (info.groupFormed) connectionInProgress = false
             promise.resolve(Arguments.createMap().apply {
                 putBoolean("groupFormed", info.groupFormed)
                 putBoolean("isGroupOwner", info.isGroupOwner)
@@ -910,10 +1001,14 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     }
 
     private fun emitCurrentPeers() {
+        val manager = wifiP2pManager ?: return
+        val currentChannel = channel ?: return
         try {
-            wifiP2pManager?.requestPeers(channel) { peers ->
-                val arr = peersArray(peers?.deviceList ?: emptyList())
-                sendEvent("PEERS_UPDATED", Arguments.createMap().apply { putArray("peers", arr) })
+            manager.requestPeers(currentChannel) { peers ->
+                if (currentChannel !== channel) return@requestPeers
+                sendEvent("PEERS_UPDATED", Arguments.createMap().apply {
+                    putArray("peers", peersArray(peers?.deviceList ?: emptyList()))
+                })
             }
         } catch (_: Exception) {}
     }
@@ -925,29 +1020,57 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 when (intent.action) {
                     WIFI_P2P_STATE_CHANGED_ACTION -> {
                         val state = intent.getIntExtra(EXTRA_WIFI_STATE, -1)
-                        sendEvent("WIFI_P2P_STATE_CHANGED", Arguments.createMap().apply {
-                            putBoolean("enabled", state == WIFI_P2P_STATE_ENABLED)
-                        })
+                        val enabled = state == WIFI_P2P_STATE_ENABLED
+                        sendEvent("WIFI_P2P_STATE_CHANGED", Arguments.createMap().apply { putBoolean("enabled", enabled) })
+                        if (!enabled) {
+                            resetChannelScopedServiceState()
+                        } else if (desiredDeviceLabel != null && desiredDeviceId != null) {
+                            if (ensureChannel()) restoreDesiredAdvertising(advertisingGeneration, 0)
+                        }
                     }
+
+                    WIFI_P2P_DISCOVERY_CHANGED_ACTION -> {
+                        val state = intent.getIntExtra(EXTRA_DISCOVERY_STATE, WIFI_P2P_DISCOVERY_STOPPED)
+                        discoveryActive = state == WIFI_P2P_DISCOVERY_STARTED
+                        sendEvent("WIFI_P2P_DISCOVERY_CHANGED", Arguments.createMap().apply {
+                            putBoolean("active", discoveryActive)
+                            putInt("state", state)
+                        })
+                        if (!discoveryActive && canRefreshPresence(presenceGeneration)) {
+                            val presence = presenceGeneration
+                            mainHandler.postDelayed({
+                                if (!discoveryActive && canRefreshPresence(presence)) refreshActivePresence(presence, 0)
+                            }, 1_200L)
+                        }
+                    }
+
                     WIFI_P2P_PEERS_CHANGED_ACTION -> emitCurrentPeers()
+
                     WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
                         val eventEpoch = connectionGeneration
-                        wifiP2pManager?.requestConnectionInfo(channel) { info ->
-                            if (!isCurrentConnectionEpoch(eventEpoch, connectionGeneration)) {
+                        val manager = wifiP2pManager ?: return
+                        val currentChannel = channel ?: return
+                        manager.requestConnectionInfo(currentChannel) { info ->
+                            if (currentChannel !== channel || !isCurrentConnectionEpoch(eventEpoch, connectionGeneration)) {
                                 return@requestConnectionInfo
                             }
+                            groupActive = info.groupFormed
+                            connectionInProgress = false
                             if (info.groupFormed) {
                                 val ip = info.groupOwnerAddress?.hostAddress
-                                if (info.isGroupOwner || ip != null) {
-                                    emitPeerConnected(info, ip, eventEpoch)
-                                }
+                                if (info.isGroupOwner || ip != null) emitPeerConnected(info, ip, eventEpoch)
                             } else {
                                 connectionGeneration++
                                 emitCurrentPeers()
                                 sendEvent("PEER_DISCONNECTED", Arguments.createMap())
+                                if (canRefreshPresence(presenceGeneration)) {
+                                    val presence = presenceGeneration
+                                    mainHandler.postDelayed({ refreshActivePresence(presence, 0) }, 600L)
+                                }
                             }
                         }
                     }
+
                     WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> emitCurrentPeers()
                 }
             }
@@ -969,10 +1092,9 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         val manager = wifiP2pManager
         val currentChannel = channel
         if (manager == null || currentChannel == null) return
-
         try {
             manager.requestGroupInfo(currentChannel) { group ->
-                if (epoch != connectionGeneration) return@requestGroupInfo
+                if (currentChannel !== channel || epoch != connectionGeneration) return@requestGroupInfo
                 val peerDeviceAddress = group?.let {
                     connectedPeerAddress(
                         info.isGroupOwner,
@@ -991,11 +1113,15 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     }
 
     private fun sendEvent(name: String, params: WritableMap) {
-        reactApplicationContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(name, params)
+        reactApplicationContext
+            .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+            .emit(name, params)
     }
 
     override fun onCatalystInstanceDestroy() {
         super.onCatalystInstanceDestroy()
+        presenceGeneration++
+        recoveryGeneration++
         receiver?.let { try { reactApplicationContext.unregisterReceiver(it) } catch (_: Exception) {} }
         receiver = null
         isReceiverRegistered = false
