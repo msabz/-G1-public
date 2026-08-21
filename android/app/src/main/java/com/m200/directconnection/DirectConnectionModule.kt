@@ -39,11 +39,11 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     private val SERVICE_NAME = "_musabchat"
     private val SERVICE_TYPE = "_presence._tcp"
 
-    // Keep responder-side P2P active instead of assuming extended LISTEN is a
-    // durable cross-OEM availability primitive. CTS/AOSP test both endpoints
-    // with active discovery, and several OEM stacks lazily create the P2P
-    // interface only after discoverPeers().
+    // Cross-OEM availability is kept active rather than relying on extended
+    // LISTEN. AOSP's startListening() stops active find, while CTS and mature
+    // implementations keep responder-side P2P discovery active/periodic.
     private val ACTIVE_PRESENCE_REFRESH_MS = 45_000L
+    private val CONNECTION_ATTEMPT_WATCHDOG_MS = 35_000L
     private val CHANNEL_RECOVERY_BASE_DELAY_MS = 700L
     private val MAX_CHANNEL_RECOVERY_ATTEMPTS = 2
 
@@ -54,6 +54,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     private var serviceDiscoveryGeneration = 0
     private var connectionGeneration = 0L
     private var presenceGeneration = 0
+    private var presenceScheduleToken = 0L
     private var channelGeneration = 0L
     private var recoveryGeneration = 0L
     private var discoveryActive = false
@@ -130,6 +131,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         advertising = false
         discoveryActive = false
         presenceGeneration++
+        presenceScheduleToken++
     }
 
     private fun recreateChannel(): Boolean {
@@ -273,8 +275,6 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     advertising = true
                     val presence = ++presenceGeneration
                     scheduleActivePresenceRefresh(presence)
-                    // A recovered channel may belong to an OEM stack that only
-                    // materializes its P2P interface after active discovery.
                     mainHandler.postDelayed({ refreshActivePresence(presence, 0) }, 250L)
                 }
 
@@ -299,8 +299,13 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
             serviceRequest == null &&
             !cleanupInProgress && !connectionInProgress && !groupActive
 
-    private fun scheduleActivePresenceRefresh(presence: Int) {
+    private fun scheduleActivePresenceRefresh(
+        presence: Int,
+        delayMs: Long = ACTIVE_PRESENCE_REFRESH_MS
+    ) {
+        val token = ++presenceScheduleToken
         mainHandler.postDelayed({
+            if (token != presenceScheduleToken || presence != presenceGeneration) return@postDelayed
             if (!canRefreshPresence(presence)) {
                 if (presence == presenceGeneration && advertising && serviceInfo != null) {
                     scheduleActivePresenceRefresh(presence)
@@ -308,7 +313,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                 return@postDelayed
             }
             refreshActivePresence(presence, 0)
-        }, ACTIVE_PRESENCE_REFRESH_MS)
+        }, delayMs)
     }
 
     private fun refreshActivePresence(presence: Int, attempt: Int) {
@@ -329,7 +334,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                         mainHandler.postDelayed({ refreshActivePresence(presence, attempt + 1) }, 600L * (attempt + 1))
                     } else if (reason == BUSY && recreateChannel()) {
                         // recreateChannel restores desired advertising and starts
-                        // a fresh generation-scoped active-presence lease.
+                        // a new generation-scoped active presence lease.
                     } else {
                         scheduleActivePresenceRefresh(presence)
                     }
@@ -349,6 +354,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         desiredDeviceLabel = null
         desiredDeviceId = null
         presenceGeneration++
+        presenceScheduleToken++
         try {
             val generation = ++advertisingGeneration
             val info = serviceInfo
@@ -675,9 +681,8 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
 
     @ReactMethod
     fun startPassiveListening(promise: Promise) {
-        // Compatibility API name retained for JS callers. On modern Android we
-        // intentionally keep the responder in active discovery; startListening
-        // calls p2pStopFind() in AOSP and was the source of short visibility.
+        // API name retained for JS compatibility; behavior intentionally uses
+        // active discovery so a cold/lazy OEM P2P interface is actually primed.
         startDiscoveryWithRetry(promise, 0, false)
     }
 
@@ -753,10 +758,25 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         }
     }
 
+    private fun armConnectionAttemptWatchdog(epoch: Long) {
+        mainHandler.postDelayed({
+            if (connectionGeneration != epoch || !connectionInProgress || groupActive) return@postDelayed
+            connectionInProgress = false
+            sendEvent("WIFI_P2P_CONNECTION_ATTEMPT_TIMEOUT", Arguments.createMap().apply {
+                putDouble("connectionEpoch", epoch.toDouble())
+            })
+            if (canRefreshPresence(presenceGeneration)) {
+                scheduleActivePresenceRefresh(presenceGeneration, 600L)
+            }
+        }, CONNECTION_ATTEMPT_WATCHDOG_MS)
+    }
+
     @ReactMethod
     fun createGroup(promise: Promise) {
         connectionGeneration++
+        val epoch = connectionGeneration
         connectionInProgress = true
+        armConnectionAttemptWatchdog(epoch)
         wifiP2pManager?.createGroup(channel, object : ActionListener {
             override fun onSuccess() { promise.resolve("Group creation started") }
             override fun onFailure(reason: Int) {
@@ -772,7 +792,9 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     @ReactMethod
     fun connectToPeer(deviceAddress: String, promise: Promise) {
         connectionGeneration++
+        val epoch = connectionGeneration
         connectionInProgress = true
+        armConnectionAttemptWatchdog(epoch)
         val config = WifiP2pConfig().apply { this.deviceAddress = deviceAddress }
         wifiP2pManager?.connect(channel, config, object : ActionListener {
             override fun onSuccess() { promise.resolve("Connecting to peer") }
@@ -875,10 +897,8 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                         if (group == null) {
                             consecutiveEmptyChecks++
                             if (consecutiveEmptyChecks >= 2) {
-                                // A clean/empty P2P state is not a reason to
-                                // destroy the channel. Keeping it alive avoids
-                                // repeatedly forcing OEM stacks back into a cold
-                                // interface state before each scan.
+                                // Empty/clean is success, not a reason to throw
+                                // the framework back into a cold P2P state.
                                 finish(clean = true, timedOut = false, reinitialized = false)
                             } else {
                                 mainHandler.postDelayed({ pollGroup() }, 350L)
@@ -1037,10 +1057,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                             putInt("state", state)
                         })
                         if (!discoveryActive && canRefreshPresence(presenceGeneration)) {
-                            val presence = presenceGeneration
-                            mainHandler.postDelayed({
-                                if (!discoveryActive && canRefreshPresence(presence)) refreshActivePresence(presence, 0)
-                            }, 1_200L)
+                            scheduleActivePresenceRefresh(presenceGeneration, 1_200L)
                         }
                     }
 
@@ -1064,8 +1081,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                                 emitCurrentPeers()
                                 sendEvent("PEER_DISCONNECTED", Arguments.createMap())
                                 if (canRefreshPresence(presenceGeneration)) {
-                                    val presence = presenceGeneration
-                                    mainHandler.postDelayed({ refreshActivePresence(presence, 0) }, 600L)
+                                    scheduleActivePresenceRefresh(presenceGeneration, 600L)
                                 }
                             }
                         }
@@ -1121,6 +1137,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
     override fun onCatalystInstanceDestroy() {
         super.onCatalystInstanceDestroy()
         presenceGeneration++
+        presenceScheduleToken++
         recoveryGeneration++
         receiver?.let { try { reactApplicationContext.unregisterReceiver(it) } catch (_: Exception) {} }
         receiver = null
