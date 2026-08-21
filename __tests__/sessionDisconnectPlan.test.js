@@ -47,6 +47,18 @@ describe('session disconnect planning', () => {
     }).attemptLegacyWifiDirectReconnect).toBe(false);
   });
 
+  test('coordinator-owned Wi-Fi Direct never falls back to App legacy reconnect', () => {
+    expect(getSessionDisconnectPlan({
+      transport: TRANSPORTS.P2P,
+      controlOwner: CONTROL_PLANE_OWNERS.COORDINATOR,
+      unexpected: true,
+    })).toEqual({
+      disconnectViaCoordinator: true,
+      cleanupWifiDirect: true,
+      attemptLegacyWifiDirectReconnect: false,
+    });
+  });
+
   test('future non-P2P coordinator transport does not inherit Wi-Fi Direct teardown semantics', () => {
     expect(getSessionDisconnectPlan({
       transport: 'I2P',

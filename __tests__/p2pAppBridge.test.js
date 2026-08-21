@@ -25,6 +25,35 @@ describe('p2pAppBridge', () => {
     })).toThrow(/هوية G1 الثابتة/);
   });
 
+  test('rejects a saved peerId/deviceId when it is only a Wi-Fi Direct route address', () => {
+    expect(resolveStableP2pDeviceId(
+      {
+        peerId: 'AA:BB:CC:DD:EE:FF',
+        deviceAddress: 'aa:bb:cc:dd:ee:ff',
+      },
+      { deviceAddress: '11:22:33:44:55:66' }
+    )).toBeNull();
+
+    expect(resolveStableP2pDeviceId(
+      {
+        deviceId: '11:22:33:44:55:66',
+        deviceAddress: 'AA:BB:CC:DD:EE:FF',
+      },
+      { deviceAddress: '11:22:33:44:55:66' }
+    )).toBeNull();
+  });
+
+  test('rejects a confirmed discovery peerId when it still equals the route address', () => {
+    expect(resolveStableP2pDeviceId(
+      { peerId: 'saved-id' },
+      {
+        isMusab: true,
+        peerId: 'AA:BB:CC:DD:EE:FF',
+        deviceAddress: 'aa:bb:cc:dd:ee:ff',
+      }
+    )).toBeNull();
+  });
+
   test('prefers DNS-SD stable peerId for a confirmed G1 discovery', () => {
     expect(resolveStableP2pDeviceId(
       { peerId: 'saved-id' },

@@ -5,14 +5,35 @@ function firstText(...values) {
   return values.find(value => typeof value === 'string' && value.trim()) || '';
 }
 
+function normalizeText(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
 export function resolveStableP2pDeviceId(contact = {}, discoveredPeer = {}) {
-  // DNS-SD/Musab discovery is allowed to provide a stable G1 peerId. A raw
-  // Wi-Fi Direct deviceAddress is route metadata only and must never be promoted
-  // into logical identity.
-  if (discoveredPeer.isMusab === true && discoveredPeer.peerId) {
-    return discoveredPeer.peerId;
+  // DNS-SD/Musab discovery may provide the strongest G1 identity candidate,
+  // but even that value must stay separate from Wi-Fi Direct route metadata.
+  const candidate = firstText(
+    discoveredPeer.isMusab === true ? discoveredPeer.peerId : '',
+    contact.deviceId,
+    contact.peerId,
+    discoveredPeer.deviceId
+  );
+  if (!candidate) return null;
+
+  const normalizedCandidate = normalizeText(candidate);
+  const routeAddresses = [
+    discoveredPeer.deviceAddress,
+    contact.deviceAddress,
+    contact.transports?.[TRANSPORTS.P2P]?.deviceAddress,
+  ]
+    .map(normalizeText)
+    .filter(Boolean);
+
+  if (routeAddresses.includes(normalizedCandidate)) {
+    return null;
   }
-  return contact.deviceId || contact.peerId || discoveredPeer.deviceId || null;
+
+  return candidate;
 }
 
 export function buildCoordinatorP2pPeer({
