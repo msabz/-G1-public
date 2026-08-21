@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, FlatList,
   StatusBar, ActivityIndicator, Modal, RefreshControl, Alert, SafeAreaView, ScrollView,
@@ -9,6 +9,8 @@ import { Badge } from './common/Badge';
 import { Button } from './common/Button';
 import { NearbyPeersList } from './discovery/NearbyPeersList';
 import { DeveloperDiagnosticsModal } from './discovery/DeveloperDiagnosticsModal';
+
+const P2P_PEER_DISPLAY_GRACE_MS = 6000;
 
 function formatWhen(ts) {
   if (!ts) return '';
@@ -49,10 +51,92 @@ export default function ContactsScreen({
   const [activeTab, setActiveTab] = useState('chats'); // 'chats', 'discovery', 'calls'
   const [lanModalVisible, setLanModalVisible] = useState(false);
   const [addPeerOpen, setAddPeerOpen] = useState(false);
+  const [visibleDiscovered, setVisibleDiscovered] = useState(discovered);
+  const visibleDiscoveredRef = useRef({});
+  const peerExpiryTimerRef = useRef(null);
+  const previousScanningRef = useRef(scanning);
 
   const toggleTheme = () => {
     setThemeMode(isDark ? 'light' : 'dark');
   };
+
+  // requestPeers() is a point-in-time snapshot. A transient empty snapshot must
+  // not make a peer visually blink out, but it must never leave a stale route
+  // connectable. Keep a short display-only grace with available=false, and
+  // discard the cache immediately when a new user scan begins.
+  useEffect(() => {
+    const now = Date.now();
+    const newScanStarted = scanning && !previousScanningRef.current;
+    previousScanningRef.current = scanning;
+    const previous = newScanStarted ? {} : visibleDiscoveredRef.current;
+    const next = {};
+
+    (discovered || []).forEach((peer, index) => {
+      const key = String(
+        peer?.deviceAddress || peer?.peerId || peer?.deviceName || `peer:${index}`
+      ).toLowerCase();
+      next[key] = {
+        ...(previous[key] || {}),
+        ...peer,
+        lastSeenAt: now,
+        transientMissing: false,
+      };
+    });
+
+    if (!newScanStarted) {
+      Object.entries(previous).forEach(([key, peer]) => {
+        if (next[key]) return;
+        const lastSeenAt = Number(peer?.lastSeenAt) || 0;
+        if (lastSeenAt > 0 && now - lastSeenAt < P2P_PEER_DISPLAY_GRACE_MS) {
+          next[key] = {
+            ...peer,
+            available: false,
+            transientMissing: true,
+          };
+        }
+      });
+    }
+
+    visibleDiscoveredRef.current = next;
+    setVisibleDiscovered(Object.values(next));
+
+    if (peerExpiryTimerRef.current) {
+      clearTimeout(peerExpiryTimerRef.current);
+      peerExpiryTimerRef.current = null;
+    }
+
+    const scheduleNextExpiry = () => {
+      const snapshot = visibleDiscoveredRef.current;
+      const stalePeers = Object.values(snapshot).filter(
+        peer => peer.transientMissing === true && Number(peer.lastSeenAt) > 0
+      );
+      if (!stalePeers.length) return;
+
+      const nextExpiryAt = Math.min(
+        ...stalePeers.map(peer => Number(peer.lastSeenAt) + P2P_PEER_DISPLAY_GRACE_MS)
+      );
+      const waitMs = Math.max(50, nextExpiryAt - Date.now() + 25);
+      peerExpiryTimerRef.current = setTimeout(() => {
+        peerExpiryTimerRef.current = null;
+        const cutoff = Date.now();
+        const pruned = Object.fromEntries(
+          Object.entries(visibleDiscoveredRef.current).filter(([, peer]) => (
+            peer.transientMissing !== true ||
+            cutoff - Number(peer.lastSeenAt || 0) < P2P_PEER_DISPLAY_GRACE_MS
+          ))
+        );
+        visibleDiscoveredRef.current = pruned;
+        setVisibleDiscovered(Object.values(pruned));
+        scheduleNextExpiry();
+      }, waitMs);
+    };
+
+    scheduleNextExpiry();
+  }, [discovered, scanning]);
+
+  useEffect(() => () => {
+    if (peerExpiryTimerRef.current) clearTimeout(peerExpiryTimerRef.current);
+  }, []);
 
   const samePeer = (a, b) => {
     if (!a || !b) return false;
@@ -151,34 +235,56 @@ export default function ContactsScreen({
           {scanning && <ActivityIndicator size="small" color={theme.accent} />}
         </View>
 
-        {discovered.length === 0 ? (
+        {visibleDiscovered.length === 0 ? (
           <View style={styles.emptyBox}>
             <Text style={[styles.emptyText, { color: theme.textMuted }]}>
               {scanning ? 'جاري البحث عن أجهزة قريبة...' : 'لم يتم العثور على أجهزة بعد. اضغط "بحث جديد" بالأسفل.'}
             </Text>
           </View>
         ) : (
-          discovered.map((d, index) => {
+          visibleDiscovered.map((d, index) => {
             const dName = d.deviceName || d.name || d.deviceAddress || 'جهاز مجاور';
             const isConfirmed = d.isMusab === true;
+            const isAvailable = d.available === true;
+            const isTransient = d.transientMissing === true;
+            const statusLabel = isTransient
+              ? 'شوهد قبل لحظات — جارٍ التحقق'
+              : isAvailable && isConfirmed
+                ? '✓ DirectChat مؤكد'
+                : isAvailable
+                  ? 'جهاز Wi-Fi Direct قريب — غير مؤكد كـ DirectChat'
+                  : isConfirmed
+                    ? 'DirectChat مؤكد — غير متاح الآن'
+                    : 'جهاز Wi-Fi Direct — غير متاح الآن';
             return (
               <TouchableOpacity
                 key={d.deviceAddress || index}
+                activeOpacity={isAvailable ? 0.7 : 1}
+                disabled={!isAvailable}
                 style={[styles.peerRow, { borderBottomColor: theme.borderSubtle }]}
-                onPress={() => onOpenChat && onOpenChat(d)}
+                onPress={isAvailable ? () => onOpenChat && onOpenChat(d) : undefined}
               >
-                <Avatar name={dName} size={46} transportType="wifidirect" isOnline={isConfirmed} />
+                <Avatar
+                  name={dName}
+                  size={46}
+                  transportType="wifidirect"
+                  isOnline={isConfirmed && isAvailable}
+                />
                 <View style={styles.peerInfo}>
                   <Text style={[styles.peerName, { color: theme.text }]}>{dName}</Text>
-                  <Text style={[styles.peerStatus, { color: isConfirmed ? theme.accent : theme.textMuted }]}>
-                    {isConfirmed ? '✓ DirectChat مؤكد' : 'جهاز Wi-Fi Direct قريب — غير مؤكد كـ DirectChat'}
+                  <Text style={[
+                    styles.peerStatus,
+                    { color: isConfirmed && isAvailable ? theme.accent : theme.textMuted },
+                  ]}>
+                    {statusLabel}
                   </Text>
                 </View>
                 <Button
-                  title="اتصال"
+                  title={isAvailable ? 'اتصال' : 'غير متاح'}
                   size="small"
-                  variant={isConfirmed ? 'primary' : 'secondary'}
-                  onPress={() => onOpenChat && onOpenChat(d)}
+                  variant={isConfirmed && isAvailable ? 'primary' : 'secondary'}
+                  disabled={!isAvailable}
+                  onPress={isAvailable ? () => onOpenChat && onOpenChat(d) : undefined}
                 />
               </TouchableOpacity>
             );
@@ -273,7 +379,7 @@ export default function ContactsScreen({
             onPress={() => setActiveTab('discovery')}
           >
             <Text style={[styles.tabText, activeTab === 'discovery' && styles.activeTabText]}>الأجهزة والشبكة</Text>
-            {discovered.length > 0 && <Badge count={discovered.length} variant="subtle" style={{ marginLeft: 4 }} />}
+            {visibleDiscovered.length > 0 && <Badge count={visibleDiscovered.length} variant="subtle" style={{ marginLeft: 4 }} />}
           </TouchableOpacity>
 
           <TouchableOpacity
