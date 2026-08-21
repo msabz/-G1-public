@@ -8,12 +8,14 @@ import { setUiAttached } from './src/services/BackgroundRuntime';
 import { connectionCoordinator } from './src/network/ConnectionCoordinator';
 import { lanPassiveAdmissionHandler } from './src/network/LanPassiveAdmission';
 import { wifiDirectTransportAdapter } from './src/network/WifiDirectTransportAdapter';
+import { startP2pDiscoveryDiagnostics } from './src/network/p2pDiscoveryDiagnostics';
 import { setPassiveInboundAdmissionHandler } from './src/webrtc/signaling';
 import { signalingOwner } from './src/webrtc/signalingOwner';
 
 connectionCoordinator.setSignalingOwner(signalingOwner);
 connectionCoordinator.setP2pAdapter(wifiDirectTransportAdapter);
 wifiDirectTransportAdapter.startObserving();
+startP2pDiscoveryDiagnostics();
 setPassiveInboundAdmissionHandler(lanPassiveAdmissionHandler);
 
 function G1Root() {
