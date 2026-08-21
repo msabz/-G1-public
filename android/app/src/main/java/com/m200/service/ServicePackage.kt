@@ -11,9 +11,6 @@ class ServicePackage : ReactPackage {
             ServiceModule(reactContext),
             StorageModule(reactContext),
             CallNotificationModule(reactContext),
-            G1IdentityModule(reactContext),
-            G1ContactModule(reactContext),
-            G1QrModule(reactContext),
         )
 
     override fun createViewManagers(reactContext: ReactApplicationContext) = emptyList<ViewManager<*, *>>()

@@ -4,7 +4,6 @@ jest.mock('react-native-tcp-socket', () => ({
 }));
 
 import { PeerRegistry, TRANSPORTS } from '../src/network/PeerRegistry';
-import { IDENTITY_SOURCE, IDENTITY_TRUST } from '../src/network/IdentityModel';
 import {
   buildCoordinatorP2pPeer,
   connectP2pFromApp,
@@ -55,31 +54,18 @@ describe('p2pAppBridge', () => {
     )).toBeNull();
   });
 
-  test('prefers DNS-SD stable peerId only as a discovery-time expectation', () => {
-    const registry = new PeerRegistry({ myDeviceId: 'self' });
-    const result = buildCoordinatorP2pPeer({
-      contact: { peerId: 'saved-id' },
-      discoveredPeer: {
-        isMusab: true,
-        peerId: 'dns-id',
-        deviceAddress: 'AA:BB:CC:DD:EE:FF',
-      },
-      registry,
-    });
-
-    expect(result.identity.deviceId).toBe('dns-id');
-    expect(result.identity.trust).toBe(IDENTITY_TRUST.DISCOVERY_ASSERTED);
-    expect(result.identity.source).toBe(IDENTITY_SOURCE.DNS_SD_TXT);
-    expect(registry.getPeer('dns-id').identityTrust).toBe(IDENTITY_TRUST.DISCOVERY_ASSERTED);
+  test('prefers DNS-SD stable peerId for a confirmed G1 discovery', () => {
+    expect(resolveStableP2pDeviceId(
+      { peerId: 'saved-id' },
+      { isMusab: true, peerId: 'dns-id', deviceAddress: 'AA:BB' }
+    )).toBe('dns-id');
   });
 
-  test('builds a current P2P registry endpoint from saved expectation plus fresh route', () => {
+  test('builds a current P2P registry endpoint from saved identity plus fresh route', () => {
     const registry = new PeerRegistry({ myDeviceId: 'self' });
     const result = buildCoordinatorP2pPeer({
       contact: {
         peerId: 'peer-id',
-        userId: 'a'.repeat(64),
-        g1Number: 'G1-EXPECTED',
         customName: 'My peer',
         deviceAddress: 'OLD:ADDRESS',
       },
@@ -92,12 +78,6 @@ describe('p2pAppBridge', () => {
     });
 
     expect(result.displayName).toBe('My peer');
-    expect(result.identity).toEqual(expect.objectContaining({
-      deviceId: 'peer-id',
-      userId: 'a'.repeat(64),
-      g1Number: 'G1-EXPECTED',
-      trust: IDENTITY_TRUST.UNVERIFIED,
-    }));
     expect(result.peer.deviceId).toBe('peer-id');
     expect(result.peer.transports[TRANSPORTS.P2P]).toEqual(expect.objectContaining({
       deviceAddress: 'AA:BB:CC:DD:EE:FF',
@@ -106,23 +86,14 @@ describe('p2pAppBridge', () => {
     }));
   });
 
-  test('connectP2pFromApp passes ExpectedIdentity and returns only SESSION_PROVEN identity', async () => {
+  test('connectP2pFromApp delegates logical ownership to coordinator and returns UI projection', async () => {
     const registry = new PeerRegistry({ myDeviceId: 'self' });
-    const provenIdentity = {
-      deviceId: 'peer-id',
-      userId: 'b'.repeat(64),
-      g1Number: 'G1-PROVEN',
-      keyFingerprint: 'fp',
-      trust: IDENTITY_TRUST.SESSION_PROVEN,
-      source: IDENTITY_SOURCE.SESSION_PROOF,
-    };
     const coordinator = {
       connectP2pPeer: jest.fn().mockResolvedValue({ isConnected: true }),
       getCoordinatorStatus: jest.fn(() => ({
         state: 'CONNECTED',
         transport: TRANSPORTS.P2P,
         peer: { deviceId: 'peer-id' },
-        provenIdentity,
         p2p: {
           activeRoute: {
             isGroupOwner: false,
@@ -144,60 +115,24 @@ describe('p2pAppBridge', () => {
     expect(coordinator.connectP2pPeer).toHaveBeenCalledWith(
       expect.objectContaining({ deviceId: 'peer-id' }),
       25000,
-      {
-        incoming: true,
-        expectedIdentity: expect.objectContaining({
-          deviceId: 'peer-id',
-          trust: IDENTITY_TRUST.UNVERIFIED,
-        }),
-      }
+      { incoming: true }
     );
     expect(result).toEqual(expect.objectContaining({
       displayName: 'Peer',
-      identity: provenIdentity,
-      expectedIdentity: expect.objectContaining({ deviceId: 'peer-id' }),
       controlOwner: 'COORDINATOR',
       transport: TRANSPORTS.P2P,
       route: expect.objectContaining({ groupOwnerAddress: '192.168.49.1' }),
     }));
-    expect(registry.getPeer('peer-id')).toEqual(expect.objectContaining({
-      userId: 'b'.repeat(64),
-      identityTrust: IDENTITY_TRUST.SESSION_PROVEN,
-    }));
   });
 
-  test('does not report success while coordinator is still AUTHENTICATING', async () => {
-    const registry = new PeerRegistry({ myDeviceId: 'self' });
-    const coordinator = {
-      connectP2pPeer: jest.fn().mockResolvedValue(undefined),
-      getCoordinatorStatus: jest.fn(() => ({
-        state: 'AUTHENTICATING',
-        transport: TRANSPORTS.P2P,
-        peer: { deviceId: 'peer-id' },
-        provenIdentity: null,
-      })),
-    };
-
-    await expect(connectP2pFromApp({
-      contact: { peerId: 'peer-id' },
-      discoveredPeer: { deviceAddress: 'AA:BB:CC:DD:EE:FF' },
-      coordinator,
-      registry,
-    })).rejects.toThrow(/إثبات هوية G1/);
-  });
-
-  test('does not report success for CONNECTED P2P without matching session proof', async () => {
+  test('does not report success when coordinator status diverges from requested peer', async () => {
     const registry = new PeerRegistry({ myDeviceId: 'self' });
     const coordinator = {
       connectP2pPeer: jest.fn().mockResolvedValue(undefined),
       getCoordinatorStatus: jest.fn(() => ({
         state: 'CONNECTED',
         transport: TRANSPORTS.P2P,
-        peer: { deviceId: 'peer-id' },
-        provenIdentity: {
-          deviceId: 'different-peer',
-          trust: IDENTITY_TRUST.SESSION_PROVEN,
-        },
+        peer: { deviceId: 'different-peer' },
       })),
     };
 
@@ -206,23 +141,18 @@ describe('p2pAppBridge', () => {
       discoveredPeer: { deviceAddress: 'AA:BB:CC:DD:EE:FF' },
       coordinator,
       registry,
-    })).rejects.toThrow(/إثبات هوية G1/);
+    })).rejects.toThrow(/انتهت جلسة Wi-Fi Direct/);
   });
 
-  test('recognizes only the exact cryptographically proven coordinator-owned P2P peer', () => {
+  test('recognizes only the exact coordinator-owned P2P peer', () => {
     const status = {
       state: 'CONNECTED',
       transport: TRANSPORTS.P2P,
       peer: { deviceId: 'peer-id' },
-      provenIdentity: {
-        deviceId: 'peer-id',
-        trust: IDENTITY_TRUST.SESSION_PROVEN,
-      },
     };
 
     expect(isCoordinatorOwnedP2pSession(status, 'peer-id')).toBe(true);
     expect(isCoordinatorOwnedP2pSession(status, 'other')).toBe(false);
     expect(isCoordinatorOwnedP2pSession({ ...status, transport: TRANSPORTS.LAN }, 'peer-id')).toBe(false);
-    expect(isCoordinatorOwnedP2pSession({ ...status, provenIdentity: null }, 'peer-id')).toBe(false);
   });
 });
