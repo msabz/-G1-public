@@ -237,6 +237,7 @@ export class PeerRegistry {
     const peer = this.peers.get(deviceId);
     if (!peer) return;
     peer.connectedTransport = null;
+    peer.status = PEER_STATUS.OFFLINE;
     this._refreshPeerStatus(peer);
     this._notify();
   }

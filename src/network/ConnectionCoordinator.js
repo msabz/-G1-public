@@ -13,6 +13,59 @@ export const COORDINATOR_STATE = {
 export const HEARTBEAT_INTERVAL_MS = 6000;
 export const HEARTBEAT_TIMEOUT_MS = 18000;
 
+/**
+ * Bluetooth adapter boundary (no native module import in this coordinator):
+ *
+ * connectPeer(peer, { address, timeoutMs, attemptToken }) -> session | { session }
+ * cancelConnect({ attemptToken, reason })
+ * sendMessage(message, session) -> boolean (or expose session.sendMessage)
+ * disconnect(session, { reason }) (or expose session.disconnect/destroy)
+ * subscribeDisconnect(observer, session) -> removable subscription
+ *
+ * Make-before-break additionally uses prepareConnection, commitConnection and
+ * discardConnection. Every callback receives the immutable attempt token.
+ */
+export const BLUETOOTH_ADAPTER_CONTRACT = Object.freeze({
+  required: Object.freeze(['connectPeer']),
+  optional: Object.freeze([
+    'cancelConnect',
+    'disconnect',
+    'discardConnection',
+    'prepareConnection',
+    'commitConnection',
+    'sendMessage',
+    'subscribeDisconnect',
+    'setIdentity',
+    'getStatus',
+  ]),
+});
+
+export class CoordinatorConnectionBusyError extends Error {
+  constructor(activePeerId, requestedPeerId) {
+    super(`ConnectionCoordinator already owns a session for ${activePeerId}; cannot connect ${requestedPeerId}`);
+    this.name = 'CoordinatorConnectionBusyError';
+    this.activePeerId = activePeerId;
+    this.requestedPeerId = requestedPeerId;
+  }
+}
+
+export class TransportTransitionLimitError extends Error {
+  constructor(limit) {
+    super(`Transport transition limit reached (${limit})`);
+    this.name = 'TransportTransitionLimitError';
+    this.limit = limit;
+  }
+}
+
+export class TransportHandoverTimeoutError extends Error {
+  constructor(transport, timeoutMs) {
+    super(`Transport handover to ${transport} timed out after ${timeoutMs}ms`);
+    this.name = 'TransportHandoverTimeoutError';
+    this.transport = transport;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export class ConnectionCoordinator {
   constructor(options = {}) {
     this.myDeviceId = options.myDeviceId || '';
@@ -21,12 +74,21 @@ export class ConnectionCoordinator {
     this.activeSession = null;
     this.currentPeer = null;
     this.currentTransport = null;
+    this.preferredTransport = null;
     this.generation = 0;
+    this.attemptSequence = 0;
+    this.pendingAttempt = null;
+    this.pendingHandover = null;
+    this.transitionCount = 0;
+    this.maxTransportTransitions = Number.isFinite(options.maxTransportTransitions)
+      ? Math.max(0, Math.floor(options.maxTransportTransitions))
+      : 2;
 
     this.onStateChange = options.onStateChange || null;
     this.onMessage = options.onMessage || null;
     this.onConnected = options.onConnected || null;
     this.onDisconnected = options.onDisconnected || null;
+    this.onTransportChanged = options.onTransportChanged || null;
     this.onError = options.onError || null;
 
     this.heartbeatInterval = null;
@@ -41,11 +103,28 @@ export class ConnectionCoordinator {
     this.signalingOwner = options.signalingOwner || null;
     this.activeSessionManagedExternally = false;
     this.signalingDisconnectSubscription = null;
+    this.transportDisconnectSubscription = null;
+    this.activeTransportAdapter = null;
 
     // Wi-Fi Direct transport adapter owns only Android P2P route lifecycle:
     // discovery observations, group negotiation, bind/unbind and cleanup. It
     // never owns signaling, heartbeat, peer identity semantics or UI state.
     this.p2pAdapter = options.p2pAdapter || null;
+
+    // Bluetooth is injected behind a transport adapter. The coordinator never
+    // imports the React Native module directly, which keeps discovery/native
+    // details out of policy and makes ownership testable.
+    this.bluetoothAdapter = null;
+    this.transportHandoverAdapters = new Map();
+    this.fallbackEngine = options.fallbackEngine || null;
+    if (options.bluetoothAdapter) {
+      this._validateBluetoothAdapter(options.bluetoothAdapter);
+      this.bluetoothAdapter = options.bluetoothAdapter;
+      this.transportHandoverAdapters.set(TRANSPORTS.BLUETOOTH, options.bluetoothAdapter);
+    }
+    for (const [transport, adapter] of Object.entries(options.transportAdapters || {})) {
+      if (adapter) this.transportHandoverAdapters.set(transport, adapter);
+    }
   }
 
   setIdentity({ deviceId, deviceName }) {
@@ -55,6 +134,61 @@ export class ConnectionCoordinator {
     try {
       this.p2pAdapter?.setIdentity?.({ deviceId, deviceName });
     } catch (e) {}
+    try {
+      this.bluetoothAdapter?.setIdentity?.({ deviceId, deviceName });
+    } catch (e) {}
+  }
+
+  _validateBluetoothAdapter(adapter) {
+    if (!adapter || typeof adapter.connectPeer !== 'function') {
+      throw new TypeError('Bluetooth adapter must implement connectPeer(peer, options)');
+    }
+    return adapter;
+  }
+
+  setFallbackEngine(engine) {
+    if (engine === this.fallbackEngine) return;
+    if (this.pendingAttempt || this.pendingHandover) {
+      throw new Error('Cannot replace fallback engine while a transport attempt is active');
+    }
+    this.fallbackEngine = engine || null;
+  }
+
+  setBluetoothAdapter(adapter) {
+    if (adapter === this.bluetoothAdapter) return;
+    if (this.state === COORDINATOR_STATE.CONNECTING || this.state === COORDINATOR_STATE.CONNECTED) {
+      throw new Error('Cannot replace Bluetooth adapter while a connection is active');
+    }
+    if (adapter) this._validateBluetoothAdapter(adapter);
+    this.bluetoothAdapter = adapter || null;
+    if (adapter) this.transportHandoverAdapters.set(TRANSPORTS.BLUETOOTH, adapter);
+    else this.transportHandoverAdapters.delete(TRANSPORTS.BLUETOOTH);
+    if (adapter && this.myDeviceId) {
+      try {
+        adapter.setIdentity?.({
+          deviceId: this.myDeviceId,
+          deviceName: this.myDeviceName,
+        });
+      } catch (e) {}
+    }
+  }
+
+  setTransportHandoverAdapter(transport, adapter) {
+    if (!Object.values(TRANSPORTS).includes(transport)) {
+      throw new Error(`Unsupported transport: ${transport}`);
+    }
+    if (this.pendingHandover || (this.state === COORDINATOR_STATE.CONNECTED && transport === this.currentTransport)) {
+      throw new Error('Cannot replace an active transport adapter');
+    }
+    if (transport === TRANSPORTS.BLUETOOTH) {
+      this.setBluetoothAdapter(adapter);
+      return;
+    }
+    if (adapter && typeof adapter.prepareConnection !== 'function') {
+      throw new TypeError('Handover adapter must implement prepareConnection(peer, options)');
+    }
+    if (adapter) this.transportHandoverAdapters.set(transport, adapter);
+    else this.transportHandoverAdapters.delete(transport);
   }
 
   setSignalingOwner(owner) {
@@ -82,10 +216,131 @@ export class ConnectionCoordinator {
     }
   }
 
+  connectPeer(peer, options = {}) {
+    if (!this.fallbackEngine || typeof this.fallbackEngine.connect !== 'function') {
+      return Promise.reject(new Error('Transport fallback engine is not configured'));
+    }
+    return this.fallbackEngine.connect(peer, options.handlers || {}, options);
+  }
+
+  _connectionKey(peer, transport) {
+    return `${peer?.deviceId || ''}:${transport}`;
+  }
+
+  _getReusableConnection(peer, transport) {
+    const key = this._connectionKey(peer, transport);
+    if (this.pendingAttempt?.key === key) {
+      return this.pendingAttempt.promise;
+    }
+
+    if (this.pendingHandover) {
+      return Promise.reject(new CoordinatorConnectionBusyError(
+        this.currentPeer?.deviceId || this.pendingHandover.token.peerId,
+        peer?.deviceId || '',
+      ));
+    }
+
+    if (this.state !== COORDINATOR_STATE.CONNECTED) return null;
+    if (this.activeSession?.isConnected === false) {
+      this._handleSessionTermination({ releaseTransport: true });
+      return null;
+    }
+    const samePeer = this.currentPeer?.deviceId === peer?.deviceId;
+    const sameTransport = this.currentTransport === transport;
+    if (samePeer && sameTransport && this.activeSession) {
+      return Promise.resolve(this.activeSession);
+    }
+    return Promise.reject(new CoordinatorConnectionBusyError(
+      this.currentPeer?.deviceId || '',
+      peer?.deviceId || '',
+    ));
+  }
+
+  _createAttemptToken(peer, transport) {
+    const generation = ++this.generation;
+    const attemptId = ++this.attemptSequence;
+    return Object.freeze({
+      generation,
+      attemptId,
+      peerId: peer?.deviceId || '',
+      transport,
+    });
+  }
+
+  _trackPendingAttempt(peer, transport, token, promise) {
+    const record = {
+      key: this._connectionKey(peer, transport),
+      token,
+      promise: null,
+    };
+    const tracked = Promise.resolve(promise).finally(() => {
+      if (this.pendingAttempt === record) {
+        this.pendingAttempt = null;
+      }
+    });
+    record.promise = tracked;
+    this.pendingAttempt = record;
+    return tracked;
+  }
+
+  _isAttemptCurrent(token) {
+    return this.generation === token?.generation &&
+      this.pendingAttempt?.token === token;
+  }
+
+  _clearTransportDisconnectSubscription() {
+    const subscription = this.transportDisconnectSubscription;
+    this.transportDisconnectSubscription = null;
+    if (!subscription) return;
+    try {
+      if (typeof subscription === 'function') subscription();
+      else subscription.remove?.();
+    } catch (e) {}
+  }
+
+  _subscribeToTransportDisconnect(adapter, session, generation) {
+    this._clearTransportDisconnectSubscription();
+    if (typeof adapter?.subscribeDisconnect !== 'function') return;
+    const observer = () => {
+      if (
+        this.generation !== generation ||
+        this.activeTransportAdapter !== adapter ||
+        this.activeSession !== session ||
+        this.state !== COORDINATOR_STATE.CONNECTED
+      ) {
+        return;
+      }
+      this._handleSessionTermination();
+    };
+
+    try {
+      const subscription = adapter.subscribeDisconnect(observer, session) || null;
+      if (
+        this.generation !== generation ||
+        this.activeTransportAdapter !== adapter ||
+        this.activeSession !== session ||
+        this.state !== COORDINATOR_STATE.CONNECTED
+      ) {
+        try {
+          if (typeof subscription === 'function') subscription();
+          else subscription?.remove?.();
+        } catch (e) {}
+        return;
+      }
+      this.transportDisconnectSubscription = subscription;
+    } catch (error) {
+      console.warn('Coordinator transport disconnect subscription failed:', error?.message || error);
+    }
+  }
+
   _setState(newState, payload = {}) {
     this.state = newState;
     if (this.onStateChange) {
-      this.onStateChange(newState, payload);
+      try {
+        this.onStateChange(newState, payload);
+      } catch (error) {
+        console.warn('Coordinator state observer failed:', error?.message || error);
+      }
     }
   }
 
@@ -99,7 +354,18 @@ export class ConnectionCoordinator {
     } catch (e) {}
   }
 
-  _releaseTransportAfterTermination(transport) {
+  _releaseTransportAfterTermination(transport, session = null, transportAdapter = null) {
+    if (transport === TRANSPORTS.BLUETOOTH && transportAdapter?.disconnect) {
+      try {
+        const result = transportAdapter.disconnect(session, { reason: 'session-terminated' });
+        result?.catch?.(error => {
+          console.warn('Coordinator Bluetooth cleanup after termination failed:', error?.message || error);
+        });
+      } catch (error) {
+        console.warn('Coordinator Bluetooth cleanup after termination failed:', error?.message || error);
+      }
+      return;
+    }
     if (transport !== TRANSPORTS.P2P || !this.p2pAdapter?.disconnect) return;
     try {
       const result = this.p2pAdapter.disconnect();
@@ -168,7 +434,11 @@ export class ConnectionCoordinator {
     const remoteDevId = peerInfo.deviceId || '';
 
     // If already connected or connecting to this peer, resolve race
-    if (this.state === COORDINATOR_STATE.CONNECTING && this.currentPeer?.deviceId === remoteDevId) {
+    if (this.state === COORDINATOR_STATE.CONNECTING) {
+      if (this.currentPeer?.deviceId !== remoteDevId) {
+        try { socket.destroy(); } catch (e) {}
+        return false;
+      }
       if (this.shouldYieldToInbound(remoteDevId)) {
         console.log(`[Coordinator] Yielding outbound connect to inbound from ${remoteDevId}`);
         this.cancelConnecting();
@@ -178,11 +448,10 @@ export class ConnectionCoordinator {
         return false;
       }
     } else if (this.state === COORDINATOR_STATE.CONNECTED) {
-      if (this.currentPeer?.deviceId === remoteDevId) {
-        // Redundant incoming session from same peer
-        try { socket.destroy(); } catch (e) {}
-        return false;
-      }
+      // The coordinator has one logical application session. A second inbound
+      // socket (same or different peer) must not silently replace it.
+      try { socket.destroy(); } catch (e) {}
+      return false;
     }
 
     const session = new SignalingSession({
@@ -194,8 +463,11 @@ export class ConnectionCoordinator {
     session.attachSocket(socket, this.generation);
     this.activeSession = session;
     this.activeSessionManagedExternally = false;
+    this.activeTransportAdapter = null;
     this.currentPeer = peerInfo;
     this.currentTransport = peerInfo.transport || TRANSPORTS.LAN;
+    this.preferredTransport = this.currentTransport;
+    this.transitionCount = 0;
 
     this._startHeartbeat();
     this._setState(COORDINATOR_STATE.CONNECTED, { peer: peerInfo, transport: this.currentTransport });
@@ -264,8 +536,11 @@ export class ConnectionCoordinator {
     this.pendingConnectAbort = null;
     this.activeSession = session;
     this.activeSessionManagedExternally = true;
+    this.activeTransportAdapter = null;
     this.currentPeer = peer;
     this.currentTransport = transport;
+    this.preferredTransport = transport;
+    this.transitionCount = 0;
 
     this._stopHeartbeat();
     this._setState(COORDINATOR_STATE.CONNECTED, {
@@ -280,32 +555,34 @@ export class ConnectionCoordinator {
     return session;
   }
 
-  async connectLanPeer(peer, timeoutMs = 8000, connectOptions = {}) {
+  connectLanPeer(peer, timeoutMs = 8000, connectOptions = {}) {
+    const reusable = this._getReusableConnection(peer, TRANSPORTS.LAN);
+    if (reusable) return reusable;
     const lanInfo = peer.transports?.[TRANSPORTS.LAN] || peer;
     if (!lanInfo.host) {
-      throw new Error('LAN host is missing for peer');
+      return Promise.reject(new Error('LAN host is missing for peer'));
     }
     if (this.signalingOwner && typeof this.signalingOwner.connectOutbound !== 'function') {
-      throw new Error('Configured signaling owner is missing connectOutbound()');
+      return Promise.reject(new Error('Configured signaling owner is missing connectOutbound()'));
     }
 
     const connectionPolicy = {
       maxRetries: connectOptions?.maxRetries ?? 3,
       retryDelayMs: connectOptions?.retryDelayMs ?? 600,
     };
-    const currentGen = ++this.generation;
     this.cancelConnecting();
+    const attemptToken = this._createAttemptToken(peer, TRANSPORTS.LAN);
+    const currentGen = attemptToken.generation;
 
     this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: TRANSPORTS.LAN });
     peerRegistry.setPeerConnecting(peer.deviceId);
     this.currentPeer = peer;
     this.currentTransport = TRANSPORTS.LAN;
 
-    if (this.signalingOwner) {
-      return this._connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs, connectionPolicy);
-    }
-
-    return this._connectLanLegacy(peer, lanInfo, currentGen, connectionPolicy);
+    const attempt = this.signalingOwner
+      ? this._connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs, connectionPolicy)
+      : this._connectLanLegacy(peer, lanInfo, currentGen, connectionPolicy);
+    return this._trackPendingAttempt(peer, TRANSPORTS.LAN, attemptToken, attempt);
   }
 
   async _connectLanWithSignalingOwner(peer, lanInfo, currentGen, timeoutMs, connectionPolicy) {
@@ -345,6 +622,9 @@ export class ConnectionCoordinator {
 
       this.activeSession = session;
       this.activeSessionManagedExternally = true;
+      this.activeTransportAdapter = null;
+      this.preferredTransport = TRANSPORTS.LAN;
+      this.transitionCount = 0;
       // Heartbeat/recovery remain exclusively owned by the injected signaling
       // runtime. Starting the coordinator heartbeat here would create two
       // control-plane liveness owners for the same socket.
@@ -368,33 +648,42 @@ export class ConnectionCoordinator {
     }
   }
 
-  async connectP2pPeer(peer, timeoutMs = 30000, connectOptions = {}) {
+  connectP2pPeer(peer, timeoutMs = 30000, connectOptions = {}) {
+    const reusable = this._getReusableConnection(peer, TRANSPORTS.P2P);
+    if (reusable) return reusable;
     const p2pInfo = peer?.transports?.[TRANSPORTS.P2P] || peer || {};
     const deviceAddress = p2pInfo.deviceAddress || peer?.deviceAddress;
     if (!peer?.deviceId) {
-      throw new Error('Stable peer deviceId is required for Wi-Fi Direct');
+      return Promise.reject(new Error('Stable peer deviceId is required for Wi-Fi Direct'));
     }
     if (!deviceAddress) {
-      throw new Error('Wi-Fi Direct deviceAddress is missing for peer');
+      return Promise.reject(new Error('Wi-Fi Direct deviceAddress is missing for peer'));
     }
     if (!this.p2pAdapter || typeof this.p2pAdapter.connectPeer !== 'function') {
-      throw new Error('Configured Wi-Fi Direct transport adapter is unavailable');
+      return Promise.reject(new Error('Configured Wi-Fi Direct transport adapter is unavailable'));
     }
     const owner = this.signalingOwner;
     if (!owner || typeof owner.getActiveSession !== 'function') {
-      throw new Error('Configured signaling owner is required for Wi-Fi Direct');
+      return Promise.reject(new Error('Configured signaling owner is required for Wi-Fi Direct'));
     }
     if (!this.myDeviceId) {
-      throw new Error('Local stable G1 identity is required before Wi-Fi Direct connect');
+      return Promise.reject(new Error('Local stable G1 identity is required before Wi-Fi Direct connect'));
     }
 
-    const currentGen = ++this.generation;
     this.cancelConnecting();
+    const attemptToken = this._createAttemptToken(peer, TRANSPORTS.P2P);
+    const currentGen = attemptToken.generation;
     this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: TRANSPORTS.P2P });
     peerRegistry.setPeerConnecting(peer.deviceId);
     this.currentPeer = peer;
     this.currentTransport = TRANSPORTS.P2P;
 
+    const attempt = this._connectP2pWithOwners(peer, timeoutMs, connectOptions, currentGen);
+    return this._trackPendingAttempt(peer, TRANSPORTS.P2P, attemptToken, attempt);
+  }
+
+  async _connectP2pWithOwners(peer, timeoutMs, connectOptions, currentGen) {
+    const owner = this.signalingOwner;
     let settled = false;
     let cancelled = false;
     let route = null;
@@ -473,6 +762,9 @@ export class ConnectionCoordinator {
       if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
       this.activeSession = session;
       this.activeSessionManagedExternally = true;
+      this.activeTransportAdapter = null;
+      this.preferredTransport = TRANSPORTS.P2P;
+      this.transitionCount = 0;
       this._stopHeartbeat();
       this._setState(COORDINATOR_STATE.CONNECTED, {
         peer,
@@ -496,6 +788,416 @@ export class ConnectionCoordinator {
         peerRegistry.setPeerDisconnected(peer.deviceId);
       }
       throw err;
+    }
+  }
+
+  connectBluetoothPeer(peer, timeoutMs = 8000, connectOptions = {}) {
+    const reusable = this._getReusableConnection(peer, TRANSPORTS.BLUETOOTH);
+    if (reusable) return reusable;
+
+    const bluetoothInfo = peer?.transports?.[TRANSPORTS.BLUETOOTH] || peer || {};
+    const address = bluetoothInfo.address || peer?.btAddress;
+    if (!peer?.deviceId) {
+      return Promise.reject(new Error('Stable peer deviceId is required for Bluetooth'));
+    }
+    if (!address) {
+      return Promise.reject(new Error('Bluetooth address is missing for peer'));
+    }
+    if (!this.bluetoothAdapter) {
+      return Promise.reject(new Error('Configured Bluetooth transport adapter is unavailable'));
+    }
+
+    this.cancelConnecting();
+    const attemptToken = this._createAttemptToken(peer, TRANSPORTS.BLUETOOTH);
+    this._setState(COORDINATOR_STATE.CONNECTING, { peer, transport: TRANSPORTS.BLUETOOTH });
+    peerRegistry.setPeerConnecting(peer.deviceId);
+    this.currentPeer = peer;
+    this.currentTransport = TRANSPORTS.BLUETOOTH;
+
+    const attempt = this._connectBluetoothWithAdapter(
+      peer,
+      address,
+      timeoutMs,
+      connectOptions,
+      attemptToken,
+    );
+    return this._trackPendingAttempt(
+      peer,
+      TRANSPORTS.BLUETOOTH,
+      attemptToken,
+      attempt,
+    );
+  }
+
+  async _connectBluetoothWithAdapter(peer, address, timeoutMs, connectOptions, attemptToken) {
+    const adapter = this.bluetoothAdapter;
+    let settled = false;
+    let cancelled = false;
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      cancelled = true;
+      try {
+        const result = adapter.cancelConnect?.({
+          attemptToken,
+          reason: 'Coordinator cancelled Bluetooth connect',
+        });
+        result?.catch?.(() => {});
+      } catch (e) {}
+    };
+    this.pendingConnectAbort = abort;
+
+    try {
+      const result = await adapter.connectPeer(peer, {
+        ...connectOptions.adapterOptions,
+        address,
+        timeoutMs,
+        attemptToken,
+      });
+      const session = result?.session || result;
+
+      if (cancelled || !this._isAttemptCurrent(attemptToken)) {
+        try {
+          await adapter.discardConnection?.(session, {
+            attemptToken,
+            reason: 'stale-attempt',
+          });
+        } catch (e) {}
+        return;
+      }
+      if (!session || session.isConnected === false) {
+        throw new Error('Bluetooth adapter completed connect without an active session');
+      }
+
+      settled = true;
+      if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+      this.activeSession = session;
+      this.activeSessionManagedExternally = true;
+      this.activeTransportAdapter = adapter;
+      this.preferredTransport = TRANSPORTS.BLUETOOTH;
+      this.transitionCount = 0;
+      this._stopHeartbeat();
+      this._setState(COORDINATOR_STATE.CONNECTED, {
+        peer,
+        transport: TRANSPORTS.BLUETOOTH,
+      });
+      peerRegistry.setPeerConnected(peer.deviceId, TRANSPORTS.BLUETOOTH);
+      if (this.onConnected) this.onConnected(peer, TRANSPORTS.BLUETOOTH);
+      this._subscribeToTransportDisconnect(adapter, session, attemptToken.generation);
+      return session;
+    } catch (error) {
+      if (cancelled || this.generation !== attemptToken.generation) {
+        return;
+      }
+      settled = true;
+      if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+      this.activeSession = null;
+      this.activeSessionManagedExternally = false;
+      this.activeTransportAdapter = null;
+      this._setState(COORDINATOR_STATE.ERROR, {
+        error: error?.message || String(error),
+        transport: TRANSPORTS.BLUETOOTH,
+      });
+      peerRegistry.setPeerDisconnected(peer.deviceId);
+      throw error;
+    }
+  }
+
+  handoverPeer(peer, targetTransport, options = {}) {
+    if (!peer?.deviceId) {
+      return Promise.reject(new Error('Stable peer deviceId is required for transport handover'));
+    }
+    if (!Object.values(TRANSPORTS).includes(targetTransport)) {
+      return Promise.reject(new Error(`Unsupported handover transport: ${targetTransport}`));
+    }
+    if (
+      this.state !== COORDINATOR_STATE.CONNECTED ||
+      !this.activeSession ||
+      this.currentPeer?.deviceId !== peer.deviceId
+    ) {
+      return Promise.reject(new Error('A healthy active session for this peer is required for handover'));
+    }
+
+    this.preferredTransport = targetTransport;
+    if (targetTransport === this.currentTransport) {
+      return Promise.resolve(this.activeSession);
+    }
+    if (this.transitionCount >= this.maxTransportTransitions) {
+      return Promise.reject(new TransportTransitionLimitError(this.maxTransportTransitions));
+    }
+
+    const handoverKey = `${peer.deviceId}:${targetTransport}`;
+    if (this.pendingHandover?.key === handoverKey) {
+      return this.pendingHandover.promise;
+    }
+    if (this.pendingHandover || this.pendingAttempt) {
+      return Promise.reject(new CoordinatorConnectionBusyError(
+        this.currentPeer?.deviceId || '',
+        peer.deviceId,
+      ));
+    }
+
+    const adapter = options.adapter || this.transportHandoverAdapters.get(targetTransport);
+    const canPrepare = typeof adapter?.prepareConnection === 'function' ||
+      (targetTransport === TRANSPORTS.BLUETOOTH && typeof adapter?.connectPeer === 'function');
+    if (!canPrepare) {
+      return Promise.reject(new Error(
+        `No make-before-break adapter is configured for ${targetTransport}`,
+      ));
+    }
+
+    const token = Object.freeze({
+      attemptId: ++this.attemptSequence,
+      peerId: peer.deviceId,
+      fromTransport: this.currentTransport,
+      transport: targetTransport,
+      baseGeneration: this.generation,
+    });
+    const record = {
+      key: handoverKey,
+      token,
+      adapter,
+      baseSession: this.activeSession,
+      cancelled: false,
+      promise: null,
+    };
+    this.pendingHandover = record;
+    const attempt = this._performHandover(peer, targetTransport, adapter, options, record)
+      .finally(() => {
+        if (this.pendingHandover === record) {
+          this.pendingHandover = null;
+        }
+      });
+    record.promise = attempt;
+    return attempt;
+  }
+
+  /**
+   * Replaces a provisional route identity (for example bluetooth:MAC) with
+   * the stable G1 device identity announced on the already-authenticated
+   * session. The physical session and generation stay untouched.
+   */
+  rebindConnectedPeer(peer, { expectedDeviceId = null } = {}) {
+    if (!peer?.deviceId) throw new Error('Stable peer deviceId is required for identity rebind');
+    if (this.state !== COORDINATOR_STATE.CONNECTED || !this.activeSession || !this.currentPeer) {
+      throw new Error('A connected session is required for identity rebind');
+    }
+    const previous = this.currentPeer;
+    if (expectedDeviceId && previous.deviceId !== expectedDeviceId) {
+      throw new Error('Connected peer changed before identity rebind');
+    }
+    if (previous.deviceId === peer.deviceId) return this.currentPeer;
+
+    this.currentPeer = {
+      ...previous,
+      ...peer,
+      transports: {
+        ...(previous.transports || {}),
+        ...(peer.transports || {}),
+      },
+    };
+    peerRegistry.setPeerDisconnected(previous.deviceId);
+    peerRegistry.setPeerConnected(peer.deviceId, this.currentTransport);
+    return this.currentPeer;
+  }
+
+  _isHandoverCurrent(record) {
+    return this.pendingHandover === record &&
+      !record.cancelled &&
+      this.generation === record.token.baseGeneration &&
+      this.state === COORDINATOR_STATE.CONNECTED &&
+      this.activeSession === record.baseSession &&
+      this.currentPeer?.deviceId === record.token.peerId &&
+      this.currentTransport === record.token.fromTransport;
+  }
+
+  cancelHandover(reason = 'Transport handover was cancelled') {
+    const record = this.pendingHandover;
+    if (!record || record.cancelled) return false;
+    record.cancelled = true;
+    const cancel = record.adapter?.cancelPrepare || record.adapter?.cancelConnect;
+    try {
+      const result = cancel?.call(record.adapter, {
+        attemptToken: record.token,
+        reason,
+      });
+      result?.catch?.(() => {});
+    } catch (e) {}
+    return true;
+  }
+
+  async _discardHandoverCandidate(adapter, candidate, token, reason) {
+    if (!candidate) return;
+    const session = candidate?.session || candidate;
+    try {
+      if (typeof adapter?.discardConnection === 'function') {
+        await adapter.discardConnection(session, { attemptToken: token, reason });
+      } else if (typeof adapter?.disconnect === 'function') {
+        await adapter.disconnect(session, { reason });
+      }
+    } catch (error) {
+      console.warn('Coordinator candidate cleanup failed:', error?.message || error);
+    }
+  }
+
+  async _prepareHandoverCandidate(peer, targetTransport, adapter, options, record) {
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 8000;
+    const prepare = typeof adapter.prepareConnection === 'function'
+      ? adapter.prepareConnection.bind(adapter)
+      : adapter.connectPeer.bind(adapter);
+    const preparePromise = Promise.resolve().then(() => prepare(peer, {
+      ...options.adapterOptions,
+      transport: targetTransport,
+      fromTransport: record.token.fromTransport,
+      timeoutMs,
+      attemptToken: record.token,
+      previousSession: record.baseSession,
+    }));
+
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return preparePromise;
+    }
+
+    let timer = null;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        const cancel = adapter.cancelPrepare || adapter.cancelConnect;
+        try {
+          const result = cancel?.call(adapter, {
+            attemptToken: record.token,
+            reason: 'handover-timeout',
+          });
+          result?.catch?.(() => {});
+        } catch (e) {}
+        reject(new TransportHandoverTimeoutError(targetTransport, timeoutMs));
+      }, timeoutMs);
+      preparePromise.then(value => {
+        if (settled) {
+          this._discardHandoverCandidate(adapter, value, record.token, 'late-timeout-result');
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      }, error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+  }
+
+  _closePreviousSession(previous, reason) {
+    if (previous.adapter) {
+      if (typeof previous.adapter.disconnect === 'function') {
+        try {
+          const result = previous.adapter.disconnect(previous.session, { reason });
+          result?.catch?.(() => {});
+        } catch (e) {}
+      } else {
+        try {
+          const result = previous.session?.disconnect?.() || previous.session?.destroy?.();
+          result?.catch?.(() => {});
+        } catch (e) {}
+      }
+    } else if (previous.managedExternally) {
+      try {
+        const result = this.signalingOwner?.disconnect?.();
+        result?.catch?.(() => {});
+      } catch (e) {}
+    } else {
+      try { previous.session?.destroy?.(); } catch (e) {}
+    }
+
+    if (previous.transport === TRANSPORTS.P2P) {
+      try {
+        const result = this.p2pAdapter?.disconnect?.();
+        result?.catch?.(() => {});
+      } catch (e) {}
+    }
+  }
+
+  async _performHandover(peer, targetTransport, adapter, options, record) {
+    let candidate = null;
+    try {
+      candidate = await this._prepareHandoverCandidate(
+        peer,
+        targetTransport,
+        adapter,
+        options,
+        record,
+      );
+      let session = candidate?.session || candidate;
+      if (!session || session.isConnected === false) {
+        throw new Error(`${targetTransport} handover produced no connected candidate session`);
+      }
+      if (!this._isHandoverCurrent(record)) {
+        await this._discardHandoverCandidate(adapter, candidate, record.token, 'stale-handover');
+        return;
+      }
+
+      if (typeof adapter.commitConnection === 'function') {
+        const committed = await adapter.commitConnection(candidate, {
+          attemptToken: record.token,
+          previousSession: record.baseSession,
+        });
+        session = committed?.session || committed || session;
+      }
+      if (!this._isHandoverCurrent(record)) {
+        await this._discardHandoverCandidate(adapter, candidate, record.token, 'stale-after-commit');
+        return;
+      }
+
+      const previous = {
+        session: this.activeSession,
+        transport: this.currentTransport,
+        managedExternally: this.activeSessionManagedExternally,
+        adapter: this.activeTransportAdapter,
+      };
+      this._stopHeartbeat();
+      this._clearSignalingOwnerDisconnectSubscription();
+      this._clearTransportDisconnectSubscription();
+
+      const generation = ++this.generation;
+      this.activeSession = session;
+      this.activeSessionManagedExternally = true;
+      this.activeTransportAdapter = adapter;
+      this.currentPeer = peer;
+      this.currentTransport = targetTransport;
+      this.preferredTransport = targetTransport;
+      this.transitionCount++;
+      this._setState(COORDINATOR_STATE.CONNECTED, {
+        peer,
+        transport: targetTransport,
+        previousTransport: previous.transport,
+        handover: true,
+      });
+      peerRegistry.setPeerConnected(peer.deviceId, targetTransport);
+      this._subscribeToTransportDisconnect(adapter, session, generation);
+      try {
+        this.onTransportChanged?.({
+          peer,
+          fromTransport: previous.transport,
+          toTransport: targetTransport,
+          attemptToken: record.token,
+        });
+      } catch (error) {
+        console.warn('Coordinator transport-change observer failed:', error?.message || error);
+      }
+
+      // Commit and logical promotion have completed. Only now may the former
+      // healthy session be released (make-before-break).
+      this._closePreviousSession(previous, 'transport-handover');
+      return session;
+    } catch (error) {
+      if (candidate) {
+        await this._discardHandoverCandidate(adapter, candidate, record.token, 'handover-failed');
+      }
+      throw error;
     }
   }
 
@@ -533,6 +1235,9 @@ export class ConnectionCoordinator {
       session.attachSocket(socket, currentGen);
       this.activeSession = session;
       this.activeSessionManagedExternally = false;
+      this.activeTransportAdapter = null;
+      this.preferredTransport = TRANSPORTS.LAN;
+      this.transitionCount = 0;
 
       this._startHeartbeat();
       this._setState(COORDINATOR_STATE.CONNECTED, { peer, transport: TRANSPORTS.LAN });
@@ -617,20 +1322,28 @@ export class ConnectionCoordinator {
     }
 
     this._stopHeartbeat();
+    this.cancelHandover('Active session terminated');
     this._clearSignalingOwnerDisconnectSubscription();
+    this._clearTransportDisconnectSubscription();
     const peer = this.currentPeer;
     const transport = this.currentTransport;
+    const session = this.activeSession;
+    const transportAdapter = this.activeTransportAdapter;
+    this.generation++;
     this.activeSession = null;
     this.activeSessionManagedExternally = false;
+    this.activeTransportAdapter = null;
     this.currentPeer = null;
     this.currentTransport = null;
+    this.preferredTransport = null;
+    this.transitionCount = 0;
     this._setState(COORDINATOR_STATE.IDLE);
 
     if (peer?.deviceId) {
       peerRegistry.setPeerDisconnected(peer.deviceId);
     }
     if (releaseTransport) {
-      this._releaseTransportAfterTermination(transport);
+      this._releaseTransportAfterTermination(transport, session, transportAdapter);
     }
     if (this.onDisconnected) {
       this.onDisconnected(peer);
@@ -642,16 +1355,31 @@ export class ConnectionCoordinator {
     if (!this.activeSession || this.state !== COORDINATOR_STATE.CONNECTED) {
       return false;
     }
+    if (typeof this.activeTransportAdapter?.sendMessage === 'function') {
+      return this.activeTransportAdapter.sendMessage(msgObj, this.activeSession);
+    }
+    if (this.activeTransportAdapter) {
+      return this.activeSession.sendMessage?.(msgObj) ?? false;
+    }
     if (this.activeSessionManagedExternally && typeof this.signalingOwner?.sendMessage === 'function') {
       return this.signalingOwner.sendMessage(msgObj);
     }
-    return this.activeSession.sendMessage(msgObj);
+    return this.activeSession.sendMessage?.(msgObj) ?? false;
   }
 
   cancelConnecting() {
+    const hadPendingAttempt = Boolean(
+      this.pendingAttempt ||
+      this.pendingConnectAbort ||
+      this.state === COORDINATOR_STATE.CONNECTING
+    );
     if (this.pendingConnectAbort) {
       this.pendingConnectAbort();
       this.pendingConnectAbort = null;
+    }
+    this.pendingAttempt = null;
+    if (hadPendingAttempt) {
+      this.generation++;
     }
     if (this.state === COORDINATOR_STATE.CONNECTING) {
       const peer = this.currentPeer;
@@ -662,27 +1390,49 @@ export class ConnectionCoordinator {
         peerRegistry.setPeerDisconnected(peer.deviceId);
       }
     }
+    return hadPendingAttempt;
   }
 
   disconnect() {
-    this.generation++;
+    const peerId = this.currentPeer?.deviceId || this.pendingAttempt?.token?.peerId || null;
+    try { this.fallbackEngine?.cancel?.(peerId, 'Coordinator disconnect requested'); } catch (e) {}
+    this.cancelHandover('Coordinator disconnect requested');
     this._stopHeartbeat();
-    this.cancelConnecting();
     const session = this.activeSession;
     const managedExternally = this.activeSessionManagedExternally;
     const transport = this.currentTransport;
-    if (managedExternally) {
-      this._clearSignalingOwnerDisconnectSubscription();
-    }
+    const transportAdapter = this.activeTransportAdapter;
+    this._clearSignalingOwnerDisconnectSubscription();
+    this._clearTransportDisconnectSubscription();
+    this.cancelConnecting();
+    this.generation++;
     this.activeSession = null;
     this.activeSessionManagedExternally = false;
-    if (managedExternally) {
-      try { this.signalingOwner?.disconnect?.(); } catch (e) {}
+    this.activeTransportAdapter = null;
+    if (transportAdapter && session) {
+      if (typeof transportAdapter.disconnect === 'function') {
+        try {
+          const result = transportAdapter.disconnect(session, { reason: 'explicit-disconnect' });
+          result?.catch?.(() => {});
+        } catch (e) {}
+      } else {
+        try {
+          const result = session.disconnect?.() || session.destroy?.();
+          result?.catch?.(() => {});
+        } catch (e) {}
+      }
+    } else if (managedExternally && session) {
+      try {
+        const result = this.signalingOwner?.disconnect?.();
+        result?.catch?.(() => {});
+      } catch (e) {}
     } else if (session) {
-      session.destroy();
+      try { session.destroy?.(); } catch (e) {}
     }
     this._handleSessionTermination();
-    this._releaseTransportAfterTermination(transport);
+    if (transport === TRANSPORTS.P2P) {
+      this._releaseTransportAfterTermination(transport);
+    }
   }
 
   getActivePeer() {
@@ -694,8 +1444,19 @@ export class ConnectionCoordinator {
       state: this.state,
       peer: this.currentPeer,
       transport: this.currentTransport,
+      preferredTransport: this.preferredTransport,
       generation: this.generation,
+      pendingAttempt: this.pendingAttempt
+        ? { token: this.pendingAttempt.token }
+        : null,
+      pendingHandover: this.pendingHandover
+        ? { token: this.pendingHandover.token }
+        : null,
+      transitionCount: this.transitionCount,
+      maxTransportTransitions: this.maxTransportTransitions,
       p2p: this.p2pAdapter?.getStatus?.() || null,
+      bluetooth: this.bluetoothAdapter?.getStatus?.() || null,
+      fallback: this.fallbackEngine?.getStatus?.() || null,
     };
   }
 }

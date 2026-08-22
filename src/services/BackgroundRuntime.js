@@ -8,6 +8,7 @@ import {
 } from '../media/FileShare';
 import { saveMessage, savePeer } from './Persistence';
 import { showMessageNotification } from './Background';
+import { createIncomingTextMessage, ensureMessageIdentity } from '../messaging/messageModel';
 import {
   clearCallRuntime,
   getActiveCall,
@@ -85,10 +86,13 @@ function handleBackgroundSignal(msg) {
   if (
     msg.type === 'call-ringing' ||
     msg.type === 'call-accept' ||
+    msg.type === 'call-connected' ||
+    msg.type === 'call-active' ||
     msg.type === 'call-reject' ||
     msg.type === 'call-busy' ||
     msg.type === 'call-missed' ||
     msg.type === 'call-cancel' ||
+    msg.type === 'call-failed' ||
     msg.type === 'call-end'
   ) {
     handleRemoteCallSignal(msg);
@@ -97,14 +101,8 @@ function handleBackgroundSignal(msg) {
   if (uiAttached) return;
 
   if (msg.type === 'chat') {
-    const message = {
-      sender: 'remote',
-      type: 'text',
-      text: msg.text || '',
-      status: 'delivered',
-      time: Date.now(),
-    };
-    persistIncomingMessage(message, message.text || 'رسالة جديدة').catch(() => {});
+    const message = createIncomingTextMessage(msg);
+    if (message) persistIncomingMessage(message, message.text).catch(() => {});
   }
 }
 
@@ -133,7 +131,7 @@ function handleIncomingDone({ id, path, size, fileName, mimeType, kind }) {
     ? (path.startsWith('content://') || path.startsWith('file://') ? path : `file://${path}`)
     : null;
   const type = resolvedKind === 'voice' ? 'voice' : resolvedKind === 'image' ? 'image' : 'file';
-  const message = {
+  const message = ensureMessageIdentity({
     sender: 'remote',
     type,
     fileName: resolvedName,
@@ -143,7 +141,7 @@ function handleIncomingDone({ id, path, size, fileName, mimeType, kind }) {
     size: size || start.size || 0,
     status: 'delivered',
     time: Date.now(),
-  };
+  });
   const notificationBody =
     resolvedKind === 'voice' ? 'رسالة صوتية' :
     resolvedKind === 'image' ? 'صورة' :
@@ -175,7 +173,9 @@ export function getBackgroundPeer() {
 
 export function getPendingIncomingCall() {
   const call = getActiveCall();
-  return call?.direction === 'incoming' && !['ended', 'missed', 'declined', 'rejected', 'cancelled'].includes(call.finalState)
+  return call?.direction === 'incoming' && ![
+    'ended', 'missed', 'declined', 'rejected', 'cancelled', 'busy', 'failed',
+  ].includes(call.finalState)
     ? call
     : null;
 }

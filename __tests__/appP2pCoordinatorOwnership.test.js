@@ -40,7 +40,7 @@ describe('App outbound P2P coordinator ownership wiring', () => {
       /const handleConnectLan = async \(ip, port = 8089\) => \{[\s\S]*?if \(coordinatorP2pAttemptRef\.current\)/
     );
     expect(source).toMatch(
-      /const btConnect = async \(address\) => \{[\s\S]*?if \(coordinatorP2pAttemptRef\.current\)/
+      /const btConnect = async (?:\([^)]*\)|\w+) => \{[\s\S]*?if \(coordinatorP2pAttemptRef\.current\)/
     );
   });
 

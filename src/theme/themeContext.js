@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useEffect, useState } from 'react';
 import { useColorScheme } from 'react-native';
 import { lightColors, darkColors } from './colors';
+import { getThemeMode, persistThemeMode } from '../services/Persistence';
 
 const ThemeContext = createContext({
   theme: darkColors,
@@ -11,7 +12,21 @@ const ThemeContext = createContext({
 
 export const ThemeProvider = ({ children }) => {
   const systemColorScheme = useColorScheme();
-  const [mode, setMode] = useState('dark');
+  const [mode, setMode] = useState('system');
+
+  useEffect(() => {
+    let active = true;
+    getThemeMode().then(savedMode => {
+      if (active) setMode(savedMode);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const setThemeMode = nextMode => {
+    if (!['system', 'light', 'dark'].includes(nextMode)) return;
+    setMode(nextMode);
+    persistThemeMode(nextMode);
+  };
 
   const isDark = mode === 'system' ? systemColorScheme === 'dark' : mode === 'dark';
   const theme = isDark ? darkColors : lightColors;
@@ -22,7 +37,7 @@ export const ThemeProvider = ({ children }) => {
         theme,
         mode,
         isDark,
-        setThemeMode: setMode,
+        setThemeMode,
       }}
     >
       {children}

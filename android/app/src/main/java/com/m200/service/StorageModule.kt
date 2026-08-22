@@ -1,6 +1,8 @@
 package com.m200.service
 
 import android.content.ContentValues
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
@@ -20,7 +22,7 @@ class StorageModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
 
     override fun getName() = "StorageModule"
 
-    class DbHelper(context: Context) : SQLiteOpenHelper(context, "musabchat.db", null, 3) {
+    class DbHelper(context: Context) : SQLiteOpenHelper(context, "musabchat.db", null, 5) {
         override fun onCreate(db: SQLiteDatabase) {
             createMessagesTable(db)
             createPeersTable(db)
@@ -40,6 +42,20 @@ class StorageModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                     addColumnIfMissing(db, "messages", "deleted", "INTEGER NOT NULL DEFAULT 0")
                     createCallRecordsTable(db)
                     createIndexes(db)
+                }
+                if (oldVersion < 4) {
+                    // v3 added message_id, but rows created by older builds can
+                    // still contain NULL. Give every legacy row a deterministic
+                    // local id so reply and local-delete actions survive restart.
+                    addColumnIfMissing(db, "messages", "message_id", "TEXT")
+                    db.execSQL(
+                        "UPDATE messages SET message_id = 'legacy-' || CAST(id AS TEXT) " +
+                            "WHERE message_id IS NULL OR message_id = ''"
+                    )
+                    createIndexes(db)
+                }
+                if (oldVersion < 5) {
+                    addColumnIfMissing(db, "peers", "bluetooth_address", "TEXT")
                 }
                 db.setTransactionSuccessful()
             } finally {
@@ -76,6 +92,7 @@ class StorageModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                     peer_id TEXT PRIMARY KEY,
                     name TEXT,
                     device_address TEXT,
+                    bluetooth_address TEXT,
                     custom_name TEXT,
                     last_seen INTEGER,
                     last_message TEXT
@@ -323,6 +340,31 @@ class StorageModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     }
 
     @ReactMethod
+    fun savePeerBluetoothAddress(
+        peerId: String,
+        bluetoothAddress: String,
+        deviceName: String,
+        promise: Promise,
+    ) {
+        try {
+            val db = helper.writableDatabase
+            val values = ContentValues().apply {
+                put("peer_id", peerId)
+                put("bluetooth_address", bluetoothAddress)
+                put("name", deviceName)
+                put("last_seen", System.currentTimeMillis())
+            }
+            val updated = db.update("peers", values, "peer_id = ?", arrayOf(peerId))
+            if (updated == 0) {
+                db.insertWithOnConflict("peers", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
     fun deletePeer(peerId: String, promise: Promise) {
         try {
             val db = helper.writableDatabase
@@ -349,6 +391,7 @@ class StorageModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                         putString("peerId", c.getString(c.getColumnIndexOrThrow("peer_id")))
                         putString("name", c.getString(c.getColumnIndexOrThrow("name")))
                         putString("deviceAddress", c.getString(c.getColumnIndexOrThrow("device_address")))
+                        putString("btAddress", c.getString(c.getColumnIndexOrThrow("bluetooth_address")))
                         putString("customName", c.getString(c.getColumnIndexOrThrow("custom_name")))
                         putDouble("lastSeen", c.getLong(c.getColumnIndexOrThrow("last_seen")).toDouble())
                         putString("lastMessage", c.getString(c.getColumnIndexOrThrow("last_message")))
@@ -441,6 +484,47 @@ class StorageModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     fun clearCallHistory(promise: Promise) {
         try {
             helper.writableDatabase.delete("call_records", null, null)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun copyText(text: String, promise: Promise) {
+        try {
+            val clipboard = reactApplicationContext
+                .getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("DirectChat message", text))
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun getThemeMode(promise: Promise) {
+        try {
+            val mode = reactApplicationContext
+                .getSharedPreferences("directchat_ui", Context.MODE_PRIVATE)
+                .getString("theme_mode", "system")
+            promise.resolve(mode)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun setThemeMode(mode: String, promise: Promise) {
+        try {
+            require(mode == "system" || mode == "light" || mode == "dark") {
+                "theme mode must be system, light, or dark"
+            }
+            reactApplicationContext
+                .getSharedPreferences("directchat_ui", Context.MODE_PRIVATE)
+                .edit()
+                .putString("theme_mode", mode)
+                .apply()
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("ERROR", e.message, e)

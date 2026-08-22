@@ -59,6 +59,15 @@ export function savePeerAddress(peerId, deviceAddress, deviceName) {
   return StorageModule.savePeerAddress(peerId, deviceAddress, deviceName || '').catch(() => false);
 }
 
+export function savePeerBluetoothAddress(peerId, bluetoothAddress, deviceName) {
+  if (!StorageModule?.savePeerBluetoothAddress) return Promise.resolve(false);
+  return StorageModule.savePeerBluetoothAddress(
+    peerId,
+    bluetoothAddress,
+    deviceName || ''
+  ).catch(() => false);
+}
+
 export function deletePeer(peerId) {
   return StorageModule.deletePeer(peerId).catch(() => false);
 }
@@ -90,6 +99,25 @@ export function deleteCallRecord(callId) {
 
 export function clearCallHistory() {
   return StorageModule.clearCallHistory().catch(() => false);
+}
+
+export function copyText(text) {
+  if (!text || !StorageModule?.copyText) return Promise.resolve(false);
+  return StorageModule.copyText(String(text)).catch(() => false);
+}
+
+export function getThemeMode() {
+  if (!StorageModule?.getThemeMode) return Promise.resolve('system');
+  return StorageModule.getThemeMode()
+    .then(mode => ['system', 'light', 'dark'].includes(mode) ? mode : 'system')
+    .catch(() => 'system');
+}
+
+export function persistThemeMode(mode) {
+  if (!['system', 'light', 'dark'].includes(mode) || !StorageModule?.setThemeMode) {
+    return Promise.resolve(false);
+  }
+  return StorageModule.setThemeMode(mode).catch(() => false);
 }
 
 // هوية ثابتة لهذا الجهاز — تُنشأ مرة واحدة وتبقى.

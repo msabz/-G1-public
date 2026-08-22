@@ -44,6 +44,19 @@ describe('TransportFallbackEngine', () => {
     expect(connectP2p).not.toHaveBeenCalled();
   });
 
+  test('accepts per-selection transport deadlines', async () => {
+    const session = { id: 'custom-timeout-session' };
+    jest.spyOn(connectionCoordinator, 'connectLanPeer').mockResolvedValue(session);
+    const peer = {
+      deviceId: 'dev-custom-timeout',
+      transports: { LAN: { host: '192.168.1.44', port: 8089 } },
+    };
+
+    await expect(engine.connect(peer, {}, { lanTimeoutMs: 12_345 }))
+      .resolves.toMatchObject({ transport: 'LAN', session });
+    expect(connectionCoordinator.connectLanPeer).toHaveBeenCalledWith(peer, 12_345);
+  });
+
   test('falls back to P2P when LAN connection fails', async () => {
     jest.spyOn(connectionCoordinator, 'connectLanPeer').mockRejectedValue(new Error('LAN timeout'));
 

@@ -36,4 +36,24 @@ describe('StorageModule migration safety', () => {
     expect(source).toContain('CREATE TABLE IF NOT EXISTS call_records');
     expect(source).toContain('call_id TEXT PRIMARY KEY');
   });
+
+  test('v4 backfills stable ids for legacy rows without deleting history', () => {
+    expect(source).toContain('SQLiteOpenHelper(context, "musabchat.db", null, 5)');
+    expect(source).toContain("message_id = 'legacy-' || CAST(id AS TEXT)");
+    expect(source).toContain('WHERE message_id IS NULL OR message_id =');
+  });
+
+  test('v5 persists Bluetooth endpoints without overwriting Wi-Fi Direct addresses', () => {
+    expect(source).toContain('if (oldVersion < 5)');
+    expect(source).toContain('addColumnIfMissing(db, "peers", "bluetooth_address", "TEXT")');
+    expect(source).toContain('fun savePeerBluetoothAddress(');
+    expect(source).toContain('putString("btAddress"');
+  });
+
+  test('persists a validated theme mode and exposes explicit clipboard copy', () => {
+    expect(source).toContain('fun copyText(text: String, promise: Promise)');
+    expect(source).toContain('fun getThemeMode(promise: Promise)');
+    expect(source).toContain('fun setThemeMode(mode: String, promise: Promise)');
+    expect(source).toContain('mode == "system" || mode == "light" || mode == "dark"');
+  });
 });

@@ -1,11 +1,19 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useMemo, useState, useRef } from 'react';
 import {
   View, StyleSheet, TouchableOpacity, Text, FlatList, TextInput,
   KeyboardAvoidingView, Platform, Image, Alert, StatusBar, ActivityIndicator, Modal,
-  BackHandler,
+  BackHandler, Share,
 } from 'react-native';
 import { playVoiceFile } from '../media/AudioClip';
 import { WA } from '../theme';
+import { useAppTheme } from '../theme/themeContext';
+import { copyText } from '../services/Persistence';
+import {
+  filterMessages,
+  messagePreview,
+  resolveReplyMessage,
+  shareableMessageText,
+} from '../messaging/messageModel';
 
 function formatTime(ts) {
   const d = ts ? new Date(ts) : new Date();
@@ -33,6 +41,16 @@ function formatSize(bytes) {
 // علامات التسليم على شكل صحّين متل واتساب
 function Ticks({ status }) {
   if (status === 'sending') return <Text style={styles.metaTick}>🕐</Text>;
+  if (status === 'failed') {
+    return (
+      <Text
+        style={[styles.metaTick, { color: WA.danger }]}
+        accessibilityLabel="فشل إرسال الرسالة"
+      >
+        ✕
+      </Text>
+    );
+  }
   const color = status === 'read' ? WA.tick : WA.subText;
   return <Text style={[styles.metaTick, { color }]}>{status === 'sent' ? '✓' : '✓✓'}</Text>;
 }
@@ -87,8 +105,32 @@ function callInfo(item) {
   }
 }
 
-function MessageBubble({ item, onOpenFile, onViewImage, onRedial }) {
+function ReplyQuote({ message, theme }) {
+  return (
+    <View
+      style={[
+        styles.replyQuote,
+        { backgroundColor: theme.surfaceVariant, borderRightColor: theme.accent },
+      ]}
+      accessibilityLabel={`رد على: ${messagePreview(message)}`}
+    >
+      <Text style={[styles.replyAuthor, { color: theme.primaryLight }]}>
+        {message?.sender === 'me' ? 'أنت' : 'الطرف الآخر'}
+      </Text>
+      <Text style={[styles.replyText, { color: theme.textSecondary }]} numberOfLines={2}>
+        {messagePreview(message)}
+      </Text>
+    </View>
+  );
+}
+
+function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, replyMessage, theme }) {
   const isMe = item.sender === 'me';
+  const bubbleStyle = [
+    styles.bubble,
+    isMe ? styles.outBubble : styles.inBubble,
+    { backgroundColor: isMe ? theme.chatBubbleMine : theme.chatBubblePeer },
+  ];
 
   // ===== سجل مكالمة =====
   if (item.type === 'call') {
@@ -96,10 +138,13 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial }) {
     return (
       <View style={styles.row}>
         <TouchableOpacity
-          activeOpacity={info.missed ? 0.7 : 1}
-          disabled={!info.missed}
-          onPress={() => onRedial && onRedial(info.isVideo)}
-          style={[styles.bubble, isMe ? styles.outBubble : styles.inBubble, styles.callBubble]}
+          activeOpacity={info.missed ? 0.7 : 0.9}
+          onPress={() => info.missed && onRedial && onRedial(info.isVideo)}
+          onLongPress={() => onLongPress && onLongPress(item)}
+          delayLongPress={350}
+          style={[...bubbleStyle, styles.callBubble]}
+          accessibilityRole="button"
+          accessibilityLabel={`${info.title}. ${info.sub}`}
         >
           <View style={[styles.callIconBox, info.missed && styles.callIconMissed]}>
             <Text style={{ fontSize: 17 }}>
@@ -107,22 +152,27 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial }) {
             </Text>
           </View>
           <View style={{ flex: 1, marginRight: 10 }}>
-            <Text style={styles.callTitle}>{info.title}</Text>
-            <Text style={[styles.callSub, info.missed && { color: '#E0453F' }]}>{info.sub}</Text>
+            <Text style={[styles.callTitle, { color: theme.text }]}>{info.title}</Text>
+            <Text style={[styles.callSub, { color: theme.textSecondary }, info.missed && { color: theme.error }]}>{info.sub}</Text>
           </View>
           <Text style={styles.metaTime}>{formatTime(item.time)}</Text>
         </TouchableOpacity>
       </View>
     );
   }
-  const bubbleStyle = [styles.bubble, isMe ? styles.outBubble : styles.inBubble];
-
   // ===== رسالة صوتية =====
   if (item.type === 'voice') {
     const busy = item.progress != null && item.progress < 1;
     return (
       <View style={styles.row}>
-        <View style={[...bubbleStyle, styles.voiceBubble]}>
+        <TouchableOpacity
+          activeOpacity={0.9}
+          onLongPress={() => onLongPress && onLongPress(item)}
+          delayLongPress={350}
+          style={[...bubbleStyle, styles.voiceBubble]}
+          accessibilityRole="button"
+          accessibilityLabel="رسالة صوتية. اضغط مطولاً لخيارات الرسالة"
+        >
           <TouchableOpacity
             disabled={busy || !item.path}
             onPress={async () => {
@@ -142,7 +192,7 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial }) {
             {busy && <ProgressBar progress={item.progress} />}
           </View>
           <MessageMeta item={item} />
-        </View>
+        </TouchableOpacity>
       </View>
     );
   }
@@ -154,9 +204,12 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial }) {
       <View style={styles.row}>
         <TouchableOpacity
           activeOpacity={0.85}
-          disabled={busy || !(item.path || item.localUri)}
-          onPress={() => onViewImage && onViewImage(item)}
+          onPress={() => !busy && (item.path || item.localUri) && onViewImage && onViewImage(item)}
+          onLongPress={() => onLongPress && onLongPress(item)}
+          delayLongPress={350}
           style={[...bubbleStyle, styles.mediaBubble]}
+          accessibilityRole="imagebutton"
+          accessibilityLabel={`${item.fileName || 'صورة'}. اضغط مطولاً لخيارات الرسالة`}
         >
           {item.localUri && !busy ? (
             <Image source={{ uri: item.localUri }} style={styles.imagePreview} resizeMode="cover" />
@@ -183,17 +236,20 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial }) {
       <View style={styles.row}>
         <TouchableOpacity
           activeOpacity={canOpen ? 0.7 : 1}
-          disabled={!canOpen}
-          onPress={() => onOpenFile && onOpenFile(item)}
+          onPress={() => canOpen && onOpenFile && onOpenFile(item)}
+          onLongPress={() => onLongPress && onLongPress(item)}
+          delayLongPress={350}
           style={[...bubbleStyle, { minWidth: 230 }]}
+          accessibilityRole="button"
+          accessibilityLabel={`${item.fileName || 'ملف'}. اضغط مطولاً لخيارات الرسالة`}
         >
-          <View style={styles.fileRow}>
+          <View style={[styles.fileRow, { backgroundColor: theme.surfaceVariant }]}>
             <View style={styles.fileIconBox}>
               <Text style={{ fontSize: 22 }}>{isAppFile(item) ? '📦' : '📄'}</Text>
             </View>
             <View style={{ flex: 1, marginRight: 10 }}>
-              <Text style={styles.fileName} numberOfLines={1}>{item.fileName}</Text>
-              <Text style={styles.fileSub}>
+              <Text style={[styles.fileName, { color: theme.text }]} numberOfLines={1}>{item.fileName}</Text>
+              <Text style={[styles.fileSub, { color: theme.textSecondary }]}>
                 {busy
                   ? `${isMe ? 'جاري الإرسال' : 'جاري الاستلام'} · ${Math.round(item.progress * 100)}%`
                   : `${formatSize(item.size)}${canOpen ? (isAppFile(item) ? ' · اضغط للتثبيت' : ' · اضغط للفتح') : ''}`}
@@ -210,10 +266,22 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial }) {
   // ===== نص =====
   return (
     <View style={styles.row}>
-      <View style={bubbleStyle}>
-        <Text style={styles.msgText}>{item.text}</Text>
+      <TouchableOpacity
+        activeOpacity={0.9}
+        onLongPress={() => onLongPress && onLongPress(item)}
+        delayLongPress={350}
+        style={bubbleStyle}
+        accessibilityRole="button"
+        accessibilityLabel={`${isMe ? 'رسالتك' : 'رسالة واردة'}: ${item.text}. اضغط مطولاً للخيارات`}
+      >
+        {item.replyToMessageId ? (
+          <ReplyQuote message={replyMessage} theme={theme} />
+        ) : null}
+        <Text style={[styles.msgText, { color: isMe ? theme.chatTextMine : theme.chatTextPeer }]}>
+          {item.text}
+        </Text>
         <MessageMeta item={item} />
-      </View>
+      </TouchableOpacity>
     </View>
   );
 }
@@ -223,7 +291,9 @@ export default function ChatScreen({
   onBack, onDisconnect, onPickFile, activeTier,
   isRecording, onStartRecording, onStopRecording, peerName,
   onCaptureImage, onLoadApps, onSendApp, onOpenFile, onOpenProbe,
+  onDeleteMessage, onClearConversation,
 }) {
+  const { theme, mode, isDark, setThemeMode } = useAppTheme();
   const [msgText, setMsgText] = useState('');
   const [sheetOpen, setSheetOpen] = useState(false);
   const [appsOpen, setAppsOpen] = useState(false);
@@ -232,9 +302,24 @@ export default function ChatScreen({
   const [appSearch, setAppSearch] = useState('');
   const [viewerImage, setViewerImage] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [actionMessage, setActionMessage] = useState(null);
+  const [replyTarget, setReplyTarget] = useState(null);
   const listRef = useRef(null);
-  const tierLabel = activeTier === 'WIFI_DIRECT' ? 'متصل عبر واي فاي مباشر' : 'متصل';
+  const tierLabel = activeTier === 'WIFI_DIRECT'
+    ? 'متصل عبر واي فاي مباشر'
+    : activeTier === 'BLUETOOTH'
+      ? 'متصل عبر Bluetooth'
+        : activeTier === 'LAN'
+          ? 'متصل عبر الشبكة المحلية'
+          : 'متصل';
+  const mediaEnabled = activeTier !== 'BLUETOOTH';
   const hasText = msgText.trim().length > 0;
+  const visibleMessages = useMemo(
+    () => filterMessages(messages, searchQuery),
+    [messages, searchQuery]
+  );
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -243,6 +328,13 @@ export default function ChatScreen({
     });
     return () => sub.remove();
   }, [onBack]);
+
+  useEffect(() => {
+    if (mediaEnabled) return;
+    setSheetOpen(false);
+    setAppsOpen(false);
+    if (isRecording) onStopRecording?.();
+  }, [isRecording, mediaEnabled, onStopRecording]);
 
   const confirmDisconnect = () => {
     setMenuOpen(false);
@@ -256,13 +348,85 @@ export default function ChatScreen({
     );
   };
 
+  const cycleTheme = () => {
+    const nextMode = mode === 'system' ? 'light' : mode === 'light' ? 'dark' : 'system';
+    setThemeMode(nextMode);
+  };
+
+  const closeActionMenu = () => setActionMessage(null);
+
+  const shareMessage = async () => {
+    const selected = actionMessage;
+    closeActionMenu();
+    const text = shareableMessageText(selected);
+    if (!text) return;
+    try {
+      await Share.share({ message: text, title: selected?.fileName || 'DirectChat' });
+    } catch (error) {
+      Alert.alert('تعذّرت المشاركة', error?.message || '');
+    }
+  };
+
+  const copyMessage = async () => {
+    const text = shareableMessageText(actionMessage);
+    closeActionMenu();
+    if (!text) return;
+    const copied = await copyText(text);
+    if (!copied) Alert.alert('تعذّر النسخ', 'لم يتمكن النظام من نسخ محتوى الرسالة.');
+  };
+
+  const deleteSelectedMessage = () => {
+    const selected = actionMessage;
+    closeActionMenu();
+    if (!selected?.messageId) return;
+    Alert.alert('حذف الرسالة محلياً؟', 'ستُحذف من هذا الجهاز فقط.', [
+      { text: 'إلغاء', style: 'cancel' },
+      {
+        text: 'حذف',
+        style: 'destructive',
+        onPress: async () => {
+          const deleted = await onDeleteMessage?.(selected.messageId);
+          if (deleted === false) Alert.alert('تعذّر الحذف', 'بقيت الرسالة محفوظة على هذا الجهاز.');
+        },
+      },
+    ]);
+  };
+
+  const clearConversation = () => {
+    setMenuOpen(false);
+    Alert.alert('مسح المحادثة محلياً؟', 'لن تُحذف الرسائل من الجهاز الآخر.', [
+      { text: 'إلغاء', style: 'cancel' },
+      {
+        text: 'مسح',
+        style: 'destructive',
+        onPress: async () => {
+          const cleared = await onClearConversation?.();
+          if (cleared === false) Alert.alert('تعذّر المسح', 'بقيت المحادثة محفوظة على هذا الجهاز.');
+        },
+      },
+    ]);
+  };
+
+  const sendText = () => {
+    const text = msgText.trim();
+    if (!text) return;
+    onSendMessage({ text, replyToMessageId: replyTarget?.messageId || null });
+    setMsgText('');
+    setReplyTarget(null);
+  };
+
   return (
-    <View style={styles.container}>
-      <StatusBar backgroundColor={WA.green} barStyle="light-content" />
+    <View style={[styles.container, { backgroundColor: theme.background }]}>
+      <StatusBar backgroundColor={theme.primaryDark} barStyle={theme.statusBar} />
 
       {/* ===== الشريط العلوي ===== */}
-      <View style={styles.header}>
-        <TouchableOpacity onPress={onBack} style={styles.backBtn}>
+      <View style={[styles.header, { backgroundColor: theme.primaryDark }]}>
+        <TouchableOpacity
+          onPress={onBack}
+          style={styles.backBtn}
+          accessibilityRole="button"
+          accessibilityLabel="العودة إلى المحادثات"
+        >
           <Text style={styles.backIcon}>←</Text>
         </TouchableOpacity>
 
@@ -275,13 +439,32 @@ export default function ChatScreen({
           <Text style={styles.headerStatus} numberOfLines={1}>{tierLabel}</Text>
         </View>
 
-        <TouchableOpacity onPress={onStartVideoCall} style={styles.headerBtn}>
+        <TouchableOpacity
+          onPress={mediaEnabled ? onStartVideoCall : undefined}
+          disabled={!mediaEnabled}
+          style={[styles.headerBtn, !mediaEnabled && { opacity: 0.35 }]}
+          accessibilityRole="button"
+          accessibilityLabel="بدء مكالمة فيديو"
+          accessibilityState={{ disabled: !mediaEnabled }}
+        >
           <Text style={styles.headerIcon}>🎥</Text>
         </TouchableOpacity>
-        <TouchableOpacity onPress={onStartVoiceCall} style={styles.headerBtn}>
+        <TouchableOpacity
+          onPress={mediaEnabled ? onStartVoiceCall : undefined}
+          disabled={!mediaEnabled}
+          style={[styles.headerBtn, !mediaEnabled && { opacity: 0.35 }]}
+          accessibilityRole="button"
+          accessibilityLabel="بدء مكالمة صوتية"
+          accessibilityState={{ disabled: !mediaEnabled }}
+        >
           <Text style={styles.headerIcon}>📞</Text>
         </TouchableOpacity>
-        <TouchableOpacity onPress={() => setMenuOpen(true)} style={styles.headerBtn}>
+        <TouchableOpacity
+          onPress={() => setMenuOpen(true)}
+          style={styles.headerBtn}
+          accessibilityRole="button"
+          accessibilityLabel="خيارات المحادثة"
+        >
           <Text style={styles.menuIcon}>⋮</Text>
         </TouchableOpacity>
       </View>
@@ -294,14 +477,32 @@ export default function ChatScreen({
             activeOpacity={1}
             onPress={() => setMenuOpen(false)}
           />
-          <View style={styles.menuCard}>
+          <View style={[styles.menuCard, { backgroundColor: theme.surface }]}>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setMenuOpen(false);
+                setSearchOpen(true);
+              }}
+            >
+              <Text style={[styles.menuItemText, { color: theme.text }]}>البحث في المحادثة</Text>
+            </TouchableOpacity>
+            <View style={[styles.menuDivider, { backgroundColor: theme.border }]} />
+            <TouchableOpacity style={styles.menuItem} onPress={cycleTheme}>
+              <Text style={[styles.menuItemText, { color: theme.text }]}>المظهر: {mode === 'system' ? 'النظام' : isDark ? 'داكن' : 'فاتح'}</Text>
+            </TouchableOpacity>
+            <View style={[styles.menuDivider, { backgroundColor: theme.border }]} />
             <TouchableOpacity
               style={styles.menuItem}
               onPress={() => { setMenuOpen(false); onOpenProbe(); }}
             >
-              <Text style={styles.menuItemText}>فحص الاتصال</Text>
+              <Text style={[styles.menuItemText, { color: theme.text }]}>فحص الاتصال</Text>
             </TouchableOpacity>
-            <View style={styles.menuDivider} />
+            <View style={[styles.menuDivider, { backgroundColor: theme.border }]} />
+            <TouchableOpacity style={styles.menuItem} onPress={clearConversation}>
+              <Text style={styles.menuDangerText}>مسح المحادثة محلياً</Text>
+            </TouchableOpacity>
+            <View style={[styles.menuDivider, { backgroundColor: theme.border }]} />
             <TouchableOpacity style={styles.menuItem} onPress={confirmDisconnect}>
               <Text style={styles.menuDangerText}>قطع الاتصال</Text>
             </TouchableOpacity>
@@ -309,23 +510,98 @@ export default function ChatScreen({
         </View>
       </Modal>
 
+      {searchOpen ? (
+        <View style={[styles.searchBar, { backgroundColor: theme.surface, borderBottomColor: theme.border }]}>
+          <TouchableOpacity
+            onPress={() => {
+              setSearchOpen(false);
+              setSearchQuery('');
+            }}
+            style={styles.searchClose}
+            accessibilityRole="button"
+            accessibilityLabel="إغلاق البحث"
+          >
+            <Text style={[styles.searchCloseText, { color: theme.primary }]}>✕</Text>
+          </TouchableOpacity>
+          <TextInput
+            autoFocus
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholder="ابحث في الرسائل والملفات"
+            placeholderTextColor={theme.textMuted}
+            style={[styles.searchInput, { color: theme.text, backgroundColor: theme.surfaceVariant }]}
+            accessibilityLabel="بحث في المحادثة"
+          />
+          <Text style={[styles.searchCount, { color: theme.textSecondary }]}>
+            {visibleMessages.length}/{messages.length}
+          </Text>
+        </View>
+      ) : null}
+
+      <Modal
+        visible={!!actionMessage}
+        transparent
+        animationType="fade"
+        onRequestClose={closeActionMenu}
+      >
+        <TouchableOpacity style={styles.actionBackdrop} activeOpacity={1} onPress={closeActionMenu}>
+          <View style={[styles.actionSheet, { backgroundColor: theme.surface }]}>
+            <Text style={[styles.actionPreview, { color: theme.textSecondary }]} numberOfLines={2}>
+              {messagePreview(actionMessage)}
+            </Text>
+            <TouchableOpacity
+              style={styles.actionItem}
+              onPress={() => {
+                setReplyTarget(actionMessage);
+                closeActionMenu();
+              }}
+            >
+              <Text style={[styles.actionText, { color: theme.text }]}>↩ الرد</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.actionItem} onPress={copyMessage}>
+              <Text style={[styles.actionText, { color: theme.text }]}>⧉ نسخ</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.actionItem} onPress={shareMessage}>
+              <Text style={[styles.actionText, { color: theme.text }]}>↗ مشاركة</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.actionItem} onPress={deleteSelectedMessage}>
+              <Text style={[styles.actionText, { color: theme.error }]}>🗑 حذف محلي</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
         {/* ===== منطقة الرسائل ===== */}
-        <View style={styles.chatArea}>
+        <View style={[styles.chatArea, { backgroundColor: theme.background }]}>
           <FlatList
             ref={listRef}
-            data={messages}
-            renderItem={({ item }) => <MessageBubble item={item} onOpenFile={onOpenFile} onViewImage={setViewerImage} onRedial={(v) => (v ? onStartVideoCall() : onStartVoiceCall())} />}
-            keyExtractor={(_, i) => i.toString()}
+            data={visibleMessages}
+            renderItem={({ item }) => (
+              <MessageBubble
+                item={item}
+                onOpenFile={onOpenFile}
+                onViewImage={setViewerImage}
+                onRedial={mediaEnabled
+                  ? (v) => (v ? onStartVideoCall() : onStartVoiceCall())
+                  : undefined}
+                onLongPress={setActionMessage}
+                replyMessage={resolveReplyMessage(messages, item.replyToMessageId)}
+                theme={theme}
+              />
+            )}
+            keyExtractor={(item, i) => item.messageId || `${item.time || 'message'}:${i}`}
             contentContainerStyle={{ paddingVertical: 8, paddingHorizontal: 8 }}
             onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
             ListEmptyComponent={
               <View style={styles.emptyBox}>
                 <Text style={styles.emptyText}>
-                  🔒 الرسائل تُنقل مباشرة بين الجهازين بدون أي خادم وسيط
+                  {searchQuery
+                    ? 'لا توجد نتائج مطابقة'
+                    : '🔒 الرسائل تُنقل مباشرة بين الجهازين بدون أي خادم وسيط'}
                 </Text>
               </View>
             }
@@ -340,12 +616,45 @@ export default function ChatScreen({
           </View>
         ) : null}
 
-        <View style={styles.inputRow}>
-          <View style={styles.inputPill}>
-            <TouchableOpacity onPress={() => setSheetOpen(true)} style={styles.pillBtn}>
+        {replyTarget ? (
+          <View style={[styles.replyComposer, { backgroundColor: theme.surface, borderRightColor: theme.accent }]}>
+            <TouchableOpacity
+              onPress={() => setReplyTarget(null)}
+              style={styles.replyDismiss}
+              accessibilityRole="button"
+              accessibilityLabel="إلغاء الرد"
+            >
+              <Text style={[styles.replyDismissText, { color: theme.textMuted }]}>✕</Text>
+            </TouchableOpacity>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.replyAuthor, { color: theme.primaryLight }]}>الرد على رسالة</Text>
+              <Text style={[styles.replyText, { color: theme.textSecondary }]} numberOfLines={2}>
+                {messagePreview(replyTarget)}
+              </Text>
+            </View>
+          </View>
+        ) : null}
+
+        <View style={[styles.inputRow, { backgroundColor: theme.background }]}>
+          <View style={[styles.inputPill, { backgroundColor: theme.surface }]}>
+            <TouchableOpacity
+              onPress={mediaEnabled ? () => setSheetOpen(true) : undefined}
+              disabled={!mediaEnabled}
+              style={[styles.pillBtn, !mediaEnabled && { opacity: 0.35 }]}
+              accessibilityRole="button"
+              accessibilityLabel="إرفاق ملف أو تطبيق"
+              accessibilityState={{ disabled: !mediaEnabled }}
+            >
               <Text style={styles.pillIcon}>📎</Text>
             </TouchableOpacity>
-            <TouchableOpacity onPress={onCaptureImage} style={styles.pillBtn}>
+            <TouchableOpacity
+              onPress={mediaEnabled ? onCaptureImage : undefined}
+              disabled={!mediaEnabled}
+              style={[styles.pillBtn, !mediaEnabled && { opacity: 0.35 }]}
+              accessibilityRole="button"
+              accessibilityLabel="التقاط صورة"
+              accessibilityState={{ disabled: !mediaEnabled }}
+            >
               <Text style={styles.pillIcon}>📷</Text>
             </TouchableOpacity>
             <TextInput
@@ -353,23 +662,35 @@ export default function ChatScreen({
               onChangeText={setMsgText}
               placeholder="رسالة"
               placeholderTextColor="#8696A0"
-              style={styles.input}
+              style={[styles.input, { color: theme.text }]}
               multiline
+              accessibilityLabel="نص الرسالة"
             />
           </View>
 
           {hasText ? (
             <TouchableOpacity
-              onPress={() => { onSendMessage(msgText); setMsgText(''); }}
-              style={styles.sendCircle}
+              onPress={sendText}
+              style={[styles.sendCircle, { backgroundColor: theme.primaryLight }]}
+              accessibilityRole="button"
+              accessibilityLabel="إرسال الرسالة"
             >
               <Text style={styles.sendIcon}>➤</Text>
             </TouchableOpacity>
           ) : (
             <TouchableOpacity
-              onPressIn={onStartRecording}
-              onPressOut={onStopRecording}
-              style={[styles.sendCircle, isRecording && styles.sendCircleRec]}
+              onPressIn={mediaEnabled ? onStartRecording : undefined}
+              onPressOut={mediaEnabled ? onStopRecording : undefined}
+              disabled={!mediaEnabled}
+              style={[
+                styles.sendCircle,
+                { backgroundColor: theme.primaryLight },
+                isRecording && styles.sendCircleRec,
+                !mediaEnabled && { opacity: 0.35 },
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel="اضغط باستمرار لتسجيل رسالة صوتية"
+              accessibilityState={{ disabled: !mediaEnabled }}
             >
               <Text style={styles.sendIcon}>🎙</Text>
             </TouchableOpacity>
@@ -411,39 +732,48 @@ export default function ChatScreen({
       </Modal>
 
       {/* ===== قائمة الإرفاق (متل واتساب) ===== */}
-      <Modal visible={sheetOpen} transparent animationType="fade" onRequestClose={() => setSheetOpen(false)}>
+      <Modal visible={mediaEnabled && sheetOpen} transparent animationType="fade" onRequestClose={() => setSheetOpen(false)}>
         <TouchableOpacity style={styles.sheetBackdrop} activeOpacity={1} onPress={() => setSheetOpen(false)}>
-          <View style={styles.sheet}>
+          <View style={[styles.sheet, { backgroundColor: theme.surface }]}>
             <View style={styles.sheetGrip} />
             <View style={styles.sheetGrid}>
               <TouchableOpacity
                 style={styles.sheetItem}
-                onPress={() => { setSheetOpen(false); onPickFile(); }}
+                onPress={() => {
+                  setSheetOpen(false);
+                  if (!mediaEnabled) return;
+                  onPickFile?.();
+                }}
               >
                 <View style={[styles.sheetIcon, { backgroundColor: '#7F66FF' }]}>
                   <Text style={styles.sheetIconText}>📄</Text>
                 </View>
-                <Text style={styles.sheetLabel}>مستند</Text>
+                <Text style={[styles.sheetLabel, { color: theme.textSecondary }]}>مستند</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
                 style={styles.sheetItem}
-                onPress={() => { setSheetOpen(false); onCaptureImage(); }}
+                onPress={() => {
+                  setSheetOpen(false);
+                  if (!mediaEnabled) return;
+                  onCaptureImage?.();
+                }}
               >
                 <View style={[styles.sheetIcon, { backgroundColor: '#E0453F' }]}>
                   <Text style={styles.sheetIconText}>📷</Text>
                 </View>
-                <Text style={styles.sheetLabel}>كاميرا</Text>
+                <Text style={[styles.sheetLabel, { color: theme.textSecondary }]}>كاميرا</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
                 style={styles.sheetItem}
                 onPress={async () => {
                   setSheetOpen(false);
+                  if (!mediaEnabled) return;
                   setAppsOpen(true);
                   setAppsLoading(true);
                   try {
-                    const list = await onLoadApps();
+                    const list = await onLoadApps?.();
                     setApps(list || []);
                   } catch (e) {
                     Alert.alert('تعذّر قراءة قائمة التطبيقات', e?.message || '');
@@ -455,7 +785,7 @@ export default function ChatScreen({
                 <View style={[styles.sheetIcon, { backgroundColor: '#0AA5A5' }]}>
                   <Text style={styles.sheetIconText}>📱</Text>
                 </View>
-                <Text style={styles.sheetLabel}>تطبيق</Text>
+                <Text style={[styles.sheetLabel, { color: theme.textSecondary }]}>تطبيق</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -463,9 +793,9 @@ export default function ChatScreen({
       </Modal>
 
       {/* ===== منتقي التطبيقات المثبتة ===== */}
-      <Modal visible={appsOpen} animationType="slide" onRequestClose={() => setAppsOpen(false)}>
-        <View style={{ flex: 1, backgroundColor: '#fff' }}>
-          <View style={styles.header}>
+      <Modal visible={mediaEnabled && appsOpen} animationType="slide" onRequestClose={() => setAppsOpen(false)}>
+        <View style={{ flex: 1, backgroundColor: theme.background }}>
+          <View style={[styles.header, { backgroundColor: theme.primaryDark }]}>
             <TouchableOpacity onPress={() => setAppsOpen(false)} style={styles.backBtn}>
               <Text style={styles.backIcon}>←</Text>
             </TouchableOpacity>
@@ -476,8 +806,8 @@ export default function ChatScreen({
             value={appSearch}
             onChangeText={setAppSearch}
             placeholder="ابحث عن تطبيق"
-            placeholderTextColor="#8696A0"
-            style={styles.appSearch}
+            placeholderTextColor={theme.textMuted}
+            style={[styles.appSearch, { backgroundColor: theme.surfaceVariant, color: theme.text }]}
           />
 
           {appsLoading ? (
@@ -491,15 +821,19 @@ export default function ChatScreen({
               keyExtractor={a => a.packageName}
               renderItem={({ item: app }) => (
                 <TouchableOpacity
-                  style={styles.appRow}
-                  onPress={() => { setAppsOpen(false); onSendApp(app); }}
+                  style={[styles.appRow, { borderBottomColor: theme.borderSubtle }]}
+                  onPress={() => {
+                    setAppsOpen(false);
+                    if (!mediaEnabled) return;
+                    onSendApp?.(app);
+                  }}
                 >
                   <View style={styles.appIcon}>
                     <Text style={{ fontSize: 20 }}>📦</Text>
                   </View>
                   <View style={{ flex: 1, marginHorizontal: 12 }}>
-                    <Text style={styles.appName} numberOfLines={1}>{app.appName}</Text>
-                    <Text style={styles.appMeta}>{formatSize(app.size)}</Text>
+                    <Text style={[styles.appName, { color: theme.text }]} numberOfLines={1}>{app.appName}</Text>
+                    <Text style={[styles.appMeta, { color: theme.textSecondary }]}>{formatSize(app.size)}</Text>
                   </View>
                   <Text style={styles.appSend}>إرسال</Text>
                 </TouchableOpacity>
@@ -548,6 +882,29 @@ const styles = StyleSheet.create({
   menuDangerText: { color: WA.danger, fontSize: 15, textAlign: 'right', fontWeight: '600' },
   menuDivider: { height: StyleSheet.hairlineWidth, backgroundColor: '#E8ECEE' },
 
+  searchBar: {
+    minHeight: 58, flexDirection: 'row-reverse', alignItems: 'center',
+    paddingHorizontal: 8, borderBottomWidth: StyleSheet.hairlineWidth, gap: 8,
+  },
+  searchClose: { width: 38, height: 38, justifyContent: 'center', alignItems: 'center' },
+  searchCloseText: { fontSize: 20, fontWeight: '700' },
+  searchInput: {
+    flex: 1, minHeight: 42, borderRadius: 21, paddingHorizontal: 14,
+    fontSize: 15, textAlign: 'right',
+  },
+  searchCount: { minWidth: 48, fontSize: 12, textAlign: 'center' },
+
+  actionBackdrop: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end',
+  },
+  actionSheet: {
+    borderTopLeftRadius: 18, borderTopRightRadius: 18,
+    paddingHorizontal: 18, paddingTop: 14, paddingBottom: 28,
+  },
+  actionPreview: { textAlign: 'right', fontSize: 13, marginBottom: 8 },
+  actionItem: { minHeight: 48, justifyContent: 'center' },
+  actionText: { textAlign: 'right', fontSize: 16, fontWeight: '600' },
+
   chatArea: { flex: 1, backgroundColor: WA.chatBg },
   emptyBox: { alignItems: 'center', marginTop: 24, paddingHorizontal: 30 },
   emptyText: {
@@ -563,6 +920,19 @@ const styles = StyleSheet.create({
   outBubble: { alignSelf: 'flex-end', backgroundColor: WA.outBubble, borderTopRightRadius: 0 },
   inBubble: { alignSelf: 'flex-start', backgroundColor: WA.inBubble, borderTopLeftRadius: 0 },
   msgText: { color: WA.text, fontSize: 15, lineHeight: 20 },
+  replyQuote: {
+    borderRightWidth: 3, borderRadius: 6, paddingHorizontal: 8,
+    paddingVertical: 5, marginBottom: 5, minWidth: 150,
+  },
+  replyComposer: {
+    flexDirection: 'row-reverse', alignItems: 'center', minHeight: 58,
+    marginHorizontal: 8, marginTop: 5, paddingHorizontal: 10, paddingVertical: 7,
+    borderRightWidth: 4, borderRadius: 8,
+  },
+  replyAuthor: { textAlign: 'right', fontSize: 12, fontWeight: '700' },
+  replyText: { textAlign: 'right', fontSize: 12, marginTop: 2 },
+  replyDismiss: { width: 38, height: 38, justifyContent: 'center', alignItems: 'center' },
+  replyDismissText: { fontSize: 18 },
 
   metaRow: { flexDirection: 'row-reverse', alignItems: 'center', alignSelf: 'flex-start', marginTop: 2 },
   metaTime: { fontSize: 11, color: WA.subText, marginRight: 4 },

@@ -7,12 +7,63 @@ export const TRANSPORT_MODE = {
   BLUETOOTH_ONLY: 'BLUETOOTH_ONLY',
 };
 
+export const TRANSPORT_PRIORITY = Object.freeze(['LAN', 'P2P', 'BLUETOOTH']);
+
+const MODE_TRANSPORT = {
+  [TRANSPORT_MODE.LAN_ONLY]: 'LAN',
+  [TRANSPORT_MODE.P2P_ONLY]: 'P2P',
+  [TRANSPORT_MODE.BLUETOOTH_ONLY]: 'BLUETOOTH',
+};
+
 export class TransportTimeoutError extends Error {
   constructor(transport, timeoutMs) {
     super(`انتهت مهلة الاتصال عبر ${transport} بعد ${timeoutMs}ms`);
     this.name = 'TransportTimeoutError';
     this.transport = transport;
     this.timeoutMs = timeoutMs;
+  }
+}
+
+export class TransportSelectionBusyError extends Error {
+  constructor(activePeerId, requestedPeerId) {
+    super(`Transport selection is already active for ${activePeerId}; cannot start ${requestedPeerId}`);
+    this.name = 'TransportSelectionBusyError';
+    this.activePeerId = activePeerId;
+    this.requestedPeerId = requestedPeerId;
+  }
+}
+
+export class TransportAttemptCancelledError extends Error {
+  constructor(attemptToken, reason = 'Transport selection was cancelled') {
+    super(reason);
+    this.name = 'TransportAttemptCancelledError';
+    this.attemptToken = attemptToken;
+  }
+}
+
+export class TransportFallbackExhaustedError extends Error {
+  constructor({ mode, attempts, candidates, attemptToken }) {
+    const lastError = attempts[attempts.length - 1]?.error;
+    const forcedTransport = MODE_TRANSPORT[mode];
+    const forcedLabel = forcedTransport === 'LAN'
+      ? 'الشبكة المحلية (LAN)'
+      : forcedTransport === 'P2P'
+        ? 'Wi-Fi Direct'
+        : forcedTransport === 'BLUETOOTH'
+          ? 'البلوتوث'
+          : null;
+    const details = attempts
+      .map(item => `${item.transport}: ${item.error?.message || 'failed'}`)
+      .join(', ');
+    const message = forcedLabel
+      ? `تعذّر الاتصال عبر ${forcedLabel}: ${lastError?.message || 'لا يوجد جهاز/مسار صالح'}`
+      : `تعذّر الاتصال بالطرف الآخر عبر أي وسيلة اتصال متاحة (${details || 'لا توجد وسائل اتصال صالحة'})`;
+    super(message);
+    this.name = 'TransportFallbackExhaustedError';
+    this.mode = mode;
+    this.attempts = attempts;
+    this.candidates = candidates;
+    this.attemptToken = attemptToken;
   }
 }
 
@@ -48,16 +99,44 @@ export function runWithTransportTimeout(factory, timeoutMs, transport, onTimeout
   });
 }
 
+function normalizeMaxAttempts(value) {
+  if (!Number.isFinite(value)) return TRANSPORT_PRIORITY.length;
+  return Math.max(1, Math.min(TRANSPORT_PRIORITY.length, Math.floor(value)));
+}
+
+function peerKey(peer) {
+  return peer?.deviceId || peer?.id || null;
+}
+
+function hasEndpoint(peer, transport) {
+  if (transport === 'LAN') {
+    return Boolean(peer?.transports?.LAN?.host || peer?.host);
+  }
+  if (transport === 'P2P') {
+    return Boolean(peer?.transports?.P2P?.deviceAddress || peer?.deviceAddress);
+  }
+  return Boolean(peer?.transports?.BLUETOOTH?.address || peer?.btAddress);
+}
+
 export class TransportFallbackEngine {
   constructor(options = {}) {
     this.mode = options.mode || TRANSPORT_MODE.AUTO;
     this.lanTimeoutMs = options.lanTimeoutMs || 5000;
     this.p2pTimeoutMs = options.p2pTimeoutMs || 8000;
     this.bluetoothTimeoutMs = options.bluetoothTimeoutMs || 8000;
-    // Make connection ownership explicit without changing the default live
-    // behavior. The singleton remains the production default; injection gives
-    // tests and the coordinator-owned orchestrator an exact owner seam.
+    this.maxAttempts = normalizeMaxAttempts(options.maxAttempts);
+
+    // The engine is a deterministic policy helper. The injected coordinator is
+    // the sole logical connection/session owner.
     this.coordinator = options.coordinator || connectionCoordinator;
+    this.generation = 0;
+    this.pendingByPeer = new Map();
+
+    try {
+      this.coordinator?.setFallbackEngine?.(this);
+    } catch (error) {
+      console.warn('[FallbackEngine] Could not attach coordinator policy:', error?.message || error);
+    }
   }
 
   setMode(mode) {
@@ -70,100 +149,221 @@ export class TransportFallbackEngine {
     return this.mode;
   }
 
-  async connect(peer, handlers = {}) {
-    const {
-      connectP2p,
-      cancelP2p,
-      connectBluetooth,
-      cancelBluetooth,
-      onFallbackStep,
-    } = handlers;
-    const errors = [];
+  setMaxAttempts(maxAttempts) {
+    this.maxAttempts = normalizeMaxAttempts(maxAttempts);
+  }
 
-    // 1. LAN Transport (Priority 1). The coordinator owns LAN cancellation.
-    const canTryLan = this.mode === TRANSPORT_MODE.AUTO || this.mode === TRANSPORT_MODE.LAN_ONLY;
-    const hasLanEndpoint = peer.transports?.LAN?.host || peer.host;
+  _isTransportAllowed(transport) {
+    return this.mode === TRANSPORT_MODE.AUTO || MODE_TRANSPORT[this.mode] === transport;
+  }
 
-    if (canTryLan && hasLanEndpoint) {
-      try {
-        if (onFallbackStep) onFallbackStep('LAN');
-        const session = await runWithTransportTimeout(
-          () => this.coordinator.connectLanPeer(peer, this.lanTimeoutMs),
-          this.lanTimeoutMs,
-          'LAN',
-          () => this.coordinator.cancelConnecting()
-        );
-        return { transport: 'LAN', session };
-      } catch (err) {
-        console.log('[FallbackEngine] LAN connection failed, attempting next transport:', err?.message || err);
-        errors.push({ transport: 'LAN', error: err });
+  _hasConnector(transport, handlers = {}) {
+    if (transport === 'LAN') {
+      return typeof handlers.connectLan === 'function' ||
+        typeof this.coordinator?.connectLanPeer === 'function';
+    }
+    if (transport === 'P2P') {
+      return typeof handlers.connectP2p === 'function' ||
+        typeof this.coordinator?.connectP2pPeer === 'function';
+    }
+    return typeof handlers.connectBluetooth === 'function' ||
+      typeof this.coordinator?.connectBluetoothPeer === 'function';
+  }
+
+  /**
+   * Returns a stable priority plan. Endpoint object insertion order, discovery
+   * callback order and handler registration order never influence selection.
+   */
+  getCandidatePlan(peer, handlers = {}, options = {}) {
+    const excluded = new Set(options.excludeTransports || []);
+    const maximum = normalizeMaxAttempts(options.maxAttempts ?? this.maxAttempts);
+    return TRANSPORT_PRIORITY.filter(transport => (
+      this._isTransportAllowed(transport) &&
+      !excluded.has(transport) &&
+      hasEndpoint(peer, transport) &&
+      this._hasConnector(transport, handlers)
+    )).slice(0, maximum);
+  }
+
+  _createAttemptToken(peerId) {
+    const generation = ++this.generation;
+    return Object.freeze({
+      generation,
+      attemptId: `transport-${generation}`,
+      peerId,
+      mode: this.mode,
+    });
+  }
+
+  _findActiveRecord() {
+    return this.pendingByPeer.values().next().value || null;
+  }
+
+  _isCurrent(record) {
+    return this.pendingByPeer.get(record.peerId) === record && !record.cancelled;
+  }
+
+  getStatus() {
+    const record = this._findActiveRecord();
+    return {
+      mode: this.mode,
+      generation: this.generation,
+      maxAttempts: this.maxAttempts,
+      pendingAttempt: record
+        ? {
+            token: record.token,
+            transport: record.currentTransport,
+            completedSteps: record.completedSteps,
+          }
+        : null,
+    };
+  }
+
+  cancel(peerId = null, reason = 'Transport selection was cancelled') {
+    const record = peerId
+      ? this.pendingByPeer.get(peerId)
+      : this._findActiveRecord();
+    if (!record || record.cancelled) return false;
+
+    record.cancelled = true;
+    record.cancelReason = reason;
+    try { record.cancelCurrent?.(); } catch (e) {}
+    return true;
+  }
+
+  connect(peer, handlers = {}, options = {}) {
+    const id = peerKey(peer);
+    if (!id) {
+      return Promise.reject(new Error('Stable peer deviceId is required for transport selection'));
+    }
+
+    const duplicate = this.pendingByPeer.get(id);
+    if (duplicate) return duplicate.promise;
+
+    const active = this._findActiveRecord();
+    if (active) {
+      return Promise.reject(new TransportSelectionBusyError(active.peerId, id));
+    }
+
+    const record = {
+      peerId: id,
+      token: this._createAttemptToken(id),
+      cancelled: false,
+      cancelReason: null,
+      cancelCurrent: null,
+      currentTransport: null,
+      completedSteps: 0,
+      promise: null,
+    };
+
+    this.pendingByPeer.set(id, record);
+    const promise = this._connectWithRecord(peer, handlers, options, record)
+      .finally(() => {
+        if (this.pendingByPeer.get(id) === record) {
+          this.pendingByPeer.delete(id);
+        }
+      });
+    record.promise = promise;
+    return promise;
+  }
+
+  _connectorFor(transport, peer, handlers, options = {}) {
+    if (transport === 'LAN') {
+      const timeoutMs = options.lanTimeoutMs ?? this.lanTimeoutMs;
+      const connect = typeof handlers.connectLan === 'function'
+        ? () => handlers.connectLan(peer)
+        : () => this.coordinator.connectLanPeer(peer, timeoutMs);
+      return {
+        connect,
+        cancel: handlers.cancelLan || (() => this.coordinator?.cancelConnecting?.()),
+        timeoutMs,
+        timeoutLabel: 'LAN',
+      };
+    }
+
+    if (transport === 'P2P') {
+      const timeoutMs = options.p2pTimeoutMs ?? this.p2pTimeoutMs;
+      const connect = typeof handlers.connectP2p === 'function'
+        ? () => handlers.connectP2p(peer)
+        : () => this.coordinator.connectP2pPeer(peer, timeoutMs);
+      return {
+        connect,
+        cancel: handlers.cancelP2p || (() => this.coordinator?.cancelConnecting?.()),
+        timeoutMs,
+        timeoutLabel: 'Wi-Fi Direct',
+      };
+    }
+
+    const timeoutMs = options.bluetoothTimeoutMs ?? this.bluetoothTimeoutMs;
+    const connect = typeof handlers.connectBluetooth === 'function'
+      ? () => handlers.connectBluetooth(peer)
+      : () => this.coordinator.connectBluetoothPeer(peer, timeoutMs);
+    return {
+      connect,
+      cancel: handlers.cancelBluetooth || (() => this.coordinator?.cancelConnecting?.()),
+      timeoutMs,
+      timeoutLabel: 'Bluetooth',
+    };
+  }
+
+  async _connectWithRecord(peer, handlers, options, record) {
+    const candidates = this.getCandidatePlan(peer, handlers, options);
+    const attempts = [];
+
+    for (let index = 0; index < candidates.length; index++) {
+      if (!this._isCurrent(record)) {
+        throw new TransportAttemptCancelledError(record.token, record.cancelReason);
       }
-    }
 
-    if (this.mode === TRANSPORT_MODE.LAN_ONLY) {
-      throw new Error(`تعذّر الاتصال عبر الشبكة المحلية (LAN): ${errors[0]?.error?.message || 'لا يوجد عنوان'}`);
-    }
+      const transport = candidates[index];
+      const connector = this._connectorFor(transport, peer, handlers, options);
+      record.currentTransport = transport;
+      record.cancelCurrent = connector.cancel;
 
-    // 2. Wi-Fi Direct (P2P) (Priority 2). When the caller does not provide a
-    // compatibility handler, the coordinator is now the default P2P owner.
-    const coordinatorP2p = typeof this.coordinator?.connectP2pPeer === 'function'
-      ? candidate => this.coordinator.connectP2pPeer(candidate, this.p2pTimeoutMs)
-      : null;
-    const p2pConnect = typeof connectP2p === 'function' ? connectP2p : coordinatorP2p;
-    const p2pCancel = typeof connectP2p === 'function'
-      ? cancelP2p
-      : () => this.coordinator?.cancelConnecting?.();
-    const canTryP2p = (
-      this.mode === TRANSPORT_MODE.AUTO || this.mode === TRANSPORT_MODE.P2P_ONLY
-    ) && typeof p2pConnect === 'function';
-    const hasP2pEndpoint = peer.transports?.P2P?.deviceAddress || peer.deviceAddress;
-
-    if (canTryP2p && hasP2pEndpoint) {
       try {
-        if (onFallbackStep) onFallbackStep('P2P');
+        handlers.onFallbackStep?.(transport, {
+          attemptToken: record.token,
+          step: index + 1,
+          maxSteps: candidates.length,
+        });
         const result = await runWithTransportTimeout(
-          () => p2pConnect(peer),
-          this.p2pTimeoutMs,
-          'Wi-Fi Direct',
-          p2pCancel
+          connector.connect,
+          connector.timeoutMs,
+          connector.timeoutLabel,
+          connector.cancel,
         );
-        return { transport: 'P2P', result };
-      } catch (err) {
-        console.log('[FallbackEngine] Wi-Fi Direct connection failed, attempting next transport:', err?.message || err);
-        errors.push({ transport: 'P2P', error: err });
+
+        if (!this._isCurrent(record)) {
+          throw new TransportAttemptCancelledError(record.token, record.cancelReason);
+        }
+
+        record.cancelCurrent = null;
+        record.completedSteps = index + 1;
+        return transport === 'LAN'
+          ? { transport, session: result }
+          : { transport, result };
+      } catch (error) {
+        if (error instanceof TransportAttemptCancelledError || !this._isCurrent(record)) {
+          throw error instanceof TransportAttemptCancelledError
+            ? error
+            : new TransportAttemptCancelledError(record.token, record.cancelReason);
+        }
+        record.cancelCurrent = null;
+        record.completedSteps = index + 1;
+        attempts.push({ transport, error });
+        console.log(
+          `[FallbackEngine] ${transport} connection failed, attempting next transport:`,
+          error?.message || error,
+        );
       }
     }
 
-    if (this.mode === TRANSPORT_MODE.P2P_ONLY) {
-      throw new Error(`تعذّر الاتصال عبر Wi-Fi Direct: ${errors[errors.length - 1]?.error?.message || 'لا يوجد جهاز/مسار صالح'}`);
-    }
-
-    // 3. Bluetooth (Priority 3)
-    const canTryBt = (this.mode === TRANSPORT_MODE.AUTO || this.mode === TRANSPORT_MODE.BLUETOOTH_ONLY) && typeof connectBluetooth === 'function';
-    const hasBtEndpoint = peer.transports?.BLUETOOTH?.address || peer.btAddress;
-
-    if (canTryBt && hasBtEndpoint) {
-      try {
-        if (onFallbackStep) onFallbackStep('BLUETOOTH');
-        const result = await runWithTransportTimeout(
-          () => connectBluetooth(peer),
-          this.bluetoothTimeoutMs,
-          'Bluetooth',
-          cancelBluetooth
-        );
-        return { transport: 'BLUETOOTH', result };
-      } catch (err) {
-        console.log('[FallbackEngine] Bluetooth connection failed:', err?.message || err);
-        errors.push({ transport: 'BLUETOOTH', error: err });
-      }
-    }
-
-    if (this.mode === TRANSPORT_MODE.BLUETOOTH_ONLY) {
-      throw new Error(`تعذّر الاتصال عبر البلوتوث: ${errors[errors.length - 1]?.error?.message || 'لا يوجد جهاز/مسار صالح'}`);
-    }
-
-    const errorSummary = errors.map(e => `${e.transport}: ${e.error?.message || 'failed'}`).join(', ');
-    throw new Error(`تعذّر الاتصال بالطرف الآخر عبر أي وسيلة اتصال متاحة (${errorSummary || 'لا توجد وسائل اتصال صالحة'})`);
+    throw new TransportFallbackExhaustedError({
+      mode: this.mode,
+      attempts,
+      candidates,
+      attemptToken: record.token,
+    });
   }
 }
 

@@ -10,10 +10,13 @@ import { lanPassiveAdmissionHandler } from './src/network/LanPassiveAdmission';
 import { wifiDirectTransportAdapter } from './src/network/WifiDirectTransportAdapter';
 import { setPassiveInboundAdmissionHandler } from './src/webrtc/signaling';
 import { signalingOwner } from './src/webrtc/signalingOwner';
+import { bluetoothTransport } from './src/bluetooth/BluetoothManager';
 
 connectionCoordinator.setSignalingOwner(signalingOwner);
 connectionCoordinator.setP2pAdapter(wifiDirectTransportAdapter);
+connectionCoordinator.setBluetoothAdapter(bluetoothTransport);
 wifiDirectTransportAdapter.startObserving();
+bluetoothTransport.startObserving();
 setPassiveInboundAdmissionHandler(lanPassiveAdmissionHandler);
 
 function G1Root() {

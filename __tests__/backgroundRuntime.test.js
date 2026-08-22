@@ -68,6 +68,7 @@ import {
   setUiAttached,
   shutdownBackgroundRuntimeForTests,
 } from '../src/services/BackgroundRuntime';
+import { handleRemoteCallSignal } from '../src/services/CallRuntime';
 
 async function flushAsync() {
   await Promise.resolve();
@@ -100,7 +101,13 @@ describe('BackgroundRuntime', () => {
   test('persists and notifies incoming chat when the UI is detached', async () => {
     mockSignalMessageObserver({ type: 'identity', deviceId: 'peer-2', deviceName: 'Moto' });
     setUiAttached(false);
-    mockSignalMessageObserver({ type: 'chat', text: 'background hello' });
+    mockSignalMessageObserver({
+      type: 'chat',
+      messageId: 'background-msg-1',
+      text: 'background hello',
+      replyToMessageId: 'original-msg',
+      time: 1234,
+    });
     await flushAsync();
 
     expect(saveMessage).toHaveBeenCalledWith(
@@ -108,7 +115,9 @@ describe('BackgroundRuntime', () => {
       expect.objectContaining({
         sender: 'remote',
         type: 'text',
+        messageId: 'background-msg-1',
         text: 'background hello',
+        replyToMessageId: 'original-msg',
         status: 'delivered',
       })
     );
@@ -178,5 +187,17 @@ describe('BackgroundRuntime', () => {
 
     clearPendingIncomingCall();
     expect(getPendingIncomingCall()).toBeNull();
+  });
+
+  test('forwards connecting, active, and failed call lifecycle signals', () => {
+    for (const type of ['call-connected', 'call-active', 'call-failed']) {
+      mockSignalMessageObserver({ type, callId: 'call-lifecycle' });
+    }
+
+    expect(handleRemoteCallSignal.mock.calls.map(([message]) => message.type)).toEqual([
+      'call-connected',
+      'call-active',
+      'call-failed',
+    ]);
   });
 });

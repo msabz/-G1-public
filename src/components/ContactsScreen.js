@@ -46,6 +46,9 @@ export default function ContactsScreen({
   localIp = '127.0.0.1',
   btDevices = [],
   onSelectBtDevice,
+  callRecords = [],
+  onDeleteCallRecord,
+  onClearCallHistory,
 }) {
   const { theme, isDark, setThemeMode, mode } = useAppTheme();
   const [activeTab, setActiveTab] = useState('chats'); // 'chats', 'discovery', 'calls'
@@ -325,15 +328,106 @@ export default function ContactsScreen({
     </ScrollView>
   );
 
-  const renderCallsTab = () => (
-    <View style={[styles.tabContent, styles.centerEmpty]}>
-      <Text style={{ fontSize: 48, marginBottom: 12 }}>📞</Text>
-      <Text style={[styles.emptyTitle, { color: theme.text }]}>سجل المكالمات المباشرة</Text>
-      <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}>
-        يمكنك إجراء مكالمات صوت وفيديو مشفرة P2P عبر Wi-Fi Direct أو نفس شبكة الواي فاي LAN.
-      </Text>
-    </View>
-  );
+  const callStateLabel = record => {
+    const state = record.finalState || record.state;
+    const labels = {
+      ended: 'انتهت',
+      missed: 'فائتة',
+      declined: 'مرفوضة',
+      rejected: 'مرفوضة من الطرف الآخر',
+      busy: 'مشغول',
+      noanswer: 'بلا رد',
+      cancelled: 'ملغاة',
+      failed: 'فشلت',
+      active: 'جارية',
+      connected: 'متصلة',
+      ringing: 'ترن',
+    };
+    return labels[state] || state || 'مكالمة';
+  };
+
+  const callDurationLabel = seconds => {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (!total) return '';
+    const minutes = Math.floor(total / 60);
+    const remainder = total % 60;
+    return minutes ? `${minutes}:${String(remainder).padStart(2, '0')}` : `${remainder} ث`;
+  };
+
+  const renderCallsTab = () => {
+    if (!callRecords.length) {
+      return (
+        <View style={[styles.tabContent, styles.centerEmpty]}>
+          <Text style={{ fontSize: 48, marginBottom: 12 }}>📞</Text>
+          <Text style={[styles.emptyTitle, { color: theme.text }]}>لا يوجد سجل مكالمات بعد</Text>
+          <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}> 
+            تظهر هنا المكالمات الصوتية والفيديو، بما فيها الفائتة والمرفوضة.
+          </Text>
+        </View>
+      );
+    }
+
+    return (
+      <FlatList
+        style={styles.tabContent}
+        data={callRecords}
+        keyExtractor={(item, index) => item.callId || String(index)}
+        contentContainerStyle={{ paddingBottom: 110 }}
+        ListHeaderComponent={(
+          <View style={styles.callHistoryHeader}>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>سجل المكالمات</Text>
+            <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="مسح سجل المكالمات"
+              onPress={() => Alert.alert(
+                'مسح سجل المكالمات',
+                'هل تريد حذف جميع سجلات المكالمات من هذا الجهاز؟',
+                [
+                  { text: 'إلغاء', style: 'cancel' },
+                  { text: 'مسح', style: 'destructive', onPress: () => onClearCallHistory?.() },
+                ],
+              )}
+              style={styles.callDeleteButton}
+            >
+              <Text style={{ color: theme.danger || '#C62828', fontWeight: '700' }}>مسح الكل</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+        renderItem={({ item }) => {
+          const incoming = item.direction === 'incoming';
+          const video = item.mediaType === 'video' || item.video === true;
+          const stateLabel = callStateLabel(item);
+          const duration = callDurationLabel(item.duration);
+          const peerName = item.peerName || item.peerId || 'جهاز G1';
+          return (
+            <View
+              accessible
+              accessibilityLabel={`${incoming ? 'مكالمة واردة' : 'مكالمة صادرة'} ${video ? 'فيديو' : 'صوتية'} مع ${peerName}، ${stateLabel}`}
+              style={[styles.callRow, { backgroundColor: theme.surface, borderBottomColor: theme.borderSubtle }]}
+            >
+              <Avatar name={peerName} size={46} />
+              <View style={styles.callInfo}>
+                <Text style={[styles.peerName, { color: theme.text }]} numberOfLines={1}>{peerName}</Text>
+                <Text style={[styles.callMeta, { color: theme.textSecondary }]}>
+                  {incoming ? '↙ واردة' : '↗ صادرة'} · {video ? 'فيديو' : 'صوت'} · {stateLabel}
+                  {duration ? ` · ${duration}` : ''}
+                </Text>
+                <Text style={[styles.chatTime, { color: theme.textMuted }]}>{formatWhen(item.startedAt)}</Text>
+              </View>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel={`حذف سجل المكالمة مع ${peerName}`}
+                onPress={() => onDeleteCallRecord?.(item.callId)}
+                style={styles.callDeleteButton}
+              >
+                <Text style={{ fontSize: 19 }}>🗑️</Text>
+              </TouchableOpacity>
+            </View>
+          );
+        }}
+      />
+    );
+  };
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -626,6 +720,35 @@ const styles = StyleSheet.create({
   peerStatus: {
     fontSize: 12,
     marginTop: 2,
+  },
+  callHistoryHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+  },
+  callRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 4,
+    borderBottomWidth: 0.5,
+  },
+  callInfo: {
+    flex: 1,
+    marginHorizontal: 12,
+  },
+  callMeta: {
+    fontSize: 12,
+    marginTop: 3,
+    marginBottom: 3,
+  },
+  callDeleteButton: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 6,
   },
   emptyBox: {
     paddingVertical: 20,

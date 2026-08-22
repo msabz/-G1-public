@@ -29,13 +29,14 @@ class CallActionReceiver : BroadcastReceiver() {
             ACTION_REJECT -> "reject"
             else -> return
         }
+        val actionAt = System.currentTimeMillis()
 
         val prefs = context.getSharedPreferences(CallNotificationModule.PREFS, Context.MODE_PRIVATE)
         prefs.edit()
             .putString("pendingAction", action)
             .putString("pendingActionCallId", callId)
-            .putLong("pendingActionAt", System.currentTimeMillis())
-            .apply()
+            .putLong("pendingActionAt", actionAt)
+            .commit()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.cancel(CallNotificationModule.notificationId(callId))
@@ -53,12 +54,11 @@ class CallActionReceiver : BroadcastReceiver() {
                     .emit(CallNotificationModule.EVENT_CALL_ACTION, Arguments.createMap().apply {
                         putString("action", action)
                         putString("callId", callId)
+                        putDouble("actionAt", actionAt.toDouble())
                     })
-                prefs.edit()
-                    .remove("pendingAction")
-                    .remove("pendingActionCallId")
-                    .remove("pendingActionAt")
-                    .apply()
+                // Keep the action durable until CallRuntime acknowledges it.
+                // A ReactContext may exist while its JS listener is still being
+                // recreated, so clearing here could silently lose Answer/Reject.
                 emitted = true
             }
         } catch (_: Exception) {}

@@ -16,6 +16,22 @@ class CallNotificationModule(reactContext: ReactApplicationContext) : ReactConte
         const val CHANNEL_ID = "g1_calls"
         const val PREFS = "g1_pending_call"
         const val EVENT_CALL_ACTION = "G1_CALL_ACTION"
+        private const val ACTION_MAX_AGE_MS = 5 * 60 * 1000L
+
+        private val SESSION_KEYS = arrayOf(
+            "sessionCallId",
+            "sessionPeerId",
+            "sessionPeerName",
+            "sessionDirection",
+            "sessionMediaType",
+            "sessionState",
+            "sessionStartedAt",
+            "sessionRingingAt",
+            "sessionAnsweredAt",
+            "sessionActiveAt",
+            "sessionLastTransitionAt",
+            "sessionCorrelationMode"
+        )
 
         fun notificationId(callId: String): Int {
             val hash = callId.hashCode() and 0x7fffffff
@@ -27,6 +43,16 @@ class CallNotificationModule(reactContext: ReactApplicationContext) : ReactConte
 
     init {
         createChannel()
+    }
+
+    private fun ReadableMap.stringOrNull(key: String): String? =
+        if (hasKey(key) && !isNull(key)) getString(key) else null
+
+    private fun ReadableMap.longOrNull(key: String): Long? =
+        if (hasKey(key) && !isNull(key)) getDouble(key).toLong() else null
+
+    private fun WritableMap.putNullableTimestamp(key: String, value: Long?) {
+        if (value == null || value <= 0L) putNull(key) else putDouble(key, value.toDouble())
     }
 
     private fun createChannel() {
@@ -121,6 +147,32 @@ class CallNotificationModule(reactContext: ReactApplicationContext) : ReactConte
     }
 
     @ReactMethod
+    fun showMissedCall(callId: String, callerName: String, video: Boolean, promise: Promise) {
+        try {
+            require(callId.isNotBlank()) { "callId is required" }
+            createChannel()
+            val open = launchPendingIntent(callId)
+            val notification = NotificationCompat.Builder(reactApplicationContext, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.sym_call_missed)
+                .setContentTitle(callerName.ifBlank { "G1 DirectChat" })
+                .setContentText(if (video) "مكالمة فيديو فائتة" else "مكالمة صوتية فائتة")
+                .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOngoing(false)
+                .setAutoCancel(true)
+                .setContentIntent(open)
+                .build()
+
+            val nm = reactApplicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(notificationId(callId), notification)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
     fun cancelIncomingCall(callId: String, promise: Promise) {
         try {
             val nm = reactApplicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -161,24 +213,127 @@ class CallNotificationModule(reactContext: ReactApplicationContext) : ReactConte
     }
 
     @ReactMethod
+    fun saveCallSession(session: ReadableMap, promise: Promise) {
+        try {
+            val callId = session.stringOrNull("callId")
+                ?: throw IllegalArgumentException("callId is required")
+            val peerId = session.stringOrNull("peerId")
+                ?: throw IllegalArgumentException("peerId is required")
+            val editor = reactApplicationContext
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString("sessionCallId", callId)
+                .putString("sessionPeerId", peerId)
+                .putString("sessionPeerName", session.stringOrNull("peerName") ?: "G1 Device")
+                .putString("sessionDirection", session.stringOrNull("direction") ?: "incoming")
+                .putString("sessionMediaType", session.stringOrNull("mediaType") ?: "voice")
+                .putString("sessionState", session.stringOrNull("state") ?: "ringing")
+                .putLong("sessionStartedAt", session.longOrNull("startedAt") ?: System.currentTimeMillis())
+                .putLong("sessionLastTransitionAt", session.longOrNull("lastTransitionAt") ?: System.currentTimeMillis())
+                .putString("sessionCorrelationMode", session.stringOrNull("correlationMode") ?: "call-id")
+
+            mapOf(
+                "sessionRingingAt" to session.longOrNull("ringingAt"),
+                "sessionAnsweredAt" to session.longOrNull("answeredAt"),
+                "sessionActiveAt" to session.longOrNull("activeAt")
+            ).forEach { (key, value) ->
+                if (value == null || value <= 0L) editor.remove(key) else editor.putLong(key, value)
+            }
+            promise.resolve(editor.commit())
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun getPendingCallSession(promise: Promise) {
+        try {
+            val prefs = reactApplicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val callId = prefs.getString("sessionCallId", null)
+            if (callId.isNullOrBlank()) {
+                promise.resolve(null)
+                return
+            }
+            promise.resolve(Arguments.createMap().apply {
+                putString("callId", callId)
+                putString("peerId", prefs.getString("sessionPeerId", "unknown-peer"))
+                putString("peerName", prefs.getString("sessionPeerName", "G1 Device"))
+                putString("direction", prefs.getString("sessionDirection", "incoming"))
+                putString("mediaType", prefs.getString("sessionMediaType", "voice"))
+                putString("state", prefs.getString("sessionState", "ringing"))
+                putDouble("startedAt", prefs.getLong("sessionStartedAt", 0L).toDouble())
+                putNullableTimestamp("ringingAt", if (prefs.contains("sessionRingingAt")) prefs.getLong("sessionRingingAt", 0L) else null)
+                putNullableTimestamp("answeredAt", if (prefs.contains("sessionAnsweredAt")) prefs.getLong("sessionAnsweredAt", 0L) else null)
+                putNullableTimestamp("activeAt", if (prefs.contains("sessionActiveAt")) prefs.getLong("sessionActiveAt", 0L) else null)
+                putDouble("lastTransitionAt", prefs.getLong("sessionLastTransitionAt", 0L).toDouble())
+                putString("correlationMode", prefs.getString("sessionCorrelationMode", "call-id"))
+            })
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun clearCallSession(callId: String, promise: Promise) {
+        try {
+            val prefs = reactApplicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (prefs.getString("sessionCallId", null) == callId) {
+                val editor = prefs.edit()
+                SESSION_KEYS.forEach { key -> editor.remove(key) }
+                editor.apply()
+            }
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
     fun consumePendingCallAction(promise: Promise) {
         try {
             val prefs = reactApplicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val action = prefs.getString("pendingAction", null)
             val callId = prefs.getString("pendingActionCallId", null)
+            val actionAt = prefs.getLong("pendingActionAt", 0L)
             if (action.isNullOrBlank() || callId.isNullOrBlank()) {
                 promise.resolve(null)
                 return
             }
-            prefs.edit()
-                .remove("pendingAction")
-                .remove("pendingActionCallId")
-                .remove("pendingActionAt")
-                .apply()
+            if (actionAt <= 0L || System.currentTimeMillis() - actionAt > ACTION_MAX_AGE_MS) {
+                prefs.edit()
+                    .remove("pendingAction")
+                    .remove("pendingActionCallId")
+                    .remove("pendingActionAt")
+                    .apply()
+                promise.resolve(null)
+                return
+            }
             promise.resolve(Arguments.createMap().apply {
                 putString("action", action)
                 putString("callId", callId)
+                putDouble("actionAt", actionAt.toDouble())
             })
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun acknowledgeCallAction(callId: String, action: String, actionAt: Double, promise: Promise) {
+        try {
+            val prefs = reactApplicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val storedAt = prefs.getLong("pendingActionAt", 0L)
+            val matches = prefs.getString("pendingActionCallId", null) == callId &&
+                prefs.getString("pendingAction", null) == action &&
+                (actionAt <= 0.0 || storedAt == actionAt.toLong())
+            if (matches) {
+                prefs.edit()
+                    .remove("pendingAction")
+                    .remove("pendingActionCallId")
+                    .remove("pendingActionAt")
+                    .apply()
+            }
+            promise.resolve(matches)
         } catch (e: Exception) {
             promise.reject("ERROR", e.message, e)
         }
