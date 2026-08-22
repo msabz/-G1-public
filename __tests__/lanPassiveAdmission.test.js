@@ -102,7 +102,11 @@ describe('LAN passive session admission policy', () => {
       peerAddress: '192.168.0.36',
     });
 
-    expect(result).toEqual(expect.objectContaining({ accepted: false }));
+    expect(result).toEqual(expect.objectContaining({
+      accepted: false,
+      pending: true,
+      reason: 'awaiting-lan-discovery',
+    }));
     expect(coordinator.adoptSignalingOwnerSession).not.toHaveBeenCalled();
   });
 
@@ -116,7 +120,7 @@ describe('LAN passive session admission policy', () => {
       peerAddress: '192.168.0.36',
     });
 
-    expect(result).toEqual(expect.objectContaining({ accepted: false }));
+    expect(result).toEqual(expect.objectContaining({ accepted: false, pending: true }));
     expect(coordinator.adoptSignalingOwnerSession).not.toHaveBeenCalled();
   });
 
@@ -130,7 +134,11 @@ describe('LAN passive session admission policy', () => {
       peerAddress: '192.168.0.55',
     });
 
-    expect(result).toEqual(expect.objectContaining({ accepted: false, reason: 'endpoint-mismatch' }));
+    expect(result).toEqual(expect.objectContaining({
+      accepted: false,
+      pending: true,
+      reason: 'awaiting-matching-lan-route',
+    }));
     expect(coordinator.adoptSignalingOwnerSession).not.toHaveBeenCalled();
   });
 

@@ -59,6 +59,11 @@ describe('ConnectionCoordinator signaling-owner boundary', () => {
       retryDelayMs: 600,
       timeoutMs: 5000,
     });
+    expect(owner.sendMessage).toHaveBeenCalledWith({
+      type: 'identity',
+      deviceId: 'self-device',
+      deviceName: 'G1 Device',
+    });
     expect(TcpSocket.createConnection).not.toHaveBeenCalled();
     expect(session).toBe(owner.session);
     expect(coordinator.activeSession).toBe(owner.session);
@@ -144,6 +149,29 @@ describe('ConnectionCoordinator signaling-owner boundary', () => {
 
     await expect(coordinator.connectLanPeer(peer, 5000)).rejects.toBe(failure);
 
+    expect(coordinator.state).toBe(COORDINATOR_STATE.ERROR);
+    expect(coordinator.activeSession).toBeNull();
+  });
+
+  test('rejects and closes a LAN session when the immediate identity announcement fails', async () => {
+    const owner = makeOwner({
+      sendMessage: jest.fn().mockReturnValue(false),
+    });
+    const coordinator = new ConnectionCoordinator({
+      myDeviceId: 'self-device',
+      myDeviceName: 'Self phone',
+      signalingOwner: owner,
+    });
+    const peer = {
+      deviceId: 'peer-device',
+      transports: { LAN: { host: '192.168.0.36', port: 8089 } },
+    };
+
+    await expect(coordinator.connectLanPeer(peer, 5000)).rejects.toThrow(
+      'Failed to announce stable G1 identity over LAN'
+    );
+
+    expect(owner.disconnect).toHaveBeenCalledTimes(1);
     expect(coordinator.state).toBe(COORDINATOR_STATE.ERROR);
     expect(coordinator.activeSession).toBeNull();
   });

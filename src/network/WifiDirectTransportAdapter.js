@@ -51,6 +51,7 @@ export class WifiDirectTransportAdapter {
     this.activePeer = null;
     this.activeRoute = null;
     this.pendingConnect = null;
+    this.cleanupPromise = null;
     this.subscriptions = [];
     this.observing = false;
     this.knownIdentityByAddress = new Map();
@@ -162,15 +163,40 @@ export class WifiDirectTransportAdapter {
     }
   }
 
-  async _resolveConnectedRoute(initialInfo = {}) {
+  _ownsPendingActivation(pending) {
+    return !!pending && this.pendingConnect === pending && !pending.settled;
+  }
+
+  async _resolveConnectedRoute(
+    initialInfo = {},
+    expectedConnectionEpoch = null,
+    expectedPending = null
+  ) {
     let info = initialInfo || {};
+    const initialConnectionEpoch = initialInfo?.connectionEpoch == null
+      ? Number.NaN
+      : Number(initialInfo.connectionEpoch);
+    const pendingConnectionEpoch = expectedConnectionEpoch == null
+      ? Number.NaN
+      : Number(expectedConnectionEpoch);
+    const preservedConnectionEpoch = Number.isFinite(pendingConnectionEpoch)
+      ? pendingConnectionEpoch
+      : Number.isFinite(initialConnectionEpoch)
+        ? initialConnectionEpoch
+        : null;
     for (
       let retry = 0;
       !info.isGroupOwner && !info.groupOwnerAddress && retry < 6;
       retry += 1
     ) {
       await this.delay(500);
+      if (!this._ownsPendingActivation(expectedPending)) {
+        throw new Error('Wi-Fi Direct route activation was superseded');
+      }
       info = await this.nativeModule.getConnectionInfo();
+      if (!this._ownsPendingActivation(expectedPending)) {
+        throw new Error('Wi-Fi Direct route activation was superseded');
+      }
     }
 
     const isGroupOwner = !!info.isGroupOwner;
@@ -181,26 +207,47 @@ export class WifiDirectTransportAdapter {
 
     let bound = true;
     if (typeof this.nativeModule.bindToWifiDirectNetwork === 'function') {
+      if (!this._ownsPendingActivation(expectedPending)) {
+        throw new Error('Wi-Fi Direct route activation was superseded');
+      }
+      let bindAttempted = false;
       try {
+        bindAttempted = true;
         bound = (await this.nativeModule.bindToWifiDirectNetwork()) !== false;
       } catch (e) {
         bound = false;
       }
+      if (!this._ownsPendingActivation(expectedPending)) {
+        // A native bind may complete after cancel/timeout cleanup. Undo that
+        // late process-wide side effect instead of resurrecting a stale route.
+        if (bindAttempted && typeof this.nativeModule.unbindNetwork === 'function') {
+          try { await this.nativeModule.unbindNetwork(); } catch (e) {}
+        }
+        throw new Error('Wi-Fi Direct route activation was superseded');
+      }
     }
 
+    const refreshedConnectionEpoch = info.connectionEpoch == null
+      ? Number.NaN
+      : Number(info.connectionEpoch);
     return {
       transport: TRANSPORTS.P2P,
       isGroupOwner,
       groupOwnerAddress,
-      connectionEpoch: info.connectionEpoch ?? null,
+      // getConnectionInfo() does not expose our native attempt generation.
+      // Preserve the epoch already validated from PEER_CONNECTED/pending so
+      // activeRoute can still reject a delayed disconnect from an old group.
+      connectionEpoch: Number.isFinite(refreshedConnectionEpoch)
+        ? refreshedConnectionEpoch
+        : preservedConnectionEpoch,
       interfaceName: info.interfaceName || null,
       bound,
     };
   }
 
-  _settlePending(error, route = null) {
-    const pending = this.pendingConnect;
-    if (!pending || pending.settled) return false;
+  _settlePending(expectedPending, error, route = null) {
+    const pending = expectedPending;
+    if (!pending || this.pendingConnect !== pending || pending.settled) return false;
     pending.settled = true;
     this.pendingConnect = null;
     if (pending.timer) clearTimeout(pending.timer);
@@ -224,8 +271,37 @@ export class WifiDirectTransportAdapter {
     const pending = this.pendingConnect;
     if (!pending) return;
 
-    this._resolveConnectedRoute(info)
+    // Native returns the epoch allocated by connectToPeer(). A PEER_CONNECTED
+    // callback already queued on the RN bridge can outlive cleanup and arrive
+    // during the next JS attempt, so phase alone is not sufficient isolation.
+    if (pending.phase === 'PREPARING') return;
+    const eventEpoch = Number(info.connectionEpoch);
+    if (!Number.isFinite(pending.connectionEpoch)) {
+      if (pending.phase === 'NATIVE_CONNECTING' && Number.isFinite(eventEpoch)) {
+        pending.earlyConnectedInfo = info;
+      }
+      return;
+    }
+    if (!Number.isFinite(eventEpoch) || eventEpoch !== pending.connectionEpoch) return;
+
+    // A disconnect after this point belongs to the observed group. Earlier
+    // disconnect broadcasts can still belong to the cleanup preceding this
+    // attempt, especially on Samsung devices.
+    pending.phase = 'ACTIVATING';
+
+    this._resolveConnectedRoute(info, pending.connectionEpoch, pending)
       .then(route => {
+        if (this.pendingConnect !== pending || pending.settled) return;
+        if (
+          Number.isFinite(route.connectionEpoch) &&
+          route.connectionEpoch !== pending.connectionEpoch
+        ) {
+          this._settlePending(
+            pending,
+            new Error('Wi-Fi Direct route belongs to an obsolete connection attempt')
+          );
+          return;
+        }
         const p2p = pending.peer?.transports?.[TRANSPORTS.P2P] || pending.peer || {};
         const record = {
           deviceId: pending.peer.deviceId,
@@ -241,14 +317,37 @@ export class WifiDirectTransportAdapter {
           connectionEpoch: route.connectionEpoch,
           isOnline: true,
         });
-        this._settlePending(null, route);
+        this._settlePending(pending, null, route);
       })
-      .catch(error => this._settlePending(error));
+      .catch(error => this._settlePending(pending, error));
   }
 
-  _onPeerDisconnected() {
+  _onPeerDisconnected(event = {}) {
+    const pending = this.pendingConnect;
+    const eventEpoch = Number(event.connectionEpoch);
+    if (
+      pending &&
+      Number.isFinite(eventEpoch) &&
+      Number.isFinite(pending.connectionEpoch) &&
+      eventEpoch !== pending.connectionEpoch
+    ) {
+      return;
+    }
+    if (
+      !pending &&
+      Number.isFinite(eventEpoch) &&
+      Number.isFinite(this.activeRoute?.connectionEpoch) &&
+      eventEpoch !== this.activeRoute.connectionEpoch
+    ) {
+      return;
+    }
+    if (pending && pending.phase !== 'ACTIVATING') {
+      // The bounded route timeout/native connect failure remains authoritative
+      // until Android has reported a real group for this attempt.
+      return;
+    }
     const error = new Error('Wi-Fi Direct group disconnected before route activation');
-    if (this.pendingConnect) this._settlePending(error);
+    if (pending) this._settlePending(pending, error);
     this.activePeer = null;
     this.activeRoute = null;
     if (this.state !== WIFI_DIRECT_ADAPTER_STATE.DISCONNECTING) {
@@ -287,6 +386,16 @@ export class WifiDirectTransportAdapter {
     if (!deviceAddress) {
       throw new Error('Wi-Fi Direct deviceAddress is missing for peer');
     }
+
+    // Timeout cancellation is intentionally fire-and-forget at coordinator
+    // level. Serialize a following attempt behind native cleanup so an old
+    // removeGroup()/cancelConnect() cannot tear down the new negotiation.
+    if (this.cleanupPromise) {
+      const cleanup = await this.cleanupPromise;
+      if (cleanup?.clean === false) {
+        throw new Error(cleanup.error || 'Previous Wi-Fi Direct cleanup did not complete');
+      }
+    }
     if (this.pendingConnect) {
       throw new Error('Another Wi-Fi Direct connection attempt is already active');
     }
@@ -299,53 +408,116 @@ export class WifiDirectTransportAdapter {
     const timeoutMs = options.timeoutMs || this.defaultConnectTimeoutMs;
     const incoming = options.incoming === true;
 
+    let pending = null;
     const routePromise = new Promise((resolve, reject) => {
-      const pending = {
+      pending = {
         peer,
         incoming,
+        phase: 'PREPARING',
         resolve,
         reject,
         settled: false,
         timer: null,
+        connectionEpoch: null,
+        earlyConnectedInfo: null,
       };
       if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
         pending.timer = setTimeout(() => {
-          this._settlePending(new Error(`Wi-Fi Direct group negotiation timed out after ${timeoutMs}ms`));
+          const timedOut = this._settlePending(
+            pending,
+            new Error(`Wi-Fi Direct group negotiation timed out after ${timeoutMs}ms`)
+          );
+          if (timedOut) this._cleanupNativeRoute().catch(() => {});
         }, timeoutMs);
       }
       this.pendingConnect = pending;
     });
+    routePromise.catch(() => {});
 
-    try {
+    // Android may lose the WifiP2pManager channel without ever invoking an
+    // outstanding ActionListener. Run those native calls as an operation that
+    // feeds routePromise instead of awaiting them in front of routePromise, so
+    // the bounded JS deadline always remains authoritative.
+    (async () => {
       if (typeof this.nativeModule.stopServiceDiscovery === 'function') {
         await this.nativeModule.stopServiceDiscovery().catch(() => false);
       }
-      await this.nativeModule.connectToPeer(deviceAddress);
-      return await routePromise;
-    } catch (error) {
-      this._settlePending(error);
-      // routePromise may already be rejected by _settlePending. Consume it so
-      // a synchronous native failure cannot create an unhandled rejection.
-      routePromise.catch(() => {});
-      throw error;
-    }
+      if (this.pendingConnect !== pending || pending.settled) {
+        return;
+      }
+      pending.phase = 'NATIVE_CONNECTING';
+      const nativeAttempt = await this.nativeModule.connectToPeer(deviceAddress);
+      if (this.pendingConnect !== pending || pending.settled) return;
+      if (nativeAttempt?.started !== true) {
+        throw new Error('Android invalidated the Wi-Fi Direct connection attempt before it started');
+      }
+      const connectionEpoch = Number(nativeAttempt?.connectionEpoch);
+      if (!Number.isFinite(connectionEpoch)) {
+        throw new Error('Android did not identify the Wi-Fi Direct connection attempt');
+      }
+      pending.connectionEpoch = connectionEpoch;
+      pending.phase = 'AWAITING_GROUP';
+      const earlyConnectedInfo = pending.earlyConnectedInfo;
+      pending.earlyConnectedInfo = null;
+      if (earlyConnectedInfo) this._onPeerConnected(earlyConnectedInfo);
+    })().catch(error => this._settlePending(pending, error));
+
+    return await routePromise;
+  }
+
+  _cleanupNativeRoute(timeoutMs = this.defaultCleanupTimeoutMs) {
+    if (this.cleanupPromise) return this.cleanupPromise;
+
+    this.state = WIFI_DIRECT_ADAPTER_STATE.DISCONNECTING;
+    let cleanupTask = null;
+    cleanupTask = (async () => {
+      let result = null;
+      try {
+        result = await this.nativeModule?.cleanupConnection?.(timeoutMs);
+      } catch (error) {
+        result = { clean: false, error: error?.message || String(error) };
+      }
+      try {
+        await this.nativeModule?.unbindNetwork?.();
+      } catch (e) {}
+
+      const clean = result?.clean === true || result == null;
+      if (clean) {
+        if (this.identity?.deviceId && typeof this.nativeModule?.startAdvertising === 'function') {
+          try {
+            await this.nativeModule.startAdvertising(
+              this.identity.deviceName || 'G1 Device',
+              this.identity.deviceId
+            );
+          } catch (e) {}
+        }
+        try { await this.nativeModule?.startPassiveListening?.(); } catch (e) {}
+      }
+
+      // connectPeer waits for cleanupTask before it can create a new pending
+      // attempt. The identity guard additionally prevents an obsolete tail
+      // from overwriting state if this lifecycle changes later.
+      if (this.cleanupPromise === cleanupTask) {
+        this.activePeer = null;
+        this.activeRoute = null;
+        this.state = clean ? WIFI_DIRECT_ADAPTER_STATE.IDLE : WIFI_DIRECT_ADAPTER_STATE.ERROR;
+      }
+      return result || { clean };
+    })();
+
+    this.cleanupPromise = cleanupTask;
+    cleanupTask.finally(() => {
+      if (this.cleanupPromise === cleanupTask) this.cleanupPromise = null;
+    }).catch(() => {});
+    return cleanupTask;
   }
 
   async cancelConnect(reason = 'Wi-Fi Direct connection cancelled') {
     const pending = this.pendingConnect;
     if (pending && !pending.settled) {
-      this._settlePending(new Error(reason));
+      this._settlePending(pending, new Error(reason));
     }
-    try {
-      await this.nativeModule?.cleanupConnection?.(this.defaultCleanupTimeoutMs);
-    } catch (e) {}
-    try {
-      await this.nativeModule?.unbindNetwork?.();
-    } catch (e) {}
-    this.activePeer = null;
-    this.activeRoute = null;
-    this.state = WIFI_DIRECT_ADAPTER_STATE.IDLE;
-    return true;
+    return await this._cleanupNativeRoute();
   }
 
   async disconnect(options = {}) {
@@ -353,38 +525,16 @@ export class WifiDirectTransportAdapter {
     this.state = WIFI_DIRECT_ADAPTER_STATE.DISCONNECTING;
 
     if (this.pendingConnect && !this.pendingConnect.settled) {
-      this._settlePending(new Error('Wi-Fi Direct disconnected'));
-    }
-
-    let result = null;
-    try {
-      result = await this.nativeModule.cleanupConnection(
-        options.timeoutMs || this.defaultCleanupTimeoutMs
+      this._settlePending(
+        this.pendingConnect,
+        new Error('Wi-Fi Direct disconnected')
       );
-    } catch (error) {
-      result = { clean: false, error: error?.message || String(error) };
-    }
-
-    try { await this.nativeModule.unbindNetwork?.(); } catch (e) {}
-
-    const clean = result?.clean === true || result == null;
-    if (clean) {
-      if (this.identity?.deviceId && typeof this.nativeModule.startAdvertising === 'function') {
-        try {
-          await this.nativeModule.startAdvertising(
-            this.identity.deviceName || 'G1 Device',
-            this.identity.deviceId
-          );
-        } catch (e) {}
-      }
-      try { await this.nativeModule.startPassiveListening?.(); } catch (e) {}
     }
 
     this.registry.invalidateTransport(TRANSPORTS.P2P, 'p2p-group-cleanup');
-    this.activePeer = null;
-    this.activeRoute = null;
-    this.state = clean ? WIFI_DIRECT_ADAPTER_STATE.IDLE : WIFI_DIRECT_ADAPTER_STATE.ERROR;
-    return result || { clean };
+    return await this._cleanupNativeRoute(
+      options.timeoutMs || this.defaultCleanupTimeoutMs
+    );
   }
 }
 

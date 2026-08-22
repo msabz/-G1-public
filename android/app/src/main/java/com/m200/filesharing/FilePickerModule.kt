@@ -13,6 +13,7 @@ import android.util.Base64
 import androidx.core.content.FileProvider
 import com.facebook.react.bridge.*
 import java.io.File
+import java.util.zip.Deflater
 
 class FilePickerModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext), ActivityEventListener {
     private var pickPromise: Promise? = null
@@ -241,6 +242,11 @@ class FilePickerModule(reactContext: ReactApplicationContext) : ReactContextBase
             if (outFile.exists()) outFile.delete()
 
             java.util.zip.ZipOutputStream(outFile.outputStream().buffered()).use { zip ->
+                // APK splits are ZIP archives already. Deflating them again is
+                // CPU-expensive and normally saves negligible space, delaying
+                // the visible start of transfer. Level 0 preserves the same
+                // .apks container/protocol while streaming entries quickly.
+                zip.setLevel(Deflater.NO_COMPRESSION)
                 allApks.forEachIndexed { index, f ->
                     val rawName = if (index == 0) "base.apk" else f.name
                     val safeEntry = rawName.substringAfterLast('/').substringAfterLast('\\')

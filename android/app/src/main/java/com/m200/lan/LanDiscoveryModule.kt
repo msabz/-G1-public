@@ -392,7 +392,8 @@ class LanDiscoveryModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun handleResolvedService(serviceInfo: NsdServiceInfo) {
-        val hostAddress = serviceInfo.host?.hostAddress ?: return
+        val resolvedHost = serviceInfo.host ?: return
+        val hostAddress = resolvedHost.hostAddress ?: return
         val port = serviceInfo.port
         val cleanHost = LanDiscoveryHelper.cleanHostAddress(hostAddress)
 
@@ -421,7 +422,10 @@ class LanDiscoveryModule(private val reactContext: ReactApplicationContext) :
             return
         }
 
-        val routeInterface = findBestRouteInterface(cleanHost)
+        // Keep the original InetAddress for route classification. Re-parsing a
+        // scoped link-local string is unnecessary and varies across Android
+        // releases, while the NSD result already carries the exact scope.
+        val routeInterface = findBestRouteInterface(resolvedHost)
         if (LanDiscoveryHelper.isP2pInterfaceName(routeInterface)) {
             Log.d(
                 TAG,
@@ -453,9 +457,8 @@ class LanDiscoveryModule(private val reactContext: ReactApplicationContext) :
         sendEvent(EVENT_PEER_FOUND, params)
     }
 
-    private fun findBestRouteInterface(host: String): String? {
+    private fun findBestRouteInterface(target: InetAddress): String? {
         val cm = connectivityManager ?: return null
-        val target = try { InetAddress.getByName(host) } catch (_: Exception) { return null }
         var bestInterface: String? = null
         var bestPrefix = -1
 
@@ -471,7 +474,7 @@ class LanDiscoveryModule(private val reactContext: ReactApplicationContext) :
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Unable to determine route interface for $host: ${e.message}")
+            Log.w(TAG, "Unable to determine route interface for ${target.hostAddress}: ${e.message}")
         }
         return bestInterface
     }

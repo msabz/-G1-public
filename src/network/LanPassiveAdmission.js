@@ -40,7 +40,11 @@ export function createLanPassiveAdmissionHandler(options = {}) {
 
     const peer = registry.getPeer?.(message.deviceId) || null;
     if (!peer) {
-      return { accepted: false, reason: 'unknown-peer' };
+      // Android NSD is not symmetric: the dialing phone may discover the
+      // receiver before the receiver discovers the dialer. Keep the verified
+      // identity/socket provisional for the existing bounded admission window
+      // and re-check after NSD catches up.
+      return { accepted: false, pending: true, reason: 'awaiting-lan-discovery' };
     }
 
     const endpoint = peer.transports?.[TRANSPORTS.LAN] || null;
@@ -49,11 +53,11 @@ export function createLanPassiveAdmissionHandler(options = {}) {
       typeof registry.isTransportEndpointCurrent !== 'function' ||
       !registry.isTransportEndpointCurrent(endpoint, TRANSPORTS.LAN)
     ) {
-      return { accepted: false, reason: 'stale-lan-route' };
+      return { accepted: false, pending: true, reason: 'awaiting-current-lan-route' };
     }
 
     if (!isSameSignalingEndpoint(endpoint.host, peerAddress)) {
-      return { accepted: false, reason: 'endpoint-mismatch' };
+      return { accepted: false, pending: true, reason: 'awaiting-matching-lan-route' };
     }
 
     const decision = {

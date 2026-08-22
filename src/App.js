@@ -16,7 +16,11 @@ import {
 import { lanDiscovery } from './network/LanDiscovery';
 import { peerRegistry, TRANSPORTS } from './network/PeerRegistry';
 import { connectionCoordinator } from './network/ConnectionCoordinator';
-import { connectP2pFromApp, resolveStableP2pDeviceId } from './network/p2pAppBridge';
+import {
+  connectP2pFromApp,
+  resolveStableP2pDeviceId,
+  shouldYieldNativeP2pEvent,
+} from './network/p2pAppBridge';
 import { resolveKnownLanTarget } from './network/knownLanTarget';
 import { setLanPassiveAdmissionContextProvider } from './network/LanPassiveAdmission';
 import {
@@ -94,6 +98,7 @@ const DirectConnection = NativeModules.DirectConnectionModule;
 const emitter = new NativeEventEmitter(DirectConnection);
 const PORT = 8089;
 const DISC_TIMEOUT = 10000;
+const LEGACY_P2P_EPOCH_PENDING = 'PENDING';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const CALL_CONTROL_TYPES = new Set([
   'call-ringing',
@@ -289,6 +294,8 @@ export default function App() {
   const pendingKnownLanPeerIdRef = useRef(null);
   const coordinatorP2pAttemptRef = useRef(null);
   const connectionAddressTrackerRef = useRef(createConnectionAddressTracker());
+  const legacyP2pExpectedEpochRef = useRef(null);
+  const legacyP2pEarlyConnectedInfoRef = useRef(new Map());
   const rtcNegotiatingRef = useRef(false);
   const rtcNegotiatingCallIdRef = useRef(null);
   const inCallRef = useRef(false);
@@ -378,6 +385,10 @@ export default function App() {
     lastConnectionRef.current = null;
     activeTransportRef.current = null;
     activeControlOwnerRef.current = null;
+    bluetoothPendingPeerRef.current = null;
+    bluetoothActivationRef.current = null;
+    bluetoothLegacyHandoverRef.current = null;
+    pendingBluetoothIdentityRef.current = null;
     transferActivityGateRef.current.reset();
     setChatVisible(false);
     setActivePeer(null);
@@ -392,7 +403,8 @@ export default function App() {
 
   useEffect(() => {
     mountedRef.current = true;
-    requestWifiDirectPerms().then(async granted => {
+    const wifiPermissionRequest = requestWifiDirectPerms();
+    wifiPermissionRequest.then(async granted => {
       if (!granted) {
         if (mountedRef.current) {
           setStatusText('اسمح لـ G1 بالوصول إلى الأجهزة القريبة لتفعيل Wi-Fi Direct.');
@@ -434,10 +446,15 @@ export default function App() {
           setStatusText(`تعذّر تهيئة Wi-Fi Direct: ${e?.message || 'خطأ غير معروف'}`);
         }
       }
-    }).finally(() => {
-      // حافظ على طلبات الوسائط/البلوتوث القديمة، لكن نتيجتها لا تملك قرار
-      // تشغيل Wi-Fi Direct. رفض الكاميرا أو الميكروفون لا يجعل P2P يختفي.
-      requestPerms().catch(() => false);
+    });
+
+    // Serialize only the Android permission dialogs. Bluetooth availability
+    // does not wait for Wi-Fi Direct initialization/group cleanup or media
+    // consent, and either transport may start when the other is denied.
+    wifiPermissionRequest.finally(() => {
+      startBluetoothAvailability()
+        .catch(error => console.warn('[Bluetooth] availability bootstrap failed:', error?.message || error))
+        .finally(() => requestMediaPerms().catch(() => false));
     });
 
     setOnMessage(async (msg) => {
@@ -889,20 +906,10 @@ export default function App() {
     }
   }
 
-  async function requestPerms() {
+  async function requestMediaPerms() {
     const perms = [
       PermissionsAndroid.PERMISSIONS.CAMERA,
       PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-      ...(Platform.Version >= 33
-        ? [PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES]
-        : [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION]),
-      ...(Platform.Version >= 31
-        ? [
-            PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-            PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-            PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
-          ]
-        : []),
     ];
     const res = await PermissionsAndroid.requestMultiple(perms);
     const essentialsGranted = !Object.values(res).some(v => v !== 'granted');
@@ -917,6 +924,16 @@ export default function App() {
 
     return essentialsGranted;
   };
+
+  async function startBluetoothAvailability() {
+    if (!(await requestBluetoothPerms())) return false;
+    const supported = await BT.isSupported().catch(() => false);
+    if (!supported) return false;
+    const enabled = await BT.isEnabled().catch(() => false);
+    if (!enabled) return false;
+    await bluetoothTransport.startListening();
+    return true;
+  }
 
   const start = async () => {
     if (!(await requestWifiDirectPerms())) { Alert.alert('إذن الأجهزة القريبة مطلوب للاتصال عبر Wi-Fi Direct'); return; }
@@ -951,13 +968,27 @@ export default function App() {
 
   const createGroup = async () => {
     connectionAddressTrackerRef.current.beginAttempt();
+    legacyP2pExpectedEpochRef.current = LEGACY_P2P_EPOCH_PENDING;
+    legacyP2pEarlyConnectedInfoRef.current.clear();
     clearTimeout(timeoutRef.current);
     setShowCreateGroup(false);
+    stateRef.current = States.WIFI_CONNECTING;
     setState(States.WIFI_CONNECTING);
     try {
-      await DirectConnection.createGroup();
+      const nativeAttempt = await DirectConnection.createGroup();
+      const connectionEpoch = Number(nativeAttempt?.connectionEpoch);
+      if (nativeAttempt?.started !== true || !Number.isInteger(connectionEpoch)) {
+        throw new Error('لم يؤكد Android معرّف محاولة إنشاء المجموعة');
+      }
+      legacyP2pExpectedEpochRef.current = connectionEpoch;
+      const earlyConnectedInfo = legacyP2pEarlyConnectedInfoRef.current.get(connectionEpoch);
+      legacyP2pEarlyConnectedInfoRef.current.clear();
+      if (earlyConnectedInfo) await handlePeerConnected(earlyConnectedInfo);
     } catch (e) {
+      legacyP2pExpectedEpochRef.current = null;
+      legacyP2pEarlyConnectedInfoRef.current.clear();
       setStatusText('فشل إنشاء المجموعة. جرّب البلوتوث كبديل.');
+      stateRef.current = States.IDLE;
       setState(States.IDLE);
     }
   };
@@ -1004,12 +1035,27 @@ export default function App() {
   const handlePeerConnected = async initialInfo => {
     if (!initialInfo?.groupFormed || disconnectingRef.current) return;
     const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+    if (shouldYieldNativeP2pEvent({
+      coordinatorStatus,
+      coordinatorP2pAttemptActive: !!coordinatorP2pAttemptRef.current,
+    })) {
+      // The coordinator/fallback selection owns native P2P events until its
+      // current step settles. This also quarantines a late group event after
+      // P2P timeout while AUTO has already advanced to LAN/Bluetooth.
+      return;
+    }
+    const eventEpoch = Number(initialInfo.connectionEpoch);
+    const expectedEpoch = legacyP2pExpectedEpochRef.current;
+    if (expectedEpoch === LEGACY_P2P_EPOCH_PENDING) {
+      if (Number.isInteger(eventEpoch)) {
+        legacyP2pEarlyConnectedInfoRef.current.set(eventEpoch, initialInfo);
+      }
+      return;
+    }
     if (
-      coordinatorStatus.transport === TRANSPORTS.P2P &&
-      (coordinatorStatus.state === 'CONNECTING' || coordinatorStatus.state === 'CONNECTED')
+      Number.isInteger(expectedEpoch) &&
+      (!Number.isInteger(eventEpoch) || eventEpoch !== expectedEpoch)
     ) {
-      // Adapter/coordinator owns this group event; App must not open a second
-      // signaling path for the same Wi-Fi Direct route.
       return;
     }
     if (stateRef.current === States.CONNECTED || connectionSetupRef.current) return;
@@ -1020,6 +1066,8 @@ export default function App() {
     ) {
       return;
     }
+    legacyP2pExpectedEpochRef.current = eventEpoch;
+    legacyP2pEarlyConnectedInfoRef.current.clear();
 
     incomingInvitationRef.current = null;
     connectionSetupRef.current = true;
@@ -1228,10 +1276,18 @@ export default function App() {
     });
   };
 
-  function handlePeerDisconnected() {
+  function handlePeerDisconnected(event = {}) {
     // أثناء الفصل المتعمّد، cleanupConnection هو مصدر الحقيقة وينتظر
     // requestGroupInfo؛ لا نسمح لبث متأخر بتغيير الحالة قبله.
     if (disconnectingRef.current || stateRef.current === States.DISCONNECTING) return;
+    const eventEpoch = Number(event?.connectionEpoch);
+    const expectedEpoch = legacyP2pExpectedEpochRef.current;
+    if (
+      Number.isInteger(expectedEpoch) &&
+      (!Number.isInteger(eventEpoch) || eventEpoch !== expectedEpoch)
+    ) {
+      return;
+    }
     if (stateRef.current === States.CONNECTED) {
       if (activeTransportRef.current !== TRANSPORTS.P2P) {
         console.log('[Wi-Fi Direct] تجاهل بث انفصال P2P لأن النقل النشط ليس P2P');
@@ -1279,24 +1335,45 @@ export default function App() {
   const btScan = async () => {
     if (!(await requestBluetoothPerms())) {
       Alert.alert('إذن Bluetooth مطلوب', 'الاكتشاف والاتصال لا يحتاجان إذن الكاميرا أو الميكروفون.');
-      return;
+      return false;
     }
     const supported = await BT.isSupported().catch(() => false);
-    if (!supported) { Alert.alert('البلوتوث غير مدعوم على هذا الجهاز'); return; }
-    const enabled = await BT.isEnabled().catch(() => false);
-    if (!enabled) { await BT.requestEnable().catch(() => {}); return; }
+    if (!supported) { Alert.alert('البلوتوث غير مدعوم على هذا الجهاز'); return false; }
+    let enabled = await BT.isEnabled().catch(() => false);
+    if (!enabled) {
+      try {
+        await BT.requestEnable();
+      } catch (error) {
+        Alert.alert('Bluetooth غير مفعّل', 'يجب تفعيل Bluetooth للبحث عن الجهاز الآخر.');
+        return false;
+      }
+      // RESULT_OK may arrive while the adapter is still TURNING_ON. Wait for
+      // the bounded state transition so the first tap continues into scan.
+      for (let retry = 0; retry < 20 && !enabled; retry += 1) {
+        await delay(200);
+        enabled = await BT.isEnabled().catch(() => false);
+      }
+      if (!enabled) {
+        Alert.alert('تعذّر تشغيل Bluetooth', 'لم يكتمل تشغيل Bluetooth. حاول مرة أخرى.');
+        return false;
+      }
+    }
 
     foundDevicesRef.current = {};
     setBtDevices([]);
     setBtScanning(true);
-    await bluetoothTransport.discover({
-      timeoutMs: 12000,
-      requestDiscoverable: true,
-      discoverableSeconds: 120,
-    }).catch(error => {
+    try {
+      await bluetoothTransport.discover({
+        timeoutMs: 12000,
+        requestDiscoverable: true,
+        discoverableSeconds: 120,
+      });
+      return true;
+    } catch (error) {
       setBtScanning(false);
       Alert.alert('تعذّر اكتشاف أجهزة Bluetooth', error?.message || '');
-    });
+      return false;
+    }
   };
 
   const buildBluetoothPeer = deviceOrAddress => {
@@ -1312,8 +1389,12 @@ export default function App() {
     const savedContact = contactsRef.current.find(contact => (
       String(contact?.btAddress || '').trim().toUpperCase() === address
     ));
-    const deviceId = known?.deviceId || savedContact?.peerId || savedContact?.deviceId ||
-      `bluetooth:${address}`;
+    const advertisedDeviceId = String(device.deviceId || device.remoteNodeId || '').trim();
+    // remoteNodeId comes from the authenticated native RFCOMM hello and is the
+    // source of truth. A cached MAC association may be stale and must never
+    // override the identity proven by the live socket.
+    const deviceId = advertisedDeviceId || known?.deviceId || savedContact?.peerId ||
+      savedContact?.deviceId || `bluetooth:${address}`;
     peerRegistry.upsertBluetoothPeer({
       deviceId,
       deviceName: device.name || device.deviceName || savedContact?.customName ||
@@ -1398,9 +1479,10 @@ export default function App() {
 
   const handleBluetoothConnected = async event => {
     const route = event?.route || event || {};
-    const peer = bluetoothPendingPeerRef.current || buildBluetoothPeer({
+    const peer = route.peer || buildBluetoothPeer({
       address: route.address,
       name: route.deviceName,
+      deviceId: route.deviceId || route.remoteNodeId,
     });
     const status = connectionCoordinator.getCoordinatorStatus();
     const plannedLegacyHandover = bluetoothLegacyHandoverRef.current;
@@ -1416,23 +1498,115 @@ export default function App() {
     ) {
       return false;
     }
+    const currentPeerId = status.peer?.deviceId || peerIdRef.current ||
+      activePeerRef.current?.deviceId || activePeerRef.current?.peerId;
     if (
       (activeTransportRef.current && activeTransportRef.current !== TRANSPORTS.BLUETOOTH) ||
       (status.state === 'CONNECTED' && status.transport !== TRANSPORTS.BLUETOOTH)
     ) {
-      // An unsolicited inbound RFCOMM socket must never replace a healthy IP
-      // session behind the coordinator's back. Planned changes go exclusively
-      // through handoverPeer(), which commits the candidate before break.
-      await bluetoothTransport.disconnect().catch(() => false);
-      return false;
-    }
-    try {
-      if (!(status.state === 'CONNECTED' && status.transport === TRANSPORTS.BLUETOOTH)) {
-        await connectionCoordinator.connectBluetoothPeer(peer, 8000, {
+      if (!currentPeerId || currentPeerId !== peer.deviceId) {
+        // The authenticated remote identity does not match the healthy IP
+        // session, so this is a different device and must not replace it.
+        await bluetoothTransport.disconnect().catch(() => false);
+        return false;
+      }
+
+      bluetoothPendingPeerRef.current = peer;
+      pendingBluetoothIdentityRef.current = null;
+      stateRef.current = States.BT_CONNECTING;
+      if (mountedRef.current) {
+        setState(States.BT_CONNECTING);
+        setStatusText('تم توثيق Bluetooth — جاري نقل الجلسة دون قطع مبكر…');
+      }
+
+      let adoptedLegacyTransport = false;
+      let releasedLegacyTransport = false;
+      try {
+        if (status.state === 'CONNECTED' && status.transport !== TRANSPORTS.BLUETOOTH) {
+          const promotedRoute = await connectionCoordinator.handoverPeer(
+            peer,
+            TRANSPORTS.BLUETOOTH,
+            {
+              timeoutMs: 25000,
+              adapter: bluetoothTransport,
+              adapterOptions: { autoReconnect: true, maxReconnectAttempts: 3 },
+            },
+          );
+          return activateBluetoothUi(peer, promotedRoute);
+        }
+
+        // The legacy App owns the old LAN/P2P signaling path. RFCOMM is already
+        // authenticated here, but the candidate is not safe to promote until the
+        // coordinator adopts that exact activeRoute. Keep the old IP path intact
+        // if adoption fails; release it only after Bluetooth is coordinator-owned.
+        const previousTransport = activeTransportRef.current;
+        bluetoothLegacyHandoverRef.current = { peerId: peer.deviceId, address: routeAddress };
+        const promotedRoute = await connectionCoordinator.connectBluetoothPeer(peer, 25000, {
           adapterOptions: { autoReconnect: true, maxReconnectAttempts: 3 },
         });
+        adoptedLegacyTransport = true;
+        await releaseLegacyIpTransportForBluetooth(previousTransport);
+        releasedLegacyTransport = true;
+        bluetoothLegacyHandoverRef.current = null;
+        return activateBluetoothUi(peer, promotedRoute);
+      } catch (error) {
+        bluetoothLegacyHandoverRef.current = null;
+        const current = connectionCoordinator.getCoordinatorStatus();
+        if (current.state === 'CONNECTED' && current.transport !== TRANSPORTS.BLUETOOTH) {
+          stateRef.current = States.CONNECTED;
+          if (mountedRef.current) {
+            setState(States.CONNECTED);
+            setActiveTier(current.transport === TRANSPORTS.LAN ? Tiers.LAN : Tiers.WIFI_DIRECT);
+            setStatusText('فشل الانتقال إلى Bluetooth؛ بقي المسار السابق متصلًا.');
+          }
+        } else if (
+          activeTransportRef.current &&
+          activeTransportRef.current !== TRANSPORTS.BLUETOOTH &&
+          !adoptedLegacyTransport &&
+          !releasedLegacyTransport
+        ) {
+          await bluetoothTransport.disconnect().catch(() => false);
+          stateRef.current = States.CONNECTED;
+          if (mountedRef.current) {
+            setState(States.CONNECTED);
+            setActiveTier(
+              activeTransportRef.current === TRANSPORTS.LAN ? Tiers.LAN : Tiers.WIFI_DIRECT
+            );
+            setStatusText('فشل الانتقال إلى Bluetooth؛ بقي المسار السابق متصلًا.');
+          }
+        } else {
+          await bluetoothTransport.disconnect().catch(() => false);
+          if (adoptedLegacyTransport || releasedLegacyTransport) {
+            resetActiveSessionUi({ clearMessages: false });
+            stateRef.current = States.IDLE;
+            if (mountedRef.current) {
+              setState(States.IDLE);
+              setActiveTier(Tiers.NONE);
+              setStatusText('فشل إكمال الانتقال إلى Bluetooth؛ أعد الاتصال.');
+            }
+          }
+        }
+        throw error;
       }
-      return activateBluetoothUi(peer, route);
+    }
+    if (!(status.state === 'CONNECTED' && status.transport === TRANSPORTS.BLUETOOTH)) {
+      bluetoothPendingPeerRef.current = peer;
+      stateRef.current = States.BT_CONNECTING;
+      if (mountedRef.current) {
+        setState(States.BT_CONNECTING);
+        setStatusText('تم توثيق جهاز Bluetooth — جاري فتح المحادثة…');
+      }
+    }
+    try {
+      let adoptedRoute = route;
+      if (!(status.state === 'CONNECTED' && status.transport === TRANSPORTS.BLUETOOTH)) {
+        adoptedRoute = await connectionCoordinator.connectBluetoothPeer(peer, 25000, {
+          adapterOptions: { autoReconnect: true, maxReconnectAttempts: 3 },
+        });
+      } else {
+        adoptedRoute = bluetoothTransport.getStatus()?.activeRoute || route;
+      }
+      return activateBluetoothUi(adoptedRoute?.peer || peer, adoptedRoute);
     } catch (error) {
       const current = connectionCoordinator.getCoordinatorStatus();
       if (!(current.state === 'CONNECTED' && current.transport === TRANSPORTS.BLUETOOTH)) {
@@ -1463,6 +1637,17 @@ export default function App() {
         return;
       }
       const stableDeviceId = typeof message.deviceId === 'string' ? message.deviceId.trim() : '';
+      const authenticatedDeviceId = String(
+        bluetoothTransport.getStatus()?.activeRoute?.remoteNodeId || ''
+      ).trim();
+      if (
+        stableDeviceId &&
+        authenticatedDeviceId &&
+        stableDeviceId !== authenticatedDeviceId
+      ) {
+        await finishCurrentTransportDisconnect({ unexpected: true }).catch(() => false);
+        throw new Error('رفض هوية Bluetooth لا تطابق المصافحة الموثقة');
+      }
       const previousPeerId = peerIdRef.current;
       const address = event?.address || activePeerRef.current?.btAddress || activePeerRef.current?.deviceAddress;
       if (message.deviceName) {
@@ -1602,38 +1787,60 @@ export default function App() {
     }
     let peer = null;
     let preparedLegacyCandidate = false;
+    let adoptedLegacyCandidate = false;
     let releasedLegacyTransport = false;
     const previousTransport = activeTransportRef.current;
     try {
       peer = buildBluetoothPeer(deviceOrAddress);
-      bluetoothPendingPeerRef.current = peer;
       stateRef.current = States.BT_CONNECTING;
       setState(States.BT_CONNECTING);
       setStatusText(`جاري الاتصال بـ ${peer.deviceName || 'الجهاز'} عبر Bluetooth…`);
       await bluetoothTransport.stopDiscovery().catch(() => {});
       const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
+      const currentPeerId = coordinatorStatus.peer?.deviceId || peerIdRef.current ||
+        activePeerRef.current?.deviceId || activePeerRef.current?.peerId;
+      if (
+        currentPeerId &&
+        peer.deviceId?.startsWith('bluetooth:') &&
+        (
+          (previousTransport && previousTransport !== TRANSPORTS.BLUETOOTH) ||
+          (coordinatorStatus.state === 'CONNECTED' &&
+            coordinatorStatus.transport !== TRANSPORTS.BLUETOOTH)
+        )
+      ) {
+        const address = peer.transports?.[TRANSPORTS.BLUETOOTH]?.address;
+        const currentPeer = peerRegistry.getPeer(currentPeerId) || activePeerRef.current || {};
+        peerRegistry.upsertBluetoothPeer({
+          deviceId: currentPeerId,
+          deviceName: currentPeer.deviceName || currentPeer.name || peer.deviceName,
+          address,
+          isOnline: true,
+        });
+        peer = peerRegistry.getPeer(currentPeerId);
+      }
+      bluetoothPendingPeerRef.current = peer;
       let route;
       if (coordinatorStatus.state === 'CONNECTED') {
-        const currentPeerId = coordinatorStatus.peer?.deviceId ||
+        const connectedPeerId = coordinatorStatus.peer?.deviceId ||
           activePeerRef.current?.deviceId || activePeerRef.current?.peerId;
-        if (currentPeerId !== peer.deviceId) {
+        if (connectedPeerId !== peer.deviceId) {
           throw new Error('لا يمكن الانتقال إلى Bluetooth لجهاز مختلف قبل قطع الجلسة الحالية');
         }
         route = await connectionCoordinator.handoverPeer(peer, TRANSPORTS.BLUETOOTH, {
-          timeoutMs: 8000,
+          timeoutMs: 25000,
           adapter: bluetoothTransport,
           adapterOptions: { autoReconnect: true, maxReconnectAttempts: 3 },
         });
       } else if (previousTransport && previousTransport !== TRANSPORTS.BLUETOOTH) {
-        const currentPeerId = peerIdRef.current ||
+        const connectedPeerId = peerIdRef.current ||
           activePeerRef.current?.deviceId || activePeerRef.current?.peerId;
-        if (currentPeerId !== peer.deviceId) {
+        if (connectedPeerId !== peer.deviceId) {
           throw new Error('لا يمكن الانتقال إلى Bluetooth لجهاز مختلف قبل قطع الجلسة الحالية');
         }
 
-        // Legacy LAN/P2P is not owned by ConnectionCoordinator. Prepare the
-        // authenticated RFCOMM candidate first, then close the old IP route,
-        // and finally let the coordinator adopt the already-connected socket.
+        // Legacy LAN/P2P is not owned by ConnectionCoordinator. Prepare and
+        // adopt the authenticated RFCOMM activeRoute first. Only a coordinator-
+        // owned Bluetooth session is allowed to release the healthy old IP path.
         const address = String(
           peer.transports?.[TRANSPORTS.BLUETOOTH]?.address || peer.btAddress || ''
         ).trim().toUpperCase();
@@ -1641,32 +1848,59 @@ export default function App() {
         await bluetoothTransport.connectPeer(peer, {
           autoReconnect: true,
           maxReconnectAttempts: 3,
-          timeoutMs: 8000,
+          connectTimeoutMs: 15000,
         });
         preparedLegacyCandidate = true;
-        await releaseLegacyIpTransportForBluetooth(previousTransport);
-        releasedLegacyTransport = true;
-        route = await connectionCoordinator.connectBluetoothPeer(peer, 8000, {
+        route = await connectionCoordinator.connectBluetoothPeer(peer, 25000, {
           adapterOptions: { autoReconnect: true, maxReconnectAttempts: 3 },
         });
+        adoptedLegacyCandidate = true;
+        await releaseLegacyIpTransportForBluetooth(previousTransport);
+        releasedLegacyTransport = true;
       } else {
-        const selection = await connectionCoordinator.connectPeer(peer, { maxAttempts: 1 });
-        route = selection?.result || selection?.session || selection;
+        route = await connectionCoordinator.connectBluetoothPeer(peer, 25000, {
+          adapterOptions: { autoReconnect: true, maxReconnectAttempts: 3 },
+        });
+      }
+      const verifiedPeer = route?.peer || peer;
+      if (verifiedPeer?.deviceId && verifiedPeer.deviceId !== peer.deviceId) {
+        const current = connectionCoordinator.getCoordinatorStatus();
+        if (
+          current.state === 'CONNECTED' &&
+          current.transport === TRANSPORTS.BLUETOOTH &&
+          current.peer?.deviceId === peer.deviceId
+        ) {
+          connectionCoordinator.rebindConnectedPeer(verifiedPeer, {
+            expectedDeviceId: peer.deviceId,
+          });
+        }
+        peer = verifiedPeer;
+        bluetoothPendingPeerRef.current = peer;
       }
       bluetoothLegacyHandoverRef.current = null;
       await activateBluetoothUi(peer, route);
       return true;
     } catch (e) {
       bluetoothLegacyHandoverRef.current = null;
-      const currentStatus = connectionCoordinator.getCoordinatorStatus();
       if (
         preparedLegacyCandidate &&
-        !(currentStatus.state === 'CONNECTED' && currentStatus.transport === TRANSPORTS.BLUETOOTH)
+        !adoptedLegacyCandidate
       ) {
         await bluetoothTransport.disconnect().catch(() => false);
       }
       bluetoothPendingPeerRef.current = null;
       Alert.alert('فشل الاتصال عبر البلوتوث', e?.message || '');
+      if (adoptedLegacyCandidate && !releasedLegacyTransport) {
+        connectionCoordinator.disconnect({ preserveFallback: true });
+        resetActiveSessionUi({ clearMessages: false });
+        stateRef.current = States.IDLE;
+        if (mountedRef.current) {
+          setState(States.IDLE);
+          setActiveTier(Tiers.NONE);
+          setStatusText('فشل إغلاق المسار السابق بعد اعتماد Bluetooth؛ أعد الاتصال.');
+        }
+        return false;
+      }
       const status = connectionCoordinator.getCoordinatorStatus();
       if (status.state === 'CONNECTED') {
         stateRef.current = States.CONNECTED;
@@ -1746,6 +1980,12 @@ export default function App() {
     connectionAttemptRef.current += 1;
     incomingInvitationRef.current = null;
     connectionAddressTrackerRef.current.clear();
+    legacyP2pExpectedEpochRef.current = null;
+    legacyP2pEarlyConnectedInfoRef.current.clear();
+    bluetoothPendingPeerRef.current = null;
+    bluetoothActivationRef.current = null;
+    bluetoothLegacyHandoverRef.current = null;
+    pendingBluetoothIdentityRef.current = null;
     const activeCall = getActiveCall();
     if (activeCall && !TERMINAL_CALL_STATES.has(activeCall.state)) {
       endRuntimeCall(activeCall.callId, { reason: 'transport-disconnected', signal: false });
@@ -2028,6 +2268,8 @@ export default function App() {
 
       scanGenerationRef.current += 1;
       connectionAddressTrackerRef.current.beginAttempt();
+      legacyP2pExpectedEpochRef.current = null;
+      legacyP2pEarlyConnectedInfoRef.current.clear();
       discoveredRef.current = {};
       if (mountedRef.current) setDiscovered([]);
 
@@ -2145,7 +2387,12 @@ export default function App() {
     return cleared;
   };
 
-  const beginWifiNegotiation = async (selected, { incoming = false } = {}) => {
+  const beginWifiNegotiation = async (
+    selected,
+    { incoming = false, attemptContext = null } = {},
+  ) => {
+    const ensureAttemptCurrent = () => attemptContext?.throwIfCancelled?.();
+    ensureAttemptCurrent();
     const stableDeviceId = incoming ? null : resolveStableP2pDeviceId(selected, selected);
     if (stableDeviceId) {
       connectionAddressTrackerRef.current.beginAttempt();
@@ -2168,7 +2415,9 @@ export default function App() {
       }
 
       try {
+        ensureAttemptCurrent();
         const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
+        ensureAttemptCurrent();
         if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
         identityRef.current = identity;
         connectionCoordinator.setIdentity(identity);
@@ -2178,19 +2427,21 @@ contact: selected,
 discoveredPeer: selected,
 timeoutMs: 30000,
         });
+        ensureAttemptCurrent();
 
         if (
 !mountedRef.current ||
 disconnectingRef.current ||
 coordinatorAttemptId !== connectionAttemptRef.current
         ) {
-connectionCoordinator.disconnect();
+cancelOwnedCoordinatorStep(stableDeviceId, TRANSPORTS.P2P);
 return false;
         }
 
         const route = result.route || {};
         if (route.connectionEpoch != null) {
 connectionAddressTrackerRef.current.activateConnection(route.connectionEpoch);
+legacyP2pExpectedEpochRef.current = Number(route.connectionEpoch);
         }
 
         const peer = result.peer;
@@ -2198,12 +2449,15 @@ connectionAddressTrackerRef.current.activateConnection(route.connectionEpoch);
 result.displayName || selected.customName || selected.name ||
 peer.deviceName || 'الجهاز الآخر';
         await savePeer(peer.deviceId, peer.deviceName || displayName, '');
+        ensureAttemptCurrent();
         await savePeerAddress(
 peer.deviceId,
 selected.deviceAddress,
 peer.deviceName || displayName
         );
+        ensureAttemptCurrent();
         const history = await loadMessages(peer.deviceId, 300);
+        ensureAttemptCurrent();
 
         peerIdRef.current = peer.deviceId;
         peerIpRef.current = route.isGroupOwner ? null : (route.groupOwnerAddress || null);
@@ -2242,17 +2496,20 @@ time: Number(item.time),
         setStatusText('');
         setChatOpen(true);
         refreshContacts();
+        ensureAttemptCurrent();
         return true;
       } catch (error) {
         console.warn('[App] coordinator P2P connect failed:', error?.message || error);
+        const attemptCancelled = attemptContext?.isCancelled?.() === true;
         const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
         if (
 coordinatorStatus.transport === TRANSPORTS.P2P &&
 coordinatorStatus.peer?.deviceId === stableDeviceId &&
 coordinatorStatus.state !== 'IDLE'
         ) {
-connectionCoordinator.disconnect();
+connectionCoordinator.disconnect({ preserveFallback: true });
         }
+        if (attemptCancelled) throw error;
         if (
 mountedRef.current &&
 !disconnectingRef.current &&
@@ -2281,6 +2538,8 @@ coordinatorP2pAttemptRef.current = null;
     // Incoming invitations and peers without a provable stable G1 identity stay
     // on the legacy path for this surgical slice.
     connectionAddressTrackerRef.current.beginAttempt();
+    legacyP2pExpectedEpochRef.current = LEGACY_P2P_EPOCH_PENDING;
+    legacyP2pEarlyConnectedInfoRef.current.clear();
     targetPeerRef.current = selected;
     connectionSetupRef.current = false;
     const attemptId = ++connectionAttemptRef.current;
@@ -2301,23 +2560,54 @@ coordinatorP2pAttemptRef.current = null;
         : `جاري الاتصال بـ ${selected.customName || selected.name || 'الجهاز'}…`
     );
 
-    await DirectConnection.stopServiceDiscovery().catch(() => false);
-    // لا نستدعي stopPeerDiscovery هنا: أندرويد يمسح معه قائمة الأقران
-    // الداخلية. العنوان مأخوذ من requestPeers أو من دعوة INVITED الحالية.
-    await DirectConnection.connectToPeer(selected.deviceAddress);
-
-    clearTimeout(timeoutRef.current);
+    // Start the deadline before every native ActionListener await. Android can
+    // lose the P2P channel without completing those callbacks; the UI/runtime
+    // must still recover and invalidate this attempt after a bounded interval.
+    let rejectNativeWait = null;
+    const nativeDeadline = new Promise((_, reject) => {
+      rejectNativeWait = reject;
+    });
     timeoutRef.current = setTimeout(async () => {
       if (!mountedRef.current || attemptId !== connectionAttemptRef.current) {
         return;
       }
       if (stateRef.current === States.WIFI_CONNECTING) {
+        const deadlineError = new Error('لم تتكوّن المجموعة خلال 30 ثانية ولم يستجب الجهاز');
+        rejectNativeWait?.(deadlineError);
         await recoverFailedConnection(
           'تفاوض Wi-Fi Direct',
-          new Error('لم تتكوّن المجموعة خلال 30 ثانية ولم يستجب الجهاز')
+          deadlineError
         );
       }
     }, 30000);
+
+    await Promise.race([
+      DirectConnection.stopServiceDiscovery().catch(() => false),
+      nativeDeadline,
+    ]);
+    if (attemptId !== connectionAttemptRef.current || stateRef.current !== States.WIFI_CONNECTING) {
+      throw new Error('انتهت محاولة Wi-Fi Direct أثناء التحضير');
+    }
+    // لا نستدعي stopPeerDiscovery هنا: أندرويد يمسح معه قائمة الأقران
+    // الداخلية. العنوان مأخوذ من requestPeers أو من دعوة INVITED الحالية.
+    const nativeAttempt = await Promise.race([
+      DirectConnection.connectToPeer(selected.deviceAddress),
+      nativeDeadline,
+    ]);
+    if (attemptId !== connectionAttemptRef.current || stateRef.current !== States.WIFI_CONNECTING) {
+      throw new Error('انتهت محاولة Wi-Fi Direct قبل بدء التفاوض');
+    }
+    const connectionEpoch = Number(nativeAttempt?.connectionEpoch);
+    if (nativeAttempt?.started !== true || !Number.isInteger(connectionEpoch)) {
+      throw new Error('لم يؤكد Android معرّف محاولة Wi-Fi Direct');
+    }
+    legacyP2pExpectedEpochRef.current = connectionEpoch;
+    const earlyConnectedInfo = legacyP2pEarlyConnectedInfoRef.current.get(connectionEpoch);
+    legacyP2pEarlyConnectedInfoRef.current.clear();
+    if (earlyConnectedInfo) {
+      await handlePeerConnected(earlyConnectedInfo);
+      return true;
+    }
   };
 
   const maybeAnswerIncomingInvitation = peers => {
@@ -2391,15 +2681,18 @@ coordinatorP2pAttemptRef.current = null;
     }
   };
 
-  const connectKnownLanPeer = async (contact, target) => {
+  const connectKnownLanPeer = async (contact, target, attemptContext = null) => {
     const lanInfo = target?.transports?.[TRANSPORTS.LAN];
     if (!target?.deviceId || !lanInfo?.host) {
       throw new Error('هدف LAN المعروف غير مكتمل');
     }
+    const ensureAttemptCurrent = () => attemptContext?.throwIfCancelled?.();
 
     pendingKnownLanPeerIdRef.current = target.deviceId;
     try {
+      ensureAttemptCurrent();
       const identity = identityRef.current || await getDeviceIdentity().catch(() => null);
+      ensureAttemptCurrent();
       if (!identity?.deviceId) throw new Error('تعذّر تحميل هوية G1 الثابتة');
       identityRef.current = identity;
 
@@ -2423,6 +2716,7 @@ coordinatorP2pAttemptRef.current = null;
         maxRetries: 5,
         retryDelayMs: 800,
       });
+      ensureAttemptCurrent();
 
       if (!mountedRef.current || disconnectingRef.current) {
         throw new Error('أُلغيت محاولة LAN قبل تفعيل الجلسة');
@@ -2430,7 +2724,9 @@ coordinatorP2pAttemptRef.current = null;
 
       const displayName = contact.customName || contact.name || target.deviceName || 'الجهاز الآخر';
       await savePeer(target.deviceId, target.deviceName || displayName, '');
+      ensureAttemptCurrent();
       const history = await loadMessages(target.deviceId, 300);
+      ensureAttemptCurrent();
 
       const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
       if (
@@ -2452,6 +2748,7 @@ coordinatorP2pAttemptRef.current = null;
       if (!identitySent || !signalingIsHealthy()) {
         throw new Error('فشل تبادل هوية G1 عبر LAN');
       }
+      ensureAttemptCurrent();
 
       peerIdRef.current = target.deviceId;
       peerIpRef.current = lanInfo.host;
@@ -2482,7 +2779,8 @@ coordinatorP2pAttemptRef.current = null;
     } catch (error) {
       const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();
       const signalingHealth = getSignalingHealth();
-      if (isKnownLanRaceWinner({
+      const attemptCancelled = attemptContext?.isCancelled?.() === true;
+      if (!attemptCancelled && isKnownLanRaceWinner({
         targetDeviceId: target.deviceId,
         coordinatorStatus,
         signalingHealth,
@@ -2493,8 +2791,12 @@ coordinatorP2pAttemptRef.current = null;
         coordinatorStatus.peer?.deviceId === target.deviceId &&
         coordinatorStatus.transport === TRANSPORTS.LAN
       ) {
-        connectionCoordinator.disconnect();
+        connectionCoordinator.disconnect({ preserveFallback: true });
       }
+      // A timed-out LAN promise may finish after fallback has already advanced
+      // to P2P/Bluetooth. It may clean only its own still-owned LAN route; it
+      // must never reset UI/refs belonging to the newer transport step.
+      if (attemptCancelled) throw error;
       if (activeControlOwnerRef.current === CONTROL_PLANE_OWNERS.COORDINATOR) {
         activeControlOwnerRef.current = null;
       }
@@ -2513,6 +2815,22 @@ coordinatorP2pAttemptRef.current = null;
         pendingKnownLanPeerIdRef.current = null;
       }
     }
+  };
+
+  const cancelOwnedCoordinatorStep = (peerId, transport) => {
+    const status = connectionCoordinator.getCoordinatorStatus();
+    if (
+      !peerId ||
+      status.peer?.deviceId !== peerId ||
+      status.transport !== transport
+    ) {
+      return false;
+    }
+    if (status.state === 'CONNECTED' || status.state === 'ERROR') {
+      connectionCoordinator.disconnect({ preserveFallback: true });
+      return true;
+    }
+    return connectionCoordinator.cancelConnecting();
   };
 
   /**
@@ -2560,7 +2878,10 @@ coordinatorP2pAttemptRef.current = null;
 
     try {
       if (!selectionOptions.isFailover) automaticFailoverCountRef.current = 0;
-      const stableId = contact.deviceId || contact.peerId || null;
+      // A raw Wi-Fi Direct MAC is route metadata, not a stable G1 identity.
+      // Keep such peers on the event-driven legacy path; it starts negotiation
+      // asynchronously and must not be read as an immediate fallback failure.
+      const stableId = resolveStableP2pDeviceId(contact, contact);
       const registryPeer = stableId ? peerRegistry.getPeer(stableId) : null;
       const knownLanTarget = resolveKnownLanTarget(contact, registryPeer);
 
@@ -2600,23 +2921,32 @@ coordinatorP2pAttemptRef.current = null;
           .filter(([transport, endpoint]) => !!endpoint && !excludedTransports.has(transport))
           .length;
         if (candidateCount > 0) {
-          await connectionCoordinator.connectPeer(selectionPeer, {
+          const selection = await connectionCoordinator.connectPeer(selectionPeer, {
             maxAttempts: 3,
             lanTimeoutMs: 8000,
-            p2pTimeoutMs: 30000,
-            bluetoothTimeoutMs: 8000,
+            p2pTimeoutMs: 40000,
+            bluetoothTimeoutMs: 25000,
             excludeTransports: [...excludedTransports],
             handlers: {
               connectLan: knownLanTarget
-                ? () => connectKnownLanPeer(contact, knownLanTarget)
+                ? (_peer, attemptContext) => connectKnownLanPeer(
+                    contact,
+                    knownLanTarget,
+                    attemptContext,
+                  )
                 : undefined,
-              cancelLan: () => connectionCoordinator.cancelConnecting(),
+              cancelLan: () => cancelOwnedCoordinatorStep(
+                selectionPeer.deviceId,
+                TRANSPORTS.LAN,
+              ),
               connectP2p: p2pAddress
-                ? async () => {
+                ? async (_peer, attemptContext = {}) => {
                     if (scanPromiseRef.current) await scanPromiseRef.current;
+                    attemptContext.throwIfCancelled?.();
                     let freshPeer = findFreshPeer(contact);
                     if (!freshPeer) {
                       await runFreshDiscovery();
+                      attemptContext.throwIfCancelled?.();
                       freshPeer = findFreshPeer(contact);
                     }
                     if (!freshPeer) throw new Error('لم يظهر مسار Wi‑Fi Direct حديث لهذا الجهاز');
@@ -2628,23 +2958,52 @@ coordinatorP2pAttemptRef.current = null;
                         : (contact.peerId || freshPeer.peerId),
                       deviceAddress: freshPeer.deviceAddress,
                     };
-                    const connected = await beginWifiNegotiation(selected);
+                    const connected = await beginWifiNegotiation(selected, { attemptContext });
+                    if (attemptContext.isCancelled?.()) {
+                      // A cancellation can arrive while Android is forming the
+                      // group. Only release a late P2P winner that still owns
+                      // the coordinator; never tear down the Bluetooth step
+                      // that may already have followed this timeout.
+                      const lateStatus = connectionCoordinator.getCoordinatorStatus();
+                      if (
+                        lateStatus.transport === TRANSPORTS.P2P &&
+                        lateStatus.peer?.deviceId === selectionPeer.deviceId &&
+                        lateStatus.state !== 'IDLE'
+                      ) {
+                        connectionCoordinator.disconnect({ preserveFallback: true });
+                      }
+                      attemptContext.throwIfCancelled?.();
+                      throw new Error('أُلغيت محاولة Wi-Fi Direct');
+                    }
                     if (!connected) throw new Error('فشل تفعيل جلسة Wi‑Fi Direct');
                     return connected;
                   }
                 : undefined,
-              cancelP2p: () => connectionCoordinator.cancelConnecting(),
+              cancelP2p: () => cancelOwnedCoordinatorStep(
+                selectionPeer.deviceId,
+                TRANSPORTS.P2P,
+              ),
               connectBluetooth: bluetoothAddress
-                ? async () => {
+                ? async (_peer, attemptContext = {}) => {
+                    attemptContext.throwIfCancelled?.();
                     bluetoothPendingPeerRef.current = selectionPeer;
-                    const route = await connectionCoordinator.connectBluetoothPeer(selectionPeer, 8000, {
+                    const route = await connectionCoordinator.connectBluetoothPeer(selectionPeer, 25000, {
                       adapterOptions: { autoReconnect: true, maxReconnectAttempts: 3 },
                     });
-                    await activateBluetoothUi(selectionPeer, route);
+                    attemptContext.throwIfCancelled?.();
                     return route;
                   }
                 : undefined,
-              cancelBluetooth: () => bluetoothTransport.cancelConnect('Transport fallback advanced'),
+              cancelBluetooth: () => {
+                const cancelled = cancelOwnedCoordinatorStep(
+                  selectionPeer.deviceId,
+                  TRANSPORTS.BLUETOOTH,
+                );
+                if (!cancelled) {
+                  return bluetoothTransport.cancelConnect('Transport fallback advanced');
+                }
+                return true;
+              },
               onFallbackStep: transport => {
                 if (mountedRef.current) {
                   const label = transport === TRANSPORTS.LAN
@@ -2655,6 +3014,16 @@ coordinatorP2pAttemptRef.current = null;
               },
             },
           });
+          if (selection?.transport === TRANSPORTS.BLUETOOTH) {
+            const route = selection.result || selection.session || selection;
+            const connectedPeer = route?.peer || selectionPeer;
+            try {
+              await activateBluetoothUi(connectedPeer, route);
+            } catch (error) {
+              cancelOwnedCoordinatorStep(selectionPeer.deviceId, TRANSPORTS.BLUETOOTH);
+              throw error;
+            }
+          }
           return;
         }
         if (selectionOptions.isFailover) {
@@ -3366,6 +3735,8 @@ coordinatorP2pAttemptRef.current = null;
           onConnectLan={handleConnectLan}
           localIp={localIp}
           btDevices={btDevices}
+          onBtScan={btScan}
+          btScanning={btScanning}
           onSelectBtDevice={btConnect}
           deviceName={identityRef.current?.deviceName}
           wifiDirectEnabled={wifiEnabled}

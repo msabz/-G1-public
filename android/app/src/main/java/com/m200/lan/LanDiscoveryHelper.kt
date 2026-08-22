@@ -22,11 +22,10 @@ object LanDiscoveryHelper {
     }
 
     fun cleanHostAddress(rawHost: String): String {
-        return if (rawHost.contains("%")) {
-            rawHost.substringBefore("%")
-        } else {
-            rawHost.trim()
-        }
+        // The zone suffix is routing data, not decoration. Link-local IPv6
+        // addresses (fe80::/10) are ambiguous without it and Android's TCP
+        // resolver needs values such as "%wlan0" or a numeric scope id.
+        return rawHost.trim()
     }
 
     /**

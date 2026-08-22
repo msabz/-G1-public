@@ -5,9 +5,10 @@ describe('App outbound P2P coordinator ownership wiring', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'App.js'), 'utf8');
 
   test('imports and uses the P2P App bridge for outbound peers with stable identity', () => {
-    expect(source).toContain(
-      "import { connectP2pFromApp, resolveStableP2pDeviceId } from './network/p2pAppBridge';"
-    );
+    expect(source).toContain('connectP2pFromApp,');
+    expect(source).toContain('resolveStableP2pDeviceId,');
+    expect(source).toContain('shouldYieldNativeP2pEvent,');
+    expect(source).toContain("} from './network/p2pAppBridge';");
     expect(source).toContain(
       'const stableDeviceId = incoming ? null : resolveStableP2pDeviceId(selected, selected);'
     );
@@ -22,14 +23,33 @@ describe('App outbound P2P coordinator ownership wiring', () => {
     expect(source).toContain(
       '// Incoming invitations and peers without a provable stable G1 identity stay'
     );
-    expect(source).toContain('await DirectConnection.connectToPeer(selected.deviceAddress);');
+    expect(source).toContain('DirectConnection.connectToPeer(selected.deviceAddress),');
+    expect(source).toContain('nativeDeadline');
   });
 
   test('legacy PEER_CONNECTED handler yields while coordinator owns P2P negotiation', () => {
+    expect(source).toContain('shouldYieldNativeP2pEvent({');
+    expect(source).toContain('coordinatorP2pAttemptActive: !!coordinatorP2pAttemptRef.current');
     expect(source).toContain('const coordinatorStatus = connectionCoordinator.getCoordinatorStatus();');
-    expect(source).toContain("coordinatorStatus.state === 'CONNECTING'");
-    expect(source).toContain("coordinatorStatus.state === 'CONNECTED'");
-    expect(source).toContain('coordinatorStatus.transport === TRANSPORTS.P2P');
+  });
+
+  test('correlates legacy native callbacks with the exact connection epoch', () => {
+    expect(source).toContain("const LEGACY_P2P_EPOCH_PENDING = 'PENDING';");
+    expect(source).toContain('const legacyP2pEarlyConnectedInfoRef = useRef(new Map());');
+    expect(source).toContain('legacyP2pExpectedEpochRef.current = LEGACY_P2P_EPOCH_PENDING;');
+    expect(source).toContain('const connectionEpoch = Number(nativeAttempt?.connectionEpoch);');
+    expect(source).toContain('legacyP2pEarlyConnectedInfoRef.current.get(connectionEpoch)');
+    expect(source).toMatch(
+      /Number\.isInteger\(expectedEpoch\)[\s\S]{0,180}?eventEpoch !== expectedEpoch/
+    );
+  });
+
+  test('passes fallback cancellation ownership through the whole P2P activation tail', () => {
+    expect(source).toContain('{ incoming = false, attemptContext = null }');
+    expect(source).toContain('const ensureAttemptCurrent = () => attemptContext?.throwIfCancelled?.();');
+    expect(source).toContain('beginWifiNegotiation(selected, { attemptContext })');
+    expect(source).toContain('cancelOwnedCoordinatorStep(');
+    expect(source).toContain('p2pTimeoutMs: 40000');
   });
 
   test('concurrent App connection entry points yield while outbound coordinator P2P is active', () => {

@@ -12,6 +12,7 @@ export const SIGNALING_HEARTBEAT_INTERVAL_MS = 6000;
 export const SIGNALING_HEARTBEAT_TIMEOUT_MS = 18000;
 export const SIGNALING_RECOVERY_GRACE_MS = 4000;
 export const PASSIVE_INBOUND_IDENTITY_TIMEOUT_MS = 5000;
+export const PASSIVE_INBOUND_ADMISSION_RETRY_MS = 250;
 
 let activeSession = null;
 let onMessageCallback = null;
@@ -32,6 +33,7 @@ let recoveryExpectedInboundPeerAddress = null;
 let recoveryInboundAdmissionSnapshot = null;
 let gracefulDisconnectPending = false;
 let duplicateInboundInspectionSocket = null;
+let duplicateInboundInspectionCancel = null;
 let passiveInboundAdmissionHandler = null;
 const messageObservers = new Set();
 const disconnectObservers = new Set();
@@ -113,15 +115,23 @@ function stopHeartbeat() {
 }
 
 function clearPassiveInboundIdentityTimer(session) {
-  if (!session?.passiveAdmissionTimer) return;
-  clearTimeout(session.passiveAdmissionTimer);
-  session.passiveAdmissionTimer = null;
+  if (!session) return;
+  if (session.passiveAdmissionTimer) {
+    clearTimeout(session.passiveAdmissionTimer);
+    session.passiveAdmissionTimer = null;
+  }
+  if (session.passiveAdmissionRetryTimer) {
+    clearTimeout(session.passiveAdmissionRetryTimer);
+    session.passiveAdmissionRetryTimer = null;
+  }
 }
 
 function terminateUnadmittedPassiveSession(session, reason = 'admission-rejected') {
   if (!session) return false;
   clearPassiveInboundIdentityTimer(session);
   session.passiveAdmissionRejected = true;
+  session.passiveAdmissionBufferedMessages = [];
+  session.passiveAdmissionBufferedBytes = 0;
 
   const socket = session.socket;
   if (activeSession === session) {
@@ -158,6 +168,31 @@ function dispatchApplicationMessage(msg) {
   if (onMessageCallback) onMessageCallback(msg);
 }
 
+function schedulePassiveInboundAdmissionRetry(session) {
+  if (
+    !session ||
+    session.passiveAdmissionRetryTimer ||
+    session.passiveAdmissionAccepted ||
+    session.passiveAdmissionRejected
+  ) {
+    return false;
+  }
+  session.passiveAdmissionRetryTimer = setTimeout(() => {
+    session.passiveAdmissionRetryTimer = null;
+    if (
+      activeSession !== session ||
+      !session.isConnected ||
+      session.passiveAdmissionAccepted ||
+      session.passiveAdmissionRejected ||
+      !session.passiveAdmissionIdentity
+    ) {
+      return;
+    }
+    handlePassiveInboundPreAdmissionMessage(session, session.passiveAdmissionIdentity);
+  }, PASSIVE_INBOUND_ADMISSION_RETRY_MS);
+  return true;
+}
+
 function handlePassiveInboundPreAdmissionMessage(session, msg) {
   if (!session?.passiveAdmissionRequired || session.passiveAdmissionAccepted) return false;
 
@@ -170,9 +205,28 @@ function handlePassiveInboundPreAdmissionMessage(session, msg) {
   }
 
   if (msg?.type !== 'identity' || !msg.deviceId) {
+    // Once a valid identity frame is waiting for LAN discovery to catch up,
+    // retain a small bounded set of following frames rather than destroying a
+    // healthy socket. Nothing is dispatched until admission succeeds.
+    if (session.passiveAdmissionIdentity) {
+      let encodedBytes = 0;
+      try { encodedBytes = utf8ByteLength(JSON.stringify(msg)); } catch (e) {}
+      const buffered = session.passiveAdmissionBufferedMessages || [];
+      const totalBytes = (session.passiveAdmissionBufferedBytes || 0) + encodedBytes;
+      if (buffered.length >= 16 || totalBytes > MAX_SIGNALING_BUFFER_BYTES) {
+        terminateUnadmittedPassiveSession(session, 'pre-admission-buffer-limit');
+        return true;
+      }
+      buffered.push(msg);
+      session.passiveAdmissionBufferedMessages = buffered;
+      session.passiveAdmissionBufferedBytes = totalBytes;
+      return true;
+    }
     terminateUnadmittedPassiveSession(session, 'identity-required');
     return true;
   }
+
+  session.passiveAdmissionIdentity = normalizeIdentityMessage(msg);
 
   const peerAddress = normalizePeerAddress(session.socket?.remoteAddress || session.peerInfo?.host || null);
   let decision = null;
@@ -192,6 +246,16 @@ function handlePassiveInboundPreAdmissionMessage(session, msg) {
     return true;
   }
 
+  if (decision?.accepted !== true && decision?.pending === true) {
+    logSocket(
+      'PASSIVE_INBOUND_PENDING',
+      session.socket,
+      `reason=${decision?.reason || 'awaiting-lan-discovery'}`
+    );
+    schedulePassiveInboundAdmissionRetry(session);
+    return true;
+  }
+
   if (decision?.accepted !== true) {
     terminateUnadmittedPassiveSession(session, decision?.reason || 'identity-rejected');
     return true;
@@ -200,6 +264,9 @@ function handlePassiveInboundPreAdmissionMessage(session, msg) {
   session.passiveAdmissionAccepted = true;
   session.passiveAdmissionDetails = decision;
   session.passiveAdmissionIdentity = normalizeIdentityMessage(msg);
+  const bufferedMessages = session.passiveAdmissionBufferedMessages || [];
+  session.passiveAdmissionBufferedMessages = [];
+  session.passiveAdmissionBufferedBytes = 0;
   clearPassiveInboundIdentityTimer(session);
   logSocket(
     'PASSIVE_INBOUND_ADMITTED',
@@ -211,6 +278,7 @@ function handlePassiveInboundPreAdmissionMessage(session, msg) {
   // Mark the session admitted before dispatching identity. If several frames
   // arrived in one TCP read, following app frames are now safe to dispatch.
   dispatchApplicationMessage(msg);
+  bufferedMessages.forEach(dispatchApplicationMessage);
   return true;
 }
 
@@ -582,14 +650,23 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
   let settled = false;
   let buffer = '';
   const bufferedMessages = [];
+  let bufferedMessageBytes = 0;
+  let bufferedApplicationMessages = 0;
   let timer = null;
+  let retryTimer = null;
+  let pendingIdentity = null;
 
   const cleanup = () => {
     if (duplicateInboundInspectionSocket === socket) {
       duplicateInboundInspectionSocket = null;
     }
+    if (duplicateInboundInspectionCancel === cancelInspection) {
+      duplicateInboundInspectionCancel = null;
+    }
     if (timer) clearTimeout(timer);
     timer = null;
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = null;
     try { socket.removeListener?.('data', onData); } catch (e) {}
     try { socket.removeListener?.('close', onTerminal); } catch (e) {}
     try { socket.removeListener?.('error', onTerminal); } catch (e) {}
@@ -602,6 +679,30 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
     logSocket('DUPLICATE_INBOUND_REJECTED', socket, `active=${socketId(activeSocket)} reason=${reason}`);
     try { socket.destroy(); } catch (e) {}
     return false;
+  };
+
+  const cancelInspection = reason => reject(reason || 'inspection-cancelled');
+  duplicateInboundInspectionCancel = cancelInspection;
+
+  const bufferCandidateMessage = (message, { application = false } = {}) => {
+    let encoded = null;
+    try { encoded = JSON.stringify(message); } catch (e) {}
+    if (typeof encoded !== 'string') {
+      reject('candidate-serialization-error');
+      return false;
+    }
+    const encodedBytes = utf8ByteLength(encoded);
+    if (
+      bufferedMessageBytes + encodedBytes > MAX_SIGNALING_BUFFER_BYTES ||
+      (application && bufferedApplicationMessages >= 16)
+    ) {
+      reject('candidate-buffer-too-large');
+      return false;
+    }
+    bufferedMessages.push(message);
+    bufferedMessageBytes += encodedBytes;
+    if (application) bufferedApplicationMessages += 1;
+    return true;
   };
 
   const promoteInboundWinner = decision => {
@@ -641,6 +742,16 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
     });
   };
 
+  const scheduleIdentityRetry = () => {
+    if (settled || retryTimer || !pendingIdentity) return false;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (settled || !pendingIdentity) return;
+      validateIdentity(pendingIdentity);
+    }, PASSIVE_INBOUND_ADMISSION_RETRY_MS);
+    return true;
+  };
+
   const validateIdentity = msg => {
     const peerAddress = normalizePeerAddress(socket?.remoteAddress);
     let decision = null;
@@ -661,6 +772,16 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
       reject('async-validator-not-supported');
       return false;
     }
+    if (decision?.accepted !== true && decision?.pending === true) {
+      pendingIdentity = msg;
+      logSocket(
+        'DUPLICATE_INBOUND_PENDING',
+        socket,
+        `reason=${decision?.reason || 'awaiting-lan-discovery'}`
+      );
+      scheduleIdentityRetry();
+      return true;
+    }
     if (decision?.accepted !== true) {
       reject(decision?.reason || 'identity-rejected');
       return false;
@@ -679,7 +800,7 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
 
     const parts = buffer.split('\n');
     buffer = parts.pop();
-    if (utf8ByteLength(buffer) > MAX_SIGNALING_BUFFER_BYTES) {
+    if (bufferedMessageBytes + utf8ByteLength(buffer) > MAX_SIGNALING_BUFFER_BYTES) {
       reject('candidate-buffer-too-large');
       return;
     }
@@ -702,8 +823,25 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
     for (let index = 0; index < parsedMessages.length; index++) {
       if (settled) return;
       const msg = parsedMessages[index];
+
+      // Once stable identity is known but its LAN route is still propagating,
+      // retain subsequent frames for the real session. The bounded five-second
+      // inspection deadline remains authoritative, while the healthy outbound
+      // socket stays active until this candidate is admitted and committed.
+      if (pendingIdentity) {
+        if (msg?.type === 'identity') {
+          if (msg.deviceId !== pendingIdentity.deviceId) {
+            reject('identity-changed-while-pending');
+            return;
+          }
+          continue;
+        }
+        if (!bufferCandidateMessage(msg, { application: msg?.type !== 'my-ip' })) return;
+        continue;
+      }
+
       if (msg?.type === 'my-ip') {
-        bufferedMessages.push(msg);
+        if (!bufferCandidateMessage(msg)) return;
         continue;
       }
       if (msg?.type !== 'identity' || !msg.deviceId) {
@@ -715,7 +853,17 @@ function inspectDuplicatePassiveInbound(socket, promote, source) {
       // real SignalingSession is attached only after the stable-id decision, so
       // bytes already consumed by this provisional parser cannot be re-read from
       // the socket. Replay identity and any trailing application frames in order.
-      bufferedMessages.push(msg, ...parsedMessages.slice(index + 1));
+      if (!bufferCandidateMessage(msg)) return;
+      for (const trailing of parsedMessages.slice(index + 1)) {
+        if (trailing?.type === 'identity') {
+          if (!trailing.deviceId || trailing.deviceId !== msg.deviceId) {
+            reject('identity-changed-while-pending');
+            return;
+          }
+          continue;
+        }
+        if (!bufferCandidateMessage(trailing, { application: trailing?.type !== 'my-ip' })) return;
+      }
       validateIdentity(msg);
       return;
     }
@@ -797,6 +945,9 @@ function attachIncomingSession(socket, promote, source, options = {}) {
     : null;
   session.passiveAdmissionRejected = false;
   session.passiveAdmissionTimer = null;
+  session.passiveAdmissionRetryTimer = null;
+  session.passiveAdmissionBufferedMessages = [];
+  session.passiveAdmissionBufferedBytes = 0;
 
   setupSessionEvents(session);
   session.attachSocket(socket);
@@ -1004,10 +1155,15 @@ export function closeSignaling() {
   cancelPendingRecovery();
   gracefulDisconnectPending = false;
 
-  const pendingDuplicateSocket = duplicateInboundInspectionSocket;
-  duplicateInboundInspectionSocket = null;
-  if (pendingDuplicateSocket) {
-    try { pendingDuplicateSocket.destroy(); } catch (e) {}
+  const cancelDuplicateInspection = duplicateInboundInspectionCancel;
+  if (cancelDuplicateInspection) {
+    cancelDuplicateInspection('signaling-closed');
+  } else {
+    const pendingDuplicateSocket = duplicateInboundInspectionSocket;
+    duplicateInboundInspectionSocket = null;
+    if (pendingDuplicateSocket) {
+      try { pendingDuplicateSocket.destroy(); } catch (e) {}
+    }
   }
 
   const session = activeSession;

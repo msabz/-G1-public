@@ -37,9 +37,10 @@ class LanDiscoveryTest {
     }
 
     @Test
-    fun cleansScopedIpv6HostAddresses() {
-        assertEquals("fe80::1", LanDiscoveryHelper.cleanHostAddress("fe80::1%wlan0"))
-        assertEquals("192.168.1.100", LanDiscoveryHelper.cleanHostAddress("192.168.1.100"))
+    fun preservesIpv6ScopeRequiredForLinkLocalConnections() {
+        assertEquals("fe80::1%wlan0", LanDiscoveryHelper.cleanHostAddress(" fe80::1%wlan0 "))
+        assertEquals("fe80::1%42", LanDiscoveryHelper.cleanHostAddress("fe80::1%42"))
+        assertEquals("192.168.1.100", LanDiscoveryHelper.cleanHostAddress(" 192.168.1.100 "))
     }
 
     @Test

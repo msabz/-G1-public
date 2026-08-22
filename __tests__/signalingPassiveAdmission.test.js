@@ -130,6 +130,36 @@ describe('passive inbound signaling admission', () => {
     expect(signaling.getSignalingHealth().connected).toBe(false);
   });
 
+  test('keeps asymmetric LAN discovery provisional and admits it when the route appears', async () => {
+    jest.useFakeTimers();
+    let routeKnown = false;
+    const validator = jest.fn(() => routeKnown
+      ? { accepted: true, peerId: 'peer-late', transport: 'LAN' }
+      : { accepted: false, pending: true, reason: 'awaiting-lan-discovery' });
+    const received = jest.fn();
+    signaling.setPassiveInboundAdmissionHandler(validator);
+    signaling.setOnMessage(received);
+    await signaling.startPersistentListener(8089);
+
+    const socket = makeSocket('192.168.0.44');
+    onConnection(socket);
+    const identity = { type: 'identity', deviceId: 'peer-late', deviceName: 'Late peer' };
+    const chat = { type: 'chat', text: 'buffered until admission' };
+    emitJson(socket, identity);
+    emitJson(socket, chat);
+
+    expect(socket.destroy).not.toHaveBeenCalled();
+    expect(received).not.toHaveBeenCalled();
+
+    routeKnown = true;
+    jest.advanceTimersByTime(signaling.PASSIVE_INBOUND_ADMISSION_RETRY_MS);
+
+    expect(validator).toHaveBeenCalledTimes(2);
+    expect(received.mock.calls).toEqual([[identity], [chat]]);
+    expect(socket.destroy).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth().connected).toBe(true);
+  });
+
   test('expires a silent unadmitted passive session without opening recovery or notifying UI', async () => {
     jest.useFakeTimers();
     const validator = jest.fn(() => ({ accepted: true }));

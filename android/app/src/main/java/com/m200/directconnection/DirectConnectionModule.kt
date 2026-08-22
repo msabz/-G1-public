@@ -771,40 +771,96 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
         }, CONNECTION_ATTEMPT_WATCHDOG_MS)
     }
 
+    private fun invalidateConnectionAttempt(epoch: Long) {
+        if (epoch != connectionGeneration) return
+        connectionInProgress = false
+        // The watchdog and any callback/broadcast already queued for this
+        // attempt must fail their generation guard after a synchronous error.
+        connectionGeneration++
+    }
+
     @ReactMethod
     fun createGroup(promise: Promise) {
-        connectionGeneration++
-        val epoch = connectionGeneration
-        connectionInProgress = true
-        armConnectionAttemptWatchdog(epoch)
-        wifiP2pManager?.createGroup(channel, object : ActionListener {
-            override fun onSuccess() { promise.resolve("Group creation started") }
-            override fun onFailure(reason: Int) {
-                connectionInProgress = false
-                promise.reject("ERROR", "Create group failed: $reason (${reasonName(reason)})")
+        var attemptEpoch: Long? = null
+        try {
+            if (!ensureChannel()) {
+                promise.reject("ERROR", "Wi-Fi Direct not initialized")
+                return
             }
-        }) ?: run {
-            connectionInProgress = false
-            promise.reject("ERROR", "Wi-Fi Direct not initialized")
+            val manager = wifiP2pManager ?: run {
+                promise.reject("ERROR", "Wi-Fi Direct not initialized")
+                return
+            }
+            val currentChannel = channel ?: run {
+                promise.reject("ERROR", "Wi-Fi Direct not initialized")
+                return
+            }
+
+            connectionGeneration++
+            val epoch = connectionGeneration
+            attemptEpoch = epoch
+            connectionInProgress = true
+            armConnectionAttemptWatchdog(epoch)
+            manager.createGroup(currentChannel, object : ActionListener {
+                override fun onSuccess() {
+                    val started = epoch == connectionGeneration && currentChannel === channel
+                    if (!started) invalidateConnectionAttempt(epoch)
+                    promise.resolve(Arguments.createMap().apply {
+                        putBoolean("started", started)
+                        putDouble("connectionEpoch", epoch.toDouble())
+                    })
+                }
+                override fun onFailure(reason: Int) {
+                    invalidateConnectionAttempt(epoch)
+                    promise.reject("ERROR", "Create group failed: $reason (${reasonName(reason)})")
+                }
+            })
+        } catch (e: Exception) {
+            attemptEpoch?.let { invalidateConnectionAttempt(it) }
+            promise.reject("ERROR", e.message ?: "Failed to create Wi-Fi Direct group", e)
         }
     }
 
     @ReactMethod
     fun connectToPeer(deviceAddress: String, promise: Promise) {
-        connectionGeneration++
-        val epoch = connectionGeneration
-        connectionInProgress = true
-        armConnectionAttemptWatchdog(epoch)
-        val config = WifiP2pConfig().apply { this.deviceAddress = deviceAddress }
-        wifiP2pManager?.connect(channel, config, object : ActionListener {
-            override fun onSuccess() { promise.resolve("Connecting to peer") }
-            override fun onFailure(reason: Int) {
-                connectionInProgress = false
-                promise.reject("ERROR", "Connection failed: $reason (${reasonName(reason)})")
+        var attemptEpoch: Long? = null
+        try {
+            if (!ensureChannel()) {
+                promise.reject("ERROR", "Wi-Fi Direct not initialized")
+                return
             }
-        }) ?: run {
-            connectionInProgress = false
-            promise.reject("ERROR", "Wi-Fi Direct not initialized")
+            val manager = wifiP2pManager ?: run {
+                promise.reject("ERROR", "Wi-Fi Direct not initialized")
+                return
+            }
+            val currentChannel = channel ?: run {
+                promise.reject("ERROR", "Wi-Fi Direct not initialized")
+                return
+            }
+
+            val config = WifiP2pConfig().apply { this.deviceAddress = deviceAddress }
+            connectionGeneration++
+            val epoch = connectionGeneration
+            attemptEpoch = epoch
+            connectionInProgress = true
+            armConnectionAttemptWatchdog(epoch)
+            manager.connect(currentChannel, config, object : ActionListener {
+                override fun onSuccess() {
+                    val started = epoch == connectionGeneration && currentChannel === channel
+                    if (!started) invalidateConnectionAttempt(epoch)
+                    promise.resolve(Arguments.createMap().apply {
+                        putBoolean("started", started)
+                        putDouble("connectionEpoch", epoch.toDouble())
+                    })
+                }
+                override fun onFailure(reason: Int) {
+                    invalidateConnectionAttempt(epoch)
+                    promise.reject("ERROR", "Connection failed: $reason (${reasonName(reason)})")
+                }
+            })
+        } catch (e: Exception) {
+            attemptEpoch?.let { invalidateConnectionAttempt(it) }
+            promise.reject("ERROR", e.message ?: "Failed to connect Wi-Fi Direct peer", e)
         }
     }
 
@@ -1066,6 +1122,7 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                     WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
                         val eventEpoch = connectionGeneration
                         val connectionWasInProgress = connectionInProgress
+                        val hadActiveGroup = groupActive
                         val manager = wifiP2pManager ?: return
                         val currentChannel = channel ?: return
                         manager.requestConnectionInfo(currentChannel) { info ->
@@ -1082,14 +1139,20 @@ class DirectConnectionModule(reactContext: ReactApplicationContext) : ReactConte
                                 // arrive after a new connect() has started. Keep the attempt protected;
                                 // the JS timeout/native watchdog remains the bounded failure authority.
                                 emitCurrentPeers()
-                            } else {
+                            } else if (hadActiveGroup) {
                                 connectionInProgress = false
                                 connectionGeneration++
                                 emitCurrentPeers()
-                                sendEvent("PEER_DISCONNECTED", Arguments.createMap())
+                                sendEvent("PEER_DISCONNECTED", Arguments.createMap().apply {
+                                    putDouble("connectionEpoch", eventEpoch.toDouble())
+                                })
                                 if (canRefreshPresence(presenceGeneration)) {
                                     scheduleActivePresenceRefresh(presenceGeneration, 600L)
                                 }
+                            } else {
+                                // Ignore idle false -> false broadcasts. Some OEMs
+                                // deliver these after cleanup has already resolved.
+                                emitCurrentPeers()
                             }
                         }
                     }

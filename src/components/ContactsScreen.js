@@ -9,6 +9,7 @@ import { Badge } from './common/Badge';
 import { Button } from './common/Button';
 import { NearbyPeersList } from './discovery/NearbyPeersList';
 import { DeveloperDiagnosticsModal } from './discovery/DeveloperDiagnosticsModal';
+import { BluetoothDiscoveryPanel } from './discovery/BluetoothDiscoveryPanel';
 
 const P2P_PEER_DISPLAY_GRACE_MS = 6000;
 
@@ -45,6 +46,8 @@ export default function ContactsScreen({
   unreadCount = 0,
   localIp = '127.0.0.1',
   btDevices = [],
+  onBtScan,
+  btScanning = false,
   onSelectBtDevice,
   callRecords = [],
   onDeleteCallRecord,
@@ -304,26 +307,17 @@ export default function ContactsScreen({
         />
       </View>
 
-      {/* Bluetooth Fallback Devices */}
-      {btDevices && btDevices.length > 0 && (
-        <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.border, marginTop: 14 }]}>
-          <Text style={[styles.sectionTitle, { color: theme.primary }]}>ᛒ أجهزة بلوتوث المقترنة</Text>
-          {btDevices.map((bt, i) => (
-            <TouchableOpacity
-              key={bt.address || i}
-              style={[styles.peerRow, { borderBottomColor: theme.borderSubtle }]}
-              onPress={() => onSelectBtDevice && onSelectBtDevice(bt)}
-            >
-              <Avatar name={bt.name || 'BT'} size={42} transportType="bluetooth" />
-              <View style={styles.peerInfo}>
-                <Text style={[styles.peerName, { color: theme.text }]}>{bt.name || 'Bluetooth Device'}</Text>
-                <Text style={[styles.peerStatus, { color: theme.textMuted }]}>{bt.address}</Text>
-              </View>
-              <Button title="محادثة BT" size="small" variant="secondary" onPress={() => onSelectBtDevice && onSelectBtDevice(bt)} />
-            </TouchableOpacity>
-          ))}
-        </View>
-      )}
+      {/* Bluetooth bootstrap must remain visible while the device list is empty. */}
+      <View style={[styles.sectionCard, { backgroundColor: theme.surface, borderColor: theme.border, marginTop: 14 }]}>
+        <BluetoothDiscoveryPanel
+          devices={btDevices}
+          isScanning={btScanning}
+          onScan={onBtScan}
+          onSelectDevice={onSelectBtDevice}
+          scanButtonTitle={btScanning ? 'جاري البحث…' : 'بحث Bluetooth'}
+          theme={theme}
+        />
+      </View>
       <View style={{ height: 90 }} />
     </ScrollView>
   );

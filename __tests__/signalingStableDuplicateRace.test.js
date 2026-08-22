@@ -256,6 +256,112 @@ describe('stable-identity simultaneous LAN arbitration', () => {
     expect(signaling.getSignalingHealth().direction).toBe('inbound');
   });
 
+  test('keeps a simultaneous inbound candidate until asymmetric LAN discovery catches up', async () => {
+    let routeKnown = false;
+    const validator = jest.fn(({ message, validateOnly }) => {
+      if (!routeKnown) {
+        return { accepted: false, pending: true, reason: 'awaiting-lan-discovery' };
+      }
+      return {
+        accepted: true,
+        peerId: message.deviceId,
+        transport: 'LAN',
+        ...(validateOnly ? { preferInbound: true } : {}),
+      };
+    });
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    const outbound = await establishOutbound();
+    const inbound = makeSocket('192.168.0.36');
+    onConnection(inbound);
+    emitJson(inbound, { type: 'identity', deviceId: 'peer-device', deviceName: 'Peer' });
+
+    expect(inbound.destroy).not.toHaveBeenCalled();
+    expect(outbound.destroy).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth().direction).toBe('outbound');
+
+    routeKnown = true;
+    jest.advanceTimersByTime(signaling.PASSIVE_INBOUND_ADMISSION_RETRY_MS);
+
+    expect(validator).toHaveBeenCalledTimes(3);
+    expect(validator.mock.calls[0][0]).toEqual(expect.objectContaining({ validateOnly: true }));
+    expect(validator.mock.calls[1][0]).toEqual(expect.objectContaining({ validateOnly: true }));
+    expect(validator.mock.calls[2][0]).not.toHaveProperty('validateOnly');
+    expect(outbound.destroy).toHaveBeenCalledTimes(1);
+    expect(inbound.destroy).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth()).toEqual(expect.objectContaining({
+      connected: true,
+      direction: 'inbound',
+      passiveAdmissionAccepted: true,
+    }));
+  });
+
+  test('rejects a conflicting second identity coalesced with a pending identity', async () => {
+    const validator = jest.fn(() => ({
+      accepted: false,
+      pending: true,
+      reason: 'awaiting-lan-discovery',
+    }));
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    const outbound = await establishOutbound();
+    const inbound = makeSocket('192.168.0.36');
+    onConnection(inbound);
+    emitJsonBatch(inbound, [
+      { type: 'identity', deviceId: 'peer-a', deviceName: 'Peer A' },
+      { type: 'identity', deviceId: 'peer-b', deviceName: 'Peer B' },
+    ]);
+
+    expect(inbound.destroy).toHaveBeenCalledTimes(1);
+    expect(outbound.destroy).not.toHaveBeenCalled();
+    expect(validator).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth().direction).toBe('outbound');
+  });
+
+  test('bounds complete application frames while duplicate admission is pending', async () => {
+    const validator = jest.fn(() => ({
+      accepted: false,
+      pending: true,
+      reason: 'awaiting-lan-discovery',
+    }));
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    const outbound = await establishOutbound();
+    const inbound = makeSocket('192.168.0.36');
+    onConnection(inbound);
+    emitJson(inbound, { type: 'identity', deviceId: 'peer-device', deviceName: 'Peer' });
+    emitJsonBatch(inbound, Array.from({ length: 17 }, (_, index) => ({
+      type: 'chat',
+      text: `buffered-${index}`,
+    })));
+
+    expect(inbound.destroy).toHaveBeenCalledTimes(1);
+    expect(outbound.destroy).not.toHaveBeenCalled();
+    expect(signaling.getSignalingHealth().direction).toBe('outbound');
+  });
+
+  test('closeSignaling cancels duplicate admission retries even when destroy emits no terminal event', async () => {
+    const validator = jest.fn(() => ({
+      accepted: false,
+      pending: true,
+      reason: 'awaiting-lan-discovery',
+    }));
+    signaling.setPassiveInboundAdmissionHandler(validator);
+
+    await establishOutbound();
+    const inbound = makeSocket('192.168.0.36');
+    onConnection(inbound);
+    emitJson(inbound, { type: 'identity', deviceId: 'peer-device', deviceName: 'Peer' });
+    expect(validator).toHaveBeenCalledTimes(1);
+
+    signaling.closeSignaling();
+    jest.advanceTimersByTime(signaling.PASSIVE_INBOUND_IDENTITY_TIMEOUT_MS);
+
+    expect(validator).toHaveBeenCalledTimes(1);
+    expect(inbound.destroy).toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   test('rolls back to the healthy outbound session when final inbound admission fails', async () => {
     const validator = jest.fn(({ message, validateOnly }) => validateOnly
       ? {

@@ -85,7 +85,10 @@ describe('TransportFallbackEngine coordinator-owned P2P default', () => {
       transport: 'P2P',
       result: { legacy: true },
     });
-    expect(connectP2p).toHaveBeenCalledWith(peer);
+    expect(connectP2p).toHaveBeenCalledWith(peer, expect.objectContaining({
+      attemptToken: expect.objectContaining({ peerId: peer.deviceId }),
+      isCancelled: expect.any(Function),
+    }));
     expect(coordinator.connectP2pPeer).not.toHaveBeenCalled();
   });
 });

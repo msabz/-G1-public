@@ -9,6 +9,7 @@ import {
   connectP2pFromApp,
   isCoordinatorOwnedP2pSession,
   resolveStableP2pDeviceId,
+  shouldYieldNativeP2pEvent,
 } from '../src/network/p2pAppBridge';
 
 describe('p2pAppBridge', () => {
@@ -154,5 +155,45 @@ describe('p2pAppBridge', () => {
     expect(isCoordinatorOwnedP2pSession(status, 'peer-id')).toBe(true);
     expect(isCoordinatorOwnedP2pSession(status, 'other')).toBe(false);
     expect(isCoordinatorOwnedP2pSession({ ...status, transport: TRANSPORTS.LAN }, 'peer-id')).toBe(false);
+  });
+
+  test('keeps a late native P2P event out of legacy signaling after fallback advances', () => {
+    expect(shouldYieldNativeP2pEvent({
+      coordinatorP2pAttemptActive: true,
+      coordinatorStatus: {
+        state: 'IDLE',
+        transport: null,
+        fallback: {
+          pendingAttempt: { transport: TRANSPORTS.P2P },
+        },
+      },
+    })).toBe(true);
+
+    // The old P2P promise may still settle after AUTO has already started BT.
+    // The global PEER_CONNECTED listener must remain owned by the selection,
+    // rather than opening the legacy TCP signaling path over the new step.
+    expect(shouldYieldNativeP2pEvent({
+      coordinatorP2pAttemptActive: false,
+      coordinatorStatus: {
+        // The fallback record advances before the Bluetooth connector has to
+        // mutate coordinator state, so ownership cannot rely on CONNECTING.
+        state: 'IDLE',
+        transport: null,
+        fallback: {
+          pendingAttempt: { transport: TRANSPORTS.BLUETOOTH },
+        },
+      },
+    })).toBe(true);
+
+    // A real legacy attempt has no coordinator/fallback owner. Its first
+    // group event must still reach the epoch-pending queue.
+    expect(shouldYieldNativeP2pEvent({
+      coordinatorP2pAttemptActive: false,
+      coordinatorStatus: {
+        state: 'IDLE',
+        transport: null,
+        fallback: { pendingAttempt: null },
+      },
+    })).toBe(false);
   });
 });

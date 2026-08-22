@@ -93,6 +93,24 @@ export function isCoordinatorOwnedP2pSession(status, deviceId) {
     status?.peer?.deviceId === deviceId;
 }
 
+/**
+ * The native PEER_CONNECTED stream is shared by the legacy App path and the
+ * coordinator's P2P adapter. While unified selection owns any step, a late P2P
+ * event must stay with that selection; otherwise App can accidentally start a
+ * second legacy signaling socket after fallback has already advanced to BT.
+ */
+export function shouldYieldNativeP2pEvent({
+  coordinatorStatus = {},
+  coordinatorP2pAttemptActive = false,
+} = {}) {
+  const fallbackAttempt = coordinatorStatus?.fallback?.pendingAttempt || null;
+  const coordinatorOwnsConnection =
+    coordinatorStatus?.state === 'CONNECTING' ||
+    coordinatorStatus?.state === 'CONNECTED';
+
+  return coordinatorP2pAttemptActive || !!fallbackAttempt || coordinatorOwnsConnection;
+}
+
 export async function connectP2pFromApp({
   contact = {},
   discoveredPeer = {},

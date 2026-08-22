@@ -25,7 +25,9 @@ export const BLUETOOTH_TRANSPORT_EVENT = Object.freeze({
 
 const DEFAULT_CONNECT_OPTIONS = Object.freeze({
   maxAttempts: 2,
-  connectTimeoutMs: 3000,
+  // A first secure RFCOMM connection can include Android's pairing dialog.
+  // Three seconds closed the socket before a person could confirm it.
+  connectTimeoutMs: 15000,
   retryDelayMs: 400,
   autoReconnect: true,
   maxReconnectAttempts: 3,
@@ -43,6 +45,22 @@ function createDefaultEmitter(nativeModule) {
 
 function normalizeAddress(value) {
   return typeof value === 'string' ? value.trim().toUpperCase() : '';
+}
+
+function normalizeNodeId(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function isProvisionalBluetoothPeerId(value) {
+  return normalizeNodeId(value).toLowerCase().startsWith('bluetooth:');
+}
+
+function createIdentityError(code, message, details = {}) {
+  const error = new Error(message);
+  error.name = 'BluetoothIdentityError';
+  error.code = code;
+  Object.assign(error, details);
+  return error;
 }
 
 function getBluetoothEndpoint(peer) {
@@ -76,8 +94,10 @@ export class BluetoothTransportAdapter {
     this.listeners = new Set();
     this.devices = new Map();
     this.pendingConnect = null;
+    this.connectGeneration = 0;
     this.activePeer = null;
     this.activeRoute = null;
+    this.activeRouteOwnership = null;
     this.lastError = null;
   }
 
@@ -194,26 +214,61 @@ export class BluetoothTransportAdapter {
     if (!address) throw new Error('Bluetooth address is missing for peer');
     if (this.pendingConnect) throw new Error('Another Bluetooth connection attempt is already active');
     if (this.activeRoute) {
-      if (normalizeAddress(this.activeRoute.address) === address) return { ...this.activeRoute, reused: true };
+      if (normalizeAddress(this.activeRoute.address) === address) {
+        try {
+          const authenticatedPeer = this._bindAuthenticatedPeer(peer, this.activeRoute);
+          this.activePeer = authenticatedPeer;
+          const route = {
+            ...this.activeRoute,
+            deviceId: authenticatedPeer.deviceId,
+            peer: authenticatedPeer,
+            reused: true,
+          };
+          this.activeRoute = route;
+          this._upsertConnectedPeer(authenticatedPeer, route);
+          return route;
+        } catch (error) {
+          await this._rejectAuthenticatedConnection(null, error, peer);
+          throw error;
+        }
+      }
       throw new Error('Another Bluetooth peer is already connected');
     }
 
-    this.startObserving();
-    if (options.startListening !== false) await this.startListening();
-    await this.stopDiscovery();
-
-    const attempt = { peer, address, cancelled: false };
+    const attempt = {
+      generation: ++this.connectGeneration,
+      peer,
+      address,
+      cancelled: false,
+      nativeStarted: false,
+      identityError: null,
+      identityDisconnectPromise: null,
+    };
     this.pendingConnect = attempt;
     this.state = BLUETOOTH_TRANSPORT_STATE.CONNECTING;
     this._notify(BLUETOOTH_TRANSPORT_EVENT.STATE, { state: this.state, address });
 
     try {
+      this.startObserving();
+      if (options.startListening !== false) {
+        await this.startListening();
+        this._throwIfConnectAttemptCancelled(attempt);
+      }
+      await this.stopDiscovery();
+      this._throwIfConnectAttemptCancelled(attempt);
+
       const nativeOptions = { ...this.defaultConnectOptions, ...options };
       delete nativeOptions.startListening;
+      attempt.nativeStarted = true;
       const result = typeof this.nativeModule.connect === 'function'
         ? await this.nativeModule.connect(address, nativeOptions)
         : await this.nativeModule.connectToDevice(address);
-      if (attempt.cancelled) throw new Error('Bluetooth connection was cancelled');
+      this._throwIfConnectAttemptCancelled(attempt);
+
+      if (attempt.identityError) {
+        await this._rejectAuthenticatedConnection(attempt, attempt.identityError, peer);
+        throw attempt.identityError;
+      }
 
       const route = {
         transport: TRANSPORTS.BLUETOOTH,
@@ -225,35 +280,70 @@ export class BluetoothTransportAdapter {
         deviceName: result?.deviceName || peer?.deviceName || peer?.name || 'Bluetooth Device',
         bonded: result?.bonded !== false,
       };
-      this.activePeer = peer;
-      this.activeRoute = route;
+      const authenticatedPeer = this._bindAuthenticatedPeer(peer, route);
+      const authenticatedRoute = {
+        ...route,
+        deviceId: authenticatedPeer.deviceId,
+        peer: authenticatedPeer,
+      };
+      this.activePeer = authenticatedPeer;
+      this.activeRoute = authenticatedRoute;
+      this.activeRouteOwnership = result?.incoming === true
+        ? null
+        : this._routeOwnership(attempt, authenticatedRoute);
       this.state = BLUETOOTH_TRANSPORT_STATE.CONNECTED;
-      this._upsertConnectedPeer(peer, route);
-      return route;
+      this._upsertConnectedPeer(authenticatedPeer, authenticatedRoute);
+      return authenticatedRoute;
     } catch (error) {
+      if (attempt.cancelled || attempt.generation !== this.connectGeneration) {
+        throw this._connectCancellationError(attempt);
+      }
+      const failure = attempt.identityError || error;
+      if (failure?.name === 'BluetoothIdentityError') {
+        await this._rejectAuthenticatedConnection(attempt, failure, peer);
+      }
       if (!attempt.cancelled) {
         this.state = BLUETOOTH_TRANSPORT_STATE.ERROR;
-        this.lastError = error;
+        this.lastError = failure;
       }
-      throw error;
+      throw failure;
     } finally {
       if (this.pendingConnect === attempt) this.pendingConnect = null;
     }
   }
 
   async cancelConnect(reason = 'Bluetooth connection cancelled') {
-    if (this.pendingConnect) {
-      this.pendingConnect.cancelled = true;
-      this.pendingConnect.cancelReason = reason;
+    const cancellationReason = typeof reason === 'string'
+      ? reason
+      : reason?.reason || 'Bluetooth connection cancelled';
+    const attempt = this.pendingConnect;
+    const ownsActivatedRoute = this._isRouteOwnedByAttempt(attempt);
+    const activatedPeer = ownsActivatedRoute ? this.activePeer : null;
+    if (attempt) {
+      attempt.cancelled = true;
+      attempt.cancelReason = cancellationReason;
+      if (attempt.generation === this.connectGeneration) this.connectGeneration += 1;
+      if (this.pendingConnect === attempt) this.pendingConnect = null;
     }
-    if (typeof this.nativeModule?.cancelConnect === 'function') {
-      await this.nativeModule.cancelConnect();
+    if (ownsActivatedRoute) {
+      this.activePeer = null;
+      this.activeRoute = null;
+      this.activeRouteOwnership = null;
+      if (activatedPeer?.deviceId) this.registry?.setPeerDisconnected?.(activatedPeer.deviceId);
     }
-    this.pendingConnect = null;
     if (!this.activeRoute) {
       this.state = this.listening
         ? BLUETOOTH_TRANSPORT_STATE.LISTENING
         : BLUETOOTH_TRANSPORT_STATE.IDLE;
+    }
+    try {
+      if (typeof this.nativeModule?.cancelConnect === 'function') {
+        await this.nativeModule.cancelConnect();
+      }
+    } finally {
+      if (ownsActivatedRoute && typeof this.nativeModule?.disconnect === 'function') {
+        await this.nativeModule.disconnect();
+      }
     }
     return true;
   }
@@ -293,6 +383,7 @@ export class BluetoothTransportAdapter {
     const previousPeer = this.activePeer;
     this.activePeer = null;
     this.activeRoute = null;
+    this.activeRouteOwnership = null;
     this.state = this.listening
       ? BLUETOOTH_TRANSPORT_STATE.LISTENING
       : BLUETOOTH_TRANSPORT_STATE.IDLE;
@@ -349,10 +440,32 @@ export class BluetoothTransportAdapter {
   }
 
   _onConnected(event = {}) {
-    const address = normalizeAddress(event.address || this.pendingConnect?.address);
-    const peer = this.pendingConnect?.peer || this.activePeer;
-    this.activePeer = peer || null;
-    this.activeRoute = {
+    const attempt = this.pendingConnect;
+    const address = normalizeAddress(event.address || attempt?.address);
+    const isIncoming = event.incoming === true;
+    const ownsNativeReconnect = !!(
+      !isIncoming &&
+      event.reconnected === true &&
+      !attempt &&
+      this.activeRoute &&
+      this.activePeer &&
+      address === normalizeAddress(this.activeRoute.address) &&
+      normalizeNodeId(event.remoteNodeId) === normalizeNodeId(this.activePeer.deviceId)
+    );
+    const ownsOutboundConnection = !!(
+      !isIncoming &&
+      attempt &&
+      !attempt.cancelled &&
+      attempt.nativeStarted &&
+      attempt.generation === this.connectGeneration &&
+      (!address || address === attempt.address)
+    );
+    if (!isIncoming && !ownsOutboundConnection && !ownsNativeReconnect) {
+      this._disconnectUnownedOutboundConnection(event);
+      return;
+    }
+    const peer = attempt?.peer || this.activePeer;
+    const route = {
       transport: TRANSPORTS.BLUETOOTH,
       address,
       security: event.security || 'AUTHENTICATED_RFCOMM',
@@ -362,9 +475,32 @@ export class BluetoothTransportAdapter {
       deviceName: event.deviceName || peer?.deviceName || 'Bluetooth Device',
       bonded: event.bonded !== false,
     };
+    let authenticatedPeer;
+    try {
+      authenticatedPeer = this._bindAuthenticatedPeer(peer, route);
+    } catch (error) {
+      if (this.pendingConnect) this.pendingConnect.identityError = error;
+      this._rejectAuthenticatedConnection(this.pendingConnect, error, peer).catch(() => false);
+      return;
+    }
+    const authenticatedRoute = {
+      ...route,
+      deviceId: authenticatedPeer.deviceId,
+      peer: authenticatedPeer,
+    };
+    this.activePeer = authenticatedPeer;
+    this.activeRoute = authenticatedRoute;
+    this.activeRouteOwnership = ownsOutboundConnection
+      ? this._routeOwnership(attempt, authenticatedRoute)
+      : null;
     this.state = BLUETOOTH_TRANSPORT_STATE.CONNECTED;
-    this._upsertConnectedPeer(peer, this.activeRoute);
-    this._notify(BLUETOOTH_TRANSPORT_EVENT.CONNECTED, { ...event, route: this.activeRoute });
+    this._upsertConnectedPeer(authenticatedPeer, authenticatedRoute);
+    this._notify(BLUETOOTH_TRANSPORT_EVENT.CONNECTED, {
+      ...event,
+      deviceId: authenticatedPeer.deviceId,
+      peer: authenticatedPeer,
+      route: authenticatedRoute,
+    });
   }
 
   _onReconnecting(event = {}) {
@@ -384,6 +520,7 @@ export class BluetoothTransportAdapter {
     const peer = this.activePeer;
     this.activePeer = null;
     this.activeRoute = null;
+    this.activeRouteOwnership = null;
     this.state = this.listening
       ? BLUETOOTH_TRANSPORT_STATE.LISTENING
       : BLUETOOTH_TRANSPORT_STATE.IDLE;
@@ -398,6 +535,130 @@ export class BluetoothTransportAdapter {
     this.lastError = error;
     if (!error.recoverable && !this.activeRoute) this.state = BLUETOOTH_TRANSPORT_STATE.ERROR;
     this._notify(BLUETOOTH_TRANSPORT_EVENT.ERROR, { ...event, error });
+  }
+
+  _connectCancellationError(attempt) {
+    return new Error(attempt?.cancelReason || 'Bluetooth connection was cancelled');
+  }
+
+  _throwIfConnectAttemptCancelled(attempt) {
+    if (
+      attempt?.cancelled ||
+      this.pendingConnect !== attempt ||
+      attempt?.generation !== this.connectGeneration
+    ) {
+      throw this._connectCancellationError(attempt);
+    }
+  }
+
+  _routeOwnership(attempt, route) {
+    if (!attempt) return null;
+    return {
+      generation: attempt.generation,
+      sessionId: route?.sessionId || null,
+      address: normalizeAddress(route?.address),
+    };
+  }
+
+  _isRouteOwnedByAttempt(attempt) {
+    const ownership = this.activeRouteOwnership;
+    if (!attempt || !ownership || !this.activeRoute) return false;
+    if (ownership.generation !== attempt.generation) return false;
+    const activeAddress = normalizeAddress(this.activeRoute.address);
+    if (ownership.address && activeAddress !== ownership.address) return false;
+    if (
+      ownership.sessionId &&
+      this.activeRoute.sessionId &&
+      ownership.sessionId !== this.activeRoute.sessionId
+    ) {
+      return false;
+    }
+    return activeAddress === attempt.address;
+  }
+
+  _disconnectUnownedOutboundConnection(event = {}) {
+    const activeSessionId = this.activeRoute?.sessionId || null;
+    const eventSessionId = event.sessionId || null;
+    if (this.activeRoute && activeSessionId && eventSessionId !== activeSessionId) {
+      // The rejected notification belongs to an obsolete socket. Never tear
+      // down a newer authenticated incoming route that already owns native.
+      return;
+    }
+    const previousPeer = this.activePeer;
+    this.activePeer = null;
+    this.activeRoute = null;
+    this.activeRouteOwnership = null;
+    this.state = this.listening
+      ? BLUETOOTH_TRANSPORT_STATE.LISTENING
+      : BLUETOOTH_TRANSPORT_STATE.IDLE;
+    if (previousPeer?.deviceId) this.registry?.setPeerDisconnected?.(previousPeer.deviceId);
+    Promise.resolve()
+      .then(() => this.nativeModule?.disconnect?.())
+      .catch(() => false);
+  }
+
+  _bindAuthenticatedPeer(peer, route) {
+    const remoteNodeId = normalizeNodeId(route?.remoteNodeId);
+    const expectedDeviceId = normalizeNodeId(peer?.deviceId);
+    if (!remoteNodeId) {
+      throw createIdentityError(
+        'BT_IDENTITY_MISSING',
+        'Authenticated Bluetooth handshake did not provide a stable remote node ID',
+        { expectedDeviceId: expectedDeviceId || null },
+      );
+    }
+    if (
+      expectedDeviceId &&
+      !isProvisionalBluetoothPeerId(expectedDeviceId) &&
+      expectedDeviceId !== remoteNodeId
+    ) {
+      throw createIdentityError(
+        'BT_IDENTITY_MISMATCH',
+        `Bluetooth peer identity mismatch: expected ${expectedDeviceId}, received ${remoteNodeId}`,
+        { expectedDeviceId, remoteNodeId },
+      );
+    }
+
+    const endpoint = getBluetoothEndpoint(peer);
+    return {
+      ...(peer || {}),
+      deviceId: remoteNodeId,
+      deviceName: route?.deviceName || peer?.deviceName || peer?.name || 'Bluetooth Device',
+      transports: {
+        ...(peer?.transports || {}),
+        [TRANSPORTS.BLUETOOTH]: {
+          ...endpoint,
+          address: normalizeAddress(route?.address || endpoint?.address),
+          isReachable: true,
+        },
+      },
+    };
+  }
+
+  async _rejectAuthenticatedConnection(attempt, error, peer) {
+    if (attempt?.identityDisconnectPromise) {
+      await attempt.identityDisconnectPromise;
+      return;
+    }
+    if (attempt) attempt.identityError = error;
+    const previousPeer = this.activePeer || peer;
+    this.activePeer = null;
+    this.activeRoute = null;
+    this.activeRouteOwnership = null;
+    this.state = BLUETOOTH_TRANSPORT_STATE.ERROR;
+    this.lastError = error;
+    if (previousPeer?.deviceId) this.registry?.setPeerDisconnected?.(previousPeer.deviceId);
+    this._notify(BLUETOOTH_TRANSPORT_EVENT.ERROR, {
+      code: error.code,
+      message: error.message,
+      recoverable: false,
+      error,
+    });
+    const disconnectPromise = Promise.resolve()
+      .then(() => this.nativeModule?.disconnect?.())
+      .catch(() => false);
+    if (attempt) attempt.identityDisconnectPromise = disconnectPromise;
+    await disconnectPromise;
   }
 
   _upsertConnectedPeer(peer, route) {

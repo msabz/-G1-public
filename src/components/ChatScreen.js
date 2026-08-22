@@ -8,6 +8,7 @@ import { playVoiceFile } from '../media/AudioClip';
 import { WA } from '../theme';
 import { useAppTheme } from '../theme/themeContext';
 import { copyText } from '../services/Persistence';
+import MessageActionSheet from './MessageActionSheet';
 import {
   filterMessages,
   messagePreview,
@@ -126,6 +127,16 @@ function ReplyQuote({ message, theme }) {
 
 function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, replyMessage, theme }) {
   const isMe = item.sender === 'me';
+  const openMessageActions = () => onLongPress?.(item);
+  const messageAccessibilityHint = onLongPress
+    ? 'اضغط مطولاً أو استخدم إجراءات إمكانية الوصول لفتح خيارات الرسالة'
+    : undefined;
+  const messageAccessibilityActions = onLongPress
+    ? [{ name: 'showMessageActions', label: 'فتح خيارات الرسالة' }]
+    : undefined;
+  const handleMessageAccessibilityAction = event => {
+    if (event.nativeEvent.actionName === 'showMessageActions') openMessageActions();
+  };
   const bubbleStyle = [
     styles.bubble,
     isMe ? styles.outBubble : styles.inBubble,
@@ -140,11 +151,14 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, r
         <TouchableOpacity
           activeOpacity={info.missed ? 0.7 : 0.9}
           onPress={() => info.missed && onRedial && onRedial(info.isVideo)}
-          onLongPress={() => onLongPress && onLongPress(item)}
+          onLongPress={openMessageActions}
           delayLongPress={350}
           style={[...bubbleStyle, styles.callBubble]}
           accessibilityRole="button"
           accessibilityLabel={`${info.title}. ${info.sub}`}
+          accessibilityHint={messageAccessibilityHint}
+          accessibilityActions={messageAccessibilityActions}
+          onAccessibilityAction={handleMessageAccessibilityAction}
         >
           <View style={[styles.callIconBox, info.missed && styles.callIconMissed]}>
             <Text style={{ fontSize: 17 }}>
@@ -167,11 +181,14 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, r
       <View style={styles.row}>
         <TouchableOpacity
           activeOpacity={0.9}
-          onLongPress={() => onLongPress && onLongPress(item)}
+          onLongPress={openMessageActions}
           delayLongPress={350}
           style={[...bubbleStyle, styles.voiceBubble]}
           accessibilityRole="button"
-          accessibilityLabel="رسالة صوتية. اضغط مطولاً لخيارات الرسالة"
+          accessibilityLabel="رسالة صوتية"
+          accessibilityHint={messageAccessibilityHint}
+          accessibilityActions={messageAccessibilityActions}
+          onAccessibilityAction={handleMessageAccessibilityAction}
         >
           <TouchableOpacity
             disabled={busy || !item.path}
@@ -180,6 +197,9 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, r
               catch (e) { Alert.alert('تعذّر التشغيل', e?.message || ''); }
             }}
             style={styles.playBtn}
+            accessibilityRole="button"
+            accessibilityLabel="تشغيل الرسالة الصوتية"
+            accessibilityState={{ disabled: busy || !item.path }}
           >
             <Text style={styles.playIcon}>{busy ? '⏳' : '▶'}</Text>
           </TouchableOpacity>
@@ -205,11 +225,14 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, r
         <TouchableOpacity
           activeOpacity={0.85}
           onPress={() => !busy && (item.path || item.localUri) && onViewImage && onViewImage(item)}
-          onLongPress={() => onLongPress && onLongPress(item)}
+          onLongPress={openMessageActions}
           delayLongPress={350}
           style={[...bubbleStyle, styles.mediaBubble]}
           accessibilityRole="imagebutton"
-          accessibilityLabel={`${item.fileName || 'صورة'}. اضغط مطولاً لخيارات الرسالة`}
+          accessibilityLabel={item.fileName || 'صورة'}
+          accessibilityHint={messageAccessibilityHint}
+          accessibilityActions={messageAccessibilityActions}
+          onAccessibilityAction={handleMessageAccessibilityAction}
         >
           {item.localUri && !busy ? (
             <Image source={{ uri: item.localUri }} style={styles.imagePreview} resizeMode="cover" />
@@ -237,11 +260,14 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, r
         <TouchableOpacity
           activeOpacity={canOpen ? 0.7 : 1}
           onPress={() => canOpen && onOpenFile && onOpenFile(item)}
-          onLongPress={() => onLongPress && onLongPress(item)}
+          onLongPress={openMessageActions}
           delayLongPress={350}
           style={[...bubbleStyle, { minWidth: 230 }]}
           accessibilityRole="button"
-          accessibilityLabel={`${item.fileName || 'ملف'}. اضغط مطولاً لخيارات الرسالة`}
+          accessibilityLabel={item.fileName || 'ملف'}
+          accessibilityHint={messageAccessibilityHint}
+          accessibilityActions={messageAccessibilityActions}
+          onAccessibilityAction={handleMessageAccessibilityAction}
         >
           <View style={[styles.fileRow, { backgroundColor: theme.surfaceVariant }]}>
             <View style={styles.fileIconBox}>
@@ -268,11 +294,14 @@ function MessageBubble({ item, onOpenFile, onViewImage, onRedial, onLongPress, r
     <View style={styles.row}>
       <TouchableOpacity
         activeOpacity={0.9}
-        onLongPress={() => onLongPress && onLongPress(item)}
+        onLongPress={openMessageActions}
         delayLongPress={350}
         style={bubbleStyle}
         accessibilityRole="button"
-        accessibilityLabel={`${isMe ? 'رسالتك' : 'رسالة واردة'}: ${item.text}. اضغط مطولاً للخيارات`}
+        accessibilityLabel={`${isMe ? 'رسالتك' : 'رسالة واردة'}: ${item.text}`}
+        accessibilityHint={messageAccessibilityHint}
+        accessibilityActions={messageAccessibilityActions}
+        onAccessibilityAction={handleMessageAccessibilityAction}
       >
         {item.replyToMessageId ? (
           <ReplyQuote message={replyMessage} theme={theme} />
@@ -354,6 +383,12 @@ export default function ChatScreen({
   };
 
   const closeActionMenu = () => setActionMessage(null);
+
+  const replyToSelectedMessage = () => {
+    const selected = actionMessage;
+    closeActionMenu();
+    if (selected) setReplyTarget(selected);
+  };
 
   const shareMessage = async () => {
     const selected = actionMessage;
@@ -538,38 +573,16 @@ export default function ChatScreen({
         </View>
       ) : null}
 
-      <Modal
+      <MessageActionSheet
         visible={!!actionMessage}
-        transparent
-        animationType="fade"
-        onRequestClose={closeActionMenu}
-      >
-        <TouchableOpacity style={styles.actionBackdrop} activeOpacity={1} onPress={closeActionMenu}>
-          <View style={[styles.actionSheet, { backgroundColor: theme.surface }]}>
-            <Text style={[styles.actionPreview, { color: theme.textSecondary }]} numberOfLines={2}>
-              {messagePreview(actionMessage)}
-            </Text>
-            <TouchableOpacity
-              style={styles.actionItem}
-              onPress={() => {
-                setReplyTarget(actionMessage);
-                closeActionMenu();
-              }}
-            >
-              <Text style={[styles.actionText, { color: theme.text }]}>↩ الرد</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.actionItem} onPress={copyMessage}>
-              <Text style={[styles.actionText, { color: theme.text }]}>⧉ نسخ</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.actionItem} onPress={shareMessage}>
-              <Text style={[styles.actionText, { color: theme.text }]}>↗ مشاركة</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.actionItem} onPress={deleteSelectedMessage}>
-              <Text style={[styles.actionText, { color: theme.error }]}>🗑 حذف محلي</Text>
-            </TouchableOpacity>
-          </View>
-        </TouchableOpacity>
-      </Modal>
+        message={actionMessage}
+        theme={theme}
+        onClose={closeActionMenu}
+        onReply={replyToSelectedMessage}
+        onCopy={copyMessage}
+        onShare={shareMessage}
+        onDelete={deleteSelectedMessage}
+      />
 
       <KeyboardAvoidingView
         style={{ flex: 1 }}
@@ -894,17 +907,6 @@ const styles = StyleSheet.create({
   },
   searchCount: { minWidth: 48, fontSize: 12, textAlign: 'center' },
 
-  actionBackdrop: {
-    flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end',
-  },
-  actionSheet: {
-    borderTopLeftRadius: 18, borderTopRightRadius: 18,
-    paddingHorizontal: 18, paddingTop: 14, paddingBottom: 28,
-  },
-  actionPreview: { textAlign: 'right', fontSize: 13, marginBottom: 8 },
-  actionItem: { minHeight: 48, justifyContent: 'center' },
-  actionText: { textAlign: 'right', fontSize: 16, fontWeight: '600' },
-
   chatArea: { flex: 1, backgroundColor: WA.chatBg },
   emptyBox: { alignItems: 'center', marginTop: 24, paddingHorizontal: 30 },
   emptyText: {
@@ -915,11 +917,15 @@ const styles = StyleSheet.create({
   row: { width: '100%' },
   bubble: {
     maxWidth: '82%', paddingHorizontal: 9, paddingTop: 6, paddingBottom: 4,
+    minHeight: 48, justifyContent: 'center',
     borderRadius: 8, marginVertical: 2, elevation: 1,
   },
   outBubble: { alignSelf: 'flex-end', backgroundColor: WA.outBubble, borderTopRightRadius: 0 },
   inBubble: { alignSelf: 'flex-start', backgroundColor: WA.inBubble, borderTopLeftRadius: 0 },
-  msgText: { color: WA.text, fontSize: 15, lineHeight: 20 },
+  msgText: {
+    color: WA.text, fontSize: 15, lineHeight: 20,
+    textAlign: 'right', writingDirection: 'auto',
+  },
   replyQuote: {
     borderRightWidth: 3, borderRadius: 6, paddingHorizontal: 8,
     paddingVertical: 5, marginBottom: 5, minWidth: 150,
@@ -930,8 +936,10 @@ const styles = StyleSheet.create({
     borderRightWidth: 4, borderRadius: 8,
   },
   replyAuthor: { textAlign: 'right', fontSize: 12, fontWeight: '700' },
-  replyText: { textAlign: 'right', fontSize: 12, marginTop: 2 },
-  replyDismiss: { width: 38, height: 38, justifyContent: 'center', alignItems: 'center' },
+  replyText: {
+    textAlign: 'right', writingDirection: 'auto', fontSize: 12, marginTop: 2,
+  },
+  replyDismiss: { width: 48, height: 48, justifyContent: 'center', alignItems: 'center' },
   replyDismissText: { fontSize: 18 },
 
   metaRow: { flexDirection: 'row-reverse', alignItems: 'center', alignSelf: 'flex-start', marginTop: 2 },
@@ -939,7 +947,7 @@ const styles = StyleSheet.create({
   metaTick: { fontSize: 11, marginLeft: 3 },
 
   voiceBubble: { flexDirection: 'row-reverse', alignItems: 'center', minWidth: 230 },
-  playBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: '#F0F0F0', justifyContent: 'center', alignItems: 'center' },
+  playBtn: { width: 48, height: 48, borderRadius: 24, backgroundColor: '#F0F0F0', justifyContent: 'center', alignItems: 'center' },
   playIcon: { fontSize: 14, color: WA.green },
   waveform: { flexDirection: 'row', alignItems: 'center', height: 24, gap: 2 },
   waveBar: { width: 2.5, backgroundColor: '#9AAAB2', borderRadius: 2 },
@@ -964,7 +972,10 @@ const styles = StyleSheet.create({
 
   fileRow: { flexDirection: 'row-reverse', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.04)', borderRadius: 6, padding: 8 },
   fileIconBox: { width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.06)', justifyContent: 'center', alignItems: 'center' },
-  fileName: { color: WA.text, fontWeight: '600', fontSize: 14 },
+  fileName: {
+    color: WA.text, fontWeight: '600', fontSize: 14,
+    textAlign: 'right', writingDirection: 'auto',
+  },
   fileSub: { color: WA.subText, fontSize: 11, marginTop: 2 },
 
   progressTrack: { height: 3, backgroundColor: 'rgba(0,0,0,0.12)', borderRadius: 2, marginTop: 6, overflow: 'hidden' },

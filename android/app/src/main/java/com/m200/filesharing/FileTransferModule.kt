@@ -446,6 +446,20 @@ class FileTransferModule(reactContext: ReactApplicationContext) : ReactContextBa
                             if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx).coerceAtLeast(0L)
                         }
                     }
+                    // Some Storage Access Framework providers omit
+                    // OpenableColumns.SIZE even for a seekable local file. Use
+                    // the descriptor's declared length when available so both
+                    // peers can report real progress instead of remaining at 0%
+                    // for the whole transfer. UNKNOWN_LENGTH stays represented
+                    // by zero and retains the existing EOF-delimited protocol.
+                    if (size <= 0L) {
+                        try {
+                            resolver.openAssetFileDescriptor(uri, "r")?.use { descriptor ->
+                                val descriptorLength = descriptor.length
+                                if (descriptorLength > 0L) size = descriptorLength
+                            }
+                        } catch (_: Exception) {}
+                    }
                     mimeType = resolver.getType(uri) ?: mimeForPlainFile(fileName, kind)
                 }
 

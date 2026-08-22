@@ -57,6 +57,9 @@ describe('TransportFallbackEngine ownership characterization', () => {
 
     expect(connectionCoordinator.connectLanPeer).toHaveBeenCalledWith(peer, 4321);
     expect(connectP2p).toHaveBeenCalledTimes(1);
-    expect(connectP2p).toHaveBeenCalledWith(peer);
+    expect(connectP2p).toHaveBeenCalledWith(peer, expect.objectContaining({
+      attemptToken: expect.objectContaining({ peerId: peer.deviceId }),
+      isCancelled: expect.any(Function),
+    }));
   });
 });

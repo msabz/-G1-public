@@ -620,6 +620,21 @@ export class ConnectionCoordinator {
         throw new Error('Signaling owner completed LAN connect without an active session');
       }
 
+      // Passive LAN admission requires stable identity within a short bounded
+      // window. Announce it as soon as the socket exists; waiting for App UI
+      // hydration/storage can otherwise make a healthy LAN socket look like an
+      // unauthenticated intermittent failure on the receiving phone.
+      if (this.myDeviceId && typeof owner.sendMessage === 'function') {
+        const identitySent = owner.sendMessage({
+          type: 'identity',
+          deviceId: this.myDeviceId,
+          deviceName: this.myDeviceName || 'G1 Device',
+        });
+        if (!identitySent) {
+          throw new Error('Failed to announce stable G1 identity over LAN');
+        }
+      }
+
       this.activeSession = session;
       this.activeSessionManagedExternally = true;
       this.activeTransportAdapter = null;
@@ -640,6 +655,7 @@ export class ConnectionCoordinator {
         return;
       }
       if (this.pendingConnectAbort === abort) this.pendingConnectAbort = null;
+      try { owner.disconnect?.(); } catch (e) {}
       if (this.generation === currentGen) {
         this._setState(COORDINATOR_STATE.ERROR, { error: err.message });
         peerRegistry.setPeerDisconnected(peer.deviceId);
@@ -791,7 +807,7 @@ export class ConnectionCoordinator {
     }
   }
 
-  connectBluetoothPeer(peer, timeoutMs = 8000, connectOptions = {}) {
+  connectBluetoothPeer(peer, timeoutMs = 25000, connectOptions = {}) {
     const reusable = this._getReusableConnection(peer, TRANSPORTS.BLUETOOTH);
     if (reusable) return reusable;
 
@@ -855,6 +871,12 @@ export class ConnectionCoordinator {
         attemptToken,
       });
       const session = result?.session || result;
+      // The authenticated RFCOMM hello can replace a discovery-only
+      // `bluetooth:MAC` identity with the peer's stable G1 node ID. Promote
+      // that verified identity at the coordinator boundary so observers,
+      // registry ownership and subsequent fallback steps never retain the
+      // provisional peer after the physical socket is already authenticated.
+      const connectedPeer = result?.peer?.deviceId ? result.peer : peer;
 
       if (cancelled || !this._isAttemptCurrent(attemptToken)) {
         try {
@@ -874,15 +896,19 @@ export class ConnectionCoordinator {
       this.activeSession = session;
       this.activeSessionManagedExternally = true;
       this.activeTransportAdapter = adapter;
+      this.currentPeer = connectedPeer;
       this.preferredTransport = TRANSPORTS.BLUETOOTH;
       this.transitionCount = 0;
       this._stopHeartbeat();
       this._setState(COORDINATOR_STATE.CONNECTED, {
-        peer,
+        peer: connectedPeer,
         transport: TRANSPORTS.BLUETOOTH,
       });
-      peerRegistry.setPeerConnected(peer.deviceId, TRANSPORTS.BLUETOOTH);
-      if (this.onConnected) this.onConnected(peer, TRANSPORTS.BLUETOOTH);
+      if (connectedPeer.deviceId !== peer.deviceId) {
+        peerRegistry.setPeerDisconnected(peer.deviceId);
+      }
+      peerRegistry.setPeerConnected(connectedPeer.deviceId, TRANSPORTS.BLUETOOTH);
+      if (this.onConnected) this.onConnected(connectedPeer, TRANSPORTS.BLUETOOTH);
       this._subscribeToTransportDisconnect(adapter, session, attemptToken.generation);
       return session;
     } catch (error) {
@@ -1393,9 +1419,11 @@ export class ConnectionCoordinator {
     return hadPendingAttempt;
   }
 
-  disconnect() {
+  disconnect(options = {}) {
     const peerId = this.currentPeer?.deviceId || this.pendingAttempt?.token?.peerId || null;
-    try { this.fallbackEngine?.cancel?.(peerId, 'Coordinator disconnect requested'); } catch (e) {}
+    if (options.preserveFallback !== true) {
+      try { this.fallbackEngine?.cancel?.(peerId, 'Coordinator disconnect requested'); } catch (e) {}
+    }
     this.cancelHandover('Coordinator disconnect requested');
     this._stopHeartbeat();
     const session = this.activeSession;

@@ -93,7 +93,10 @@ describe('Discovery & Fallback Race Conditions', () => {
     expect(connectLan).toHaveBeenCalledTimes(1);
     expect(connectLan).toHaveBeenCalledWith(peer, engine.lanTimeoutMs);
     expect(connectP2p).toHaveBeenCalledTimes(1);
-    expect(connectP2p).toHaveBeenCalledWith(peer);
+    expect(connectP2p).toHaveBeenCalledWith(peer, expect.objectContaining({
+      attemptToken: expect.objectContaining({ peerId: peer.deviceId }),
+      isCancelled: expect.any(Function),
+    }));
 
     coord.disconnect();
   });

@@ -66,6 +66,24 @@ describe('ConnectionCoordinator LAN connect policy', () => {
     });
   });
 
+  test('forwards a scoped IPv6 link-local LAN host without stripping its zone', async () => {
+    const owner = makeOwner();
+    const coordinator = new ConnectionCoordinator({ signalingOwner: owner });
+    const scopedPeer = {
+      deviceId: 'peer-ipv6',
+      transports: {
+        LAN: { host: 'fe80::a12b:34ff:fe56:7890%wlan0', port: 8089 },
+      },
+    };
+
+    await coordinator.connectLanPeer(scopedPeer, 5000);
+
+    expect(owner.connectOutbound).toHaveBeenCalledWith(expect.objectContaining({
+      host: 'fe80::a12b:34ff:fe56:7890%wlan0',
+      port: 8089,
+    }));
+  });
+
   test('applies the same explicit attempt count and retry delay to the legacy socket path', async () => {
     jest.useFakeTimers();
     const sockets = [];

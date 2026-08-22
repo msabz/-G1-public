@@ -1,6 +1,7 @@
 package com.m200.bluetooth
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothServerSocket
@@ -11,6 +12,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.ActivityEventListener
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -39,6 +41,8 @@ private const val MAX_DISCOVERY_TIMEOUT_MS = 30_000L
 private const val MIN_CONNECT_TIMEOUT_MS = 1_000L
 private const val MAX_CONNECT_TIMEOUT_MS = 30_000L
 private const val HANDSHAKE_TIMEOUT_MS = 6_000L
+private const val IDENTITY_PREFERENCES = "musabchat_identity"
+private const val IDENTITY_DEVICE_ID = "device_id"
 
 /**
  * Authenticated Bluetooth Classic/RFCOMM transport for G1.
@@ -51,7 +55,7 @@ private const val HANDSHAKE_TIMEOUT_MS = 6_000L
 @SuppressLint("MissingPermission")
 class BluetoothConnectionModule(
     private val reactContext: ReactApplicationContext,
-) : ReactContextBaseJavaModule(reactContext) {
+) : ReactContextBaseJavaModule(reactContext), ActivityEventListener {
 
     private data class ConnectOptions(
         val maxAttempts: Int = 3,
@@ -110,15 +114,27 @@ class BluetoothConnectionModule(
     @Volatile private var pendingConnectToken: Long? = null
     @Volatile private var pendingConnectAddress: String? = null
     @Volatile private var discoveryStopFuture: ScheduledFuture<*>? = null
+    private val REQUEST_ENABLE = 6411
+    private val REQUEST_DISCOVERABLE = 6412
+    private var enablePromise: Promise? = null
+    private var discoverablePromise: Promise? = null
+
+    init {
+        reactContext.addActivityEventListener(this)
+    }
 
     private val localNodeId: String by lazy {
-        val preferences = reactContext.getSharedPreferences("g1_bluetooth", Context.MODE_PRIVATE)
-        val existing = preferences.getString("node_id", null)
+        // Bluetooth's authenticated hello must carry the same install-scoped
+        // identity used by LAN/P2P and persisted by StorageModule. Keeping a
+        // second Bluetooth-only UUID made cross-transport identity validation
+        // impossible and allowed a MAC-only provisional peer to survive.
+        val preferences = reactContext.getSharedPreferences(IDENTITY_PREFERENCES, Context.MODE_PRIVATE)
+        val existing = preferences.getString(IDENTITY_DEVICE_ID, null)
         try {
             if (existing != null) UUID.fromString(existing).toString() else throw IllegalArgumentException()
         } catch (_: IllegalArgumentException) {
             UUID.randomUUID().toString().also { generated ->
-                preferences.edit().putString("node_id", generated).apply()
+                preferences.edit().putString(IDENTITY_DEVICE_ID, generated).apply()
             }
         }
     }
@@ -142,13 +158,23 @@ class BluetoothConnectionModule(
 
     @ReactMethod
     fun requestEnable(promise: Promise) {
+        val activity = currentActivity
+        if (activity == null) {
+            promise.reject("BT_ENABLE_FAILED", "No foreground activity is available")
+            return
+        }
+        if (enablePromise != null) {
+            promise.reject("BT_ENABLE_BUSY", "A Bluetooth enable request is already active")
+            return
+        }
         try {
-            val intent = Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            reactContext.startActivity(intent)
-            promise.resolve(true)
+            enablePromise = promise
+            activity.startActivityForResult(
+                Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE),
+                REQUEST_ENABLE,
+            )
         } catch (e: Exception) {
+            enablePromise = null
             promise.reject("BT_ENABLE_FAILED", e.message, e)
         }
     }
@@ -156,18 +182,53 @@ class BluetoothConnectionModule(
     /** Makes first-time pairing possible; the caller remains in control of the system dialog. */
     @ReactMethod
     fun requestDiscoverable(durationSeconds: Double, promise: Promise) {
+        val activity = currentActivity
+        if (activity == null) {
+            promise.reject("BT_DISCOVERABLE_FAILED", "No foreground activity is available")
+            return
+        }
+        if (discoverablePromise != null) {
+            promise.reject("BT_DISCOVERABLE_BUSY", "A Bluetooth discoverability request is already active")
+            return
+        }
         try {
             val duration = durationSeconds.toInt().coerceIn(30, 300)
             val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
                 putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, duration)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
-            reactContext.startActivity(intent)
-            promise.resolve(true)
+            discoverablePromise = promise
+            activity.startActivityForResult(intent, REQUEST_DISCOVERABLE)
         } catch (e: Exception) {
+            discoverablePromise = null
             promise.reject("BT_DISCOVERABLE_FAILED", e.message, e)
         }
     }
+
+    override fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQUEST_ENABLE) {
+            val promise = enablePromise ?: return
+            enablePromise = null
+            if (resultCode != Activity.RESULT_OK && adapter?.isEnabled != true) {
+                promise.reject("BT_ENABLE_DENIED", "Bluetooth enable request was denied")
+                return
+            }
+            promise.resolve(true)
+            return
+        }
+        if (requestCode != REQUEST_DISCOVERABLE) return
+        val promise = discoverablePromise ?: return
+        discoverablePromise = null
+        if (resultCode == Activity.RESULT_CANCELED) {
+            promise.reject("BT_DISCOVERABLE_DENIED", "Bluetooth discoverability was denied")
+            return
+        }
+        promise.resolve(Arguments.createMap().apply {
+            putBoolean("accepted", true)
+            putInt("durationSeconds", resultCode)
+        })
+    }
+
+    override fun onNewIntent(intent: Intent?) = Unit
 
     @ReactMethod
     fun startDiscovery(promise: Promise) {
@@ -938,6 +999,11 @@ class BluetoothConnectionModule(
         }
         receiverRegistered = false
         receiver = null
+        reactContext.removeActivityEventListener(this)
+        enablePromise?.reject("BT_ENABLE_CANCELLED", "Bluetooth runtime was destroyed")
+        enablePromise = null
+        discoverablePromise?.reject("BT_DISCOVERABLE_CANCELLED", "Bluetooth runtime was destroyed")
+        discoverablePromise = null
         val (connection, candidates, listener) = synchronized(stateLock) {
             val current = activeConnection
             activeConnection = null

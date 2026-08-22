@@ -121,6 +121,51 @@ describe("ConnectionCoordinator unified transport ownership", () => {
     expect(bluetoothAdapter.connectPeer).toHaveBeenCalledTimes(1);
   });
 
+  test("failed route cleanup can preserve the active fallback selection", () => {
+    const coordinator = new ConnectionCoordinator();
+    const cancel = jest.fn();
+    coordinator.fallbackEngine = { cancel };
+    coordinator.state = COORDINATOR_STATE.ERROR;
+    coordinator.currentPeer = makePeer({
+      LAN: { host: "192.168.0.36", port: 8089 },
+      P2P: { deviceAddress: "02:00:00:00:00:36" },
+    });
+    coordinator.currentTransport = TRANSPORTS.LAN;
+
+    coordinator.disconnect({ preserveFallback: true });
+
+    expect(cancel).not.toHaveBeenCalled();
+    expect(coordinator.state).toBe(COORDINATOR_STATE.IDLE);
+    expect(coordinator.currentPeer).toBeNull();
+    expect(coordinator.currentTransport).toBeNull();
+  });
+
+  test("a failed LAN handler can clean its route and continue to P2P", async () => {
+    const coordinator = new ConnectionCoordinator();
+    new TransportFallbackEngine({ coordinator });
+    const peer = makePeer({
+      LAN: { host: "192.168.0.36", port: 8089 },
+      P2P: { deviceAddress: "02:00:00:00:00:36" },
+    });
+    const connectP2p = jest.fn().mockResolvedValue({ route: "p2p" });
+    const connectLan = jest.fn(async () => {
+      coordinator.state = COORDINATOR_STATE.ERROR;
+      coordinator.currentPeer = peer;
+      coordinator.currentTransport = TRANSPORTS.LAN;
+      coordinator.disconnect({ preserveFallback: true });
+      throw new Error("ECONNREFUSED");
+    });
+
+    await expect(coordinator.connectPeer(peer, {
+      handlers: { connectLan, connectP2p },
+    })).resolves.toEqual({
+      transport: TRANSPORTS.P2P,
+      result: { route: "p2p" },
+    });
+    expect(connectLan).toHaveBeenCalledTimes(1);
+    expect(connectP2p).toHaveBeenCalledTimes(1);
+  });
+
   test("coalesces duplicate Bluetooth attempts and reuses the connected session", async () => {
     const pendingConnection = deferred();
     const bluetoothAdapter = makeBluetoothAdapter({
@@ -182,6 +227,37 @@ describe("ConnectionCoordinator unified transport ownership", () => {
       { deviceId: "another-peer" },
       { expectedDeviceId: provisional.deviceId },
     )).toThrow("Connected peer changed before identity rebind");
+  });
+
+  test("promotes the adapter-authenticated peer before publishing Bluetooth connected state", async () => {
+    const provisional = {
+      deviceId: "bluetooth:AA:BB:CC:DD:EE:12",
+      deviceName: "Discovered phone",
+      transports: {
+        BLUETOOTH: { address: "AA:BB:CC:DD:EE:12" },
+      },
+    };
+    const authenticated = {
+      ...provisional,
+      deviceId: "stable-authenticated-peer",
+    };
+    const route = {
+      transport: TRANSPORTS.BLUETOOTH,
+      address: "AA:BB:CC:DD:EE:12",
+      remoteNodeId: authenticated.deviceId,
+      peer: authenticated,
+    };
+    const bluetoothAdapter = makeBluetoothAdapter({
+      connectPeer: jest.fn().mockResolvedValue(route),
+    });
+    const onConnected = jest.fn();
+    const coordinator = new ConnectionCoordinator({ bluetoothAdapter, onConnected });
+
+    await expect(coordinator.connectBluetoothPeer(provisional, 5000)).resolves.toBe(route);
+
+    expect(coordinator.currentPeer).toBe(authenticated);
+    expect(coordinator.getCoordinatorStatus().peer.deviceId).toBe(authenticated.deviceId);
+    expect(onConnected).toHaveBeenCalledWith(authenticated, TRANSPORTS.BLUETOOTH);
   });
 
   test("rejects a second inbound session instead of replacing the active peer session", async () => {

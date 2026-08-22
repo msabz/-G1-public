@@ -67,6 +67,27 @@ describe('LanDiscovery Manager', () => {
     expect(onPeerFound).toHaveBeenCalledTimes(1);
   });
 
+  test('keeps an IPv6 link-local scope in the LAN endpoint', () => {
+    const onPeerFound = jest.fn();
+    lanDiscovery.startDiscovery({ onPeerFound });
+
+    lanDiscovery._handlePeerFound({
+      deviceId: 'remote-ipv6',
+      deviceName: 'IPv6 Phone',
+      host: 'fe80::a12b:34ff:fe56:7890%wlan0',
+      port: 8089,
+      serviceName: 'G1-remote-ipv6',
+      interfaceName: 'wlan0',
+    });
+
+    const peer = lanDiscovery.getDiscoveredPeers()[0];
+    expect(peer.host).toBe('fe80::a12b:34ff:fe56:7890%wlan0');
+    expect(onPeerFound).toHaveBeenCalledWith(expect.objectContaining({
+      host: 'fe80::a12b:34ff:fe56:7890%wlan0',
+      interfaceName: 'wlan0',
+    }));
+  });
+
   test('handles lost LAN peers', () => {
     const onPeerLost = jest.fn();
     lanDiscovery.startDiscovery({ onPeerLost });

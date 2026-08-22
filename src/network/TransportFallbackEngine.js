@@ -78,7 +78,24 @@ export function runWithTransportTimeout(factory, timeoutMs, transport, onTimeout
     timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      try { if (onTimeout) onTimeout(); } catch (e) {}
+      try {
+        const cancellation = onTimeout?.();
+        // Cancellation may need native cleanup and therefore return a Promise.
+        // The transport deadline must remain authoritative, but a rejected
+        // fire-and-forget cleanup must still be observed to avoid an unhandled
+        // rejection after fallback has already advanced to the next step.
+        Promise.resolve(cancellation).catch(error => {
+          console.warn(
+            `[FallbackEngine] ${transport} timeout cancellation failed:`,
+            error?.message || error,
+          );
+        });
+      } catch (error) {
+        console.warn(
+          `[FallbackEngine] ${transport} timeout cancellation failed:`,
+          error?.message || error,
+        );
+      }
       reject(new TransportTimeoutError(transport, timeoutMs));
     }, timeoutMs);
 
@@ -123,7 +140,9 @@ export class TransportFallbackEngine {
     this.mode = options.mode || TRANSPORT_MODE.AUTO;
     this.lanTimeoutMs = options.lanTimeoutMs || 5000;
     this.p2pTimeoutMs = options.p2pTimeoutMs || 8000;
-    this.bluetoothTimeoutMs = options.bluetoothTimeoutMs || 8000;
+    // Covers the native RFCOMM connect plus a first-time Android pairing prompt,
+    // while remaining bounded so AUTO selection cannot stall indefinitely.
+    this.bluetoothTimeoutMs = options.bluetoothTimeoutMs || 25000;
     this.maxAttempts = normalizeMaxAttempts(options.maxAttempts);
 
     // The engine is a deterministic policy helper. The injected coordinator is
@@ -227,7 +246,23 @@ export class TransportFallbackEngine {
 
     record.cancelled = true;
     record.cancelReason = reason;
-    try { record.cancelCurrent?.(); } catch (e) {}
+    try {
+      const cancellation = record.cancelCurrent?.();
+      // Explicit cancellation is intentionally synchronous for callers, but the
+      // native cleanup hook may be asynchronous. Observe a rejected cleanup so
+      // it cannot surface later as an unhandled rejection.
+      Promise.resolve(cancellation).catch(error => {
+        console.warn(
+          '[FallbackEngine] explicit cancellation cleanup failed:',
+          error?.message || error,
+        );
+      });
+    } catch (error) {
+      console.warn(
+        '[FallbackEngine] explicit cancellation cleanup failed:',
+        error?.message || error,
+      );
+    }
     return true;
   }
 
@@ -267,15 +302,36 @@ export class TransportFallbackEngine {
     return promise;
   }
 
-  _connectorFor(transport, peer, handlers, options = {}) {
+  _connectorFor(transport, peer, handlers, options = {}, record = null) {
+    const stepState = { active: true };
+    const attemptContext = Object.freeze({
+      attemptToken: record?.token || null,
+      isCancelled: () => !stepState.active || (record ? !this._isCurrent(record) : false),
+      throwIfCancelled: () => {
+        if (!stepState.active || (record && !this._isCurrent(record))) {
+          throw new TransportAttemptCancelledError(
+            record?.token || null,
+            record?.cancelReason || 'Transport attempt is no longer current'
+          );
+        }
+      },
+    });
+    const createCancel = cancel => () => {
+      stepState.active = false;
+      return cancel?.();
+    };
+    const invalidate = () => { stepState.active = false; };
     if (transport === 'LAN') {
       const timeoutMs = options.lanTimeoutMs ?? this.lanTimeoutMs;
       const connect = typeof handlers.connectLan === 'function'
-        ? () => handlers.connectLan(peer)
+        ? () => handlers.connectLan(peer, attemptContext)
         : () => this.coordinator.connectLanPeer(peer, timeoutMs);
       return {
         connect,
-        cancel: handlers.cancelLan || (() => this.coordinator?.cancelConnecting?.()),
+        cancel: createCancel(
+          handlers.cancelLan || (() => this.coordinator?.cancelConnecting?.())
+        ),
+        invalidate,
         timeoutMs,
         timeoutLabel: 'LAN',
       };
@@ -284,11 +340,14 @@ export class TransportFallbackEngine {
     if (transport === 'P2P') {
       const timeoutMs = options.p2pTimeoutMs ?? this.p2pTimeoutMs;
       const connect = typeof handlers.connectP2p === 'function'
-        ? () => handlers.connectP2p(peer)
+        ? () => handlers.connectP2p(peer, attemptContext)
         : () => this.coordinator.connectP2pPeer(peer, timeoutMs);
       return {
         connect,
-        cancel: handlers.cancelP2p || (() => this.coordinator?.cancelConnecting?.()),
+        cancel: createCancel(
+          handlers.cancelP2p || (() => this.coordinator?.cancelConnecting?.())
+        ),
+        invalidate,
         timeoutMs,
         timeoutLabel: 'Wi-Fi Direct',
       };
@@ -296,11 +355,14 @@ export class TransportFallbackEngine {
 
     const timeoutMs = options.bluetoothTimeoutMs ?? this.bluetoothTimeoutMs;
     const connect = typeof handlers.connectBluetooth === 'function'
-      ? () => handlers.connectBluetooth(peer)
+      ? () => handlers.connectBluetooth(peer, attemptContext)
       : () => this.coordinator.connectBluetoothPeer(peer, timeoutMs);
     return {
       connect,
-      cancel: handlers.cancelBluetooth || (() => this.coordinator?.cancelConnecting?.()),
+      cancel: createCancel(
+        handlers.cancelBluetooth || (() => this.coordinator?.cancelConnecting?.())
+      ),
+      invalidate,
       timeoutMs,
       timeoutLabel: 'Bluetooth',
     };
@@ -316,7 +378,7 @@ export class TransportFallbackEngine {
       }
 
       const transport = candidates[index];
-      const connector = this._connectorFor(transport, peer, handlers, options);
+      const connector = this._connectorFor(transport, peer, handlers, options, record);
       record.currentTransport = transport;
       record.cancelCurrent = connector.cancel;
 
@@ -343,6 +405,7 @@ export class TransportFallbackEngine {
           ? { transport, session: result }
           : { transport, result };
       } catch (error) {
+        connector.invalidate();
         if (error instanceof TransportAttemptCancelledError || !this._isCurrent(record)) {
           throw error instanceof TransportAttemptCancelledError
             ? error
